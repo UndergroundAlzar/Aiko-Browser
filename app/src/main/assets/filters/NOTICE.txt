@@ -1,0 +1,19 @@
+Bundled filter snapshots and public suffix data
+
+The GZIP files in this directory contain the unmodified text distributed by
+their respective upstreams. The files are separate data consumed by Aiko's
+own rule matcher. The corresponding text is included inside this APK and
+in the source archive.
+
+- EasyList (version 202611201235) and EasyPrivacy (version 202611201244)
+  The EasyList authors (https://easylist.to/).
+  GPL-3.0-or-later option per https://easylist.to/pages/licence.html.
+  https://easylist.to/easylist/easylist.txt
+  https://easylist.to/easylist/easyprivacy.txt
+- AdGuard Chinese filter (version 2.1.69.90), including EasyList China
+  https://filters.adtidy.org/extension/chromium/filters/224.txt
+  Upstream license notices: https://github.com/AdguardTeam/AdguardFilters
+  See the original headers and LICENSE-GPL-3.0.txt.
+- Public Suffix List (version 2026-11-20_10-39-09_UTC)
+  https://publicsuffix.org/list/public_suffix_list.dat
+  Mozilla Public License 2.0; see LICENSE-MPL-2.0.txt.
