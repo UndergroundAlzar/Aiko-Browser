@@ -54,7 +54,11 @@ public final class MainActivity extends Activity {
     private final ArrayDeque<String> timings = new ArrayDeque<>();
     private final ArrayDeque<Tab> closedTabs = new ArrayDeque<>();
     private BrowserLibrary library;
+    private android.content.SharedPreferences siteProfiles;
+    private String desktopAgent;
     private SiteFilter siteFilter;
+    private UserScripts userScripts;
+    private ScriptTools scriptTools;
     private final Runnable saveHistory = () -> library.flushHistory();
     private FrameLayout root, page;
     private LinearLayout content, addressRow;
@@ -80,6 +84,8 @@ public final class MainActivity extends Activity {
         String visibleUrl;
         int visibleIndex = ScrollPositions.URL_ONLY;
         volatile SiteFilter.Page filterPage;
+        boolean filterPagePrepared, desktopApplied;
+        int baseTextZoom = SiteProfile.DEFAULT_ZOOM;
         ScrollPositions.Position pendingScroll;
         boolean scrollQueued;
         android.graphics.Bitmap favicon;
@@ -98,6 +104,9 @@ public final class MainActivity extends Activity {
         getWindow().setSoftInputMode(android.view.WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
         if (Build.VERSION.SDK_INT >= 30) getWindow().setDecorFitsSystemWindows(false);
         library = new BrowserLibrary(getSharedPreferences("library", MODE_PRIVATE));
+        siteProfiles = getSharedPreferences("site_profiles", MODE_PRIVATE);
+        userScripts = new UserScripts(this);
+        scriptTools = new ScriptTools(this, userScripts);
         DownloadService.PACER.setBrowserFirst(getPreferences(MODE_PRIVATE).getBoolean("browserFirst", true));
         buildChrome();
         restoreTabs(state == null ? incomingLink(getIntent()) : null);
@@ -298,9 +307,9 @@ public final class MainActivity extends Activity {
         } else {
             if (tab.view == null) {
                 beginNavigation(tab);
-                tab.filterPage = filterPage(tab.url);
                 setScrollTarget(tab, tab.positions.get(ScrollPositions.URL_ONLY, tab.url));
                 tab.view = createWebView(tab);
+                prepareTopLoad(tab, tab.url, true, false);
                 if (tab.navigation == null || tab.view.restoreState(tab.navigation) == null) tab.view.loadUrl(tab.url);
                 tab.navigation = null;
             }
@@ -362,6 +371,9 @@ public final class MainActivity extends Activity {
         WebView web = tab.view;
         if (web == null) return;
         tab.view = null;
+        tab.desktopApplied = false;
+        tab.filterPagePrepared = false;
+        userScripts.detach(web);
         setScrollTarget(tab, null);
         if (web.getParent() instanceof ViewGroup) ((ViewGroup) web.getParent()).removeView(web);
         web.destroy();
@@ -409,6 +421,7 @@ public final class MainActivity extends Activity {
         web.setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_IMPORTANT, true);
         if (Build.VERSION.SDK_INT >= 35) web.setRequestedFrameRate(View.REQUESTED_FRAME_RATE_CATEGORY_HIGH);
         WebSettings s = web.getSettings();
+        tab.baseTextZoom = s.getTextZoom();
         s.setJavaScriptEnabled(true);
         s.setDomStorageEnabled(true);
         s.setAllowFileAccess(false);
@@ -425,12 +438,13 @@ public final class MainActivity extends Activity {
             @Override public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
                 String scheme = request.getUrl().getScheme();
                 boolean allowed = "http".equalsIgnoreCase(scheme) || "https".equalsIgnoreCase(scheme);
-                if (allowed && tab == current && request.isForMainFrame() && !request.isRedirect()) {
-                    if (!request.getUrl().toString().equals(tab.historyTarget)) {
-                        prepareFreshNavigation(tab);
+                if (allowed && tab.view == view && request.isForMainFrame() && !request.isRedirect()) {
+                    String destination = request.getUrl().toString();
+                    if (tab == current) {
+                        if (!destination.equals(tab.historyTarget)) prepareFreshNavigation(tab);
+                        beginNavigation(tab);
                     }
-                    tab.filterPage = filterPage(request.getUrl().toString());
-                    beginNavigation(tab);
+                    prepareTopLoad(tab, destination, "GET".equals(request.getMethod()) && view.getProgress() >= 100, false);
                 }
                 return !allowed;
             }
@@ -442,7 +456,11 @@ public final class MainActivity extends Activity {
                 tab.progress = 1;
                 if (http(url)) {
                     tab.url = url;
-                    tab.filterPage = filterPage(url);
+                    if (!tab.filterPagePrepared || tab.filterPage == null || !url.equals(tab.filterPage.url))
+                        tab.filterPage = filterPage(url);
+                    tab.filterPagePrepared = false;
+                    // Redirects and form submissions keep their request chain and UA.
+                    applySiteProfile(tab, siteProfile(siteFor(url)), false, false);
                 }
                 if (tab == current) updateChrome();
             }
@@ -454,6 +472,12 @@ public final class MainActivity extends Activity {
             @Override public void onPageCommitVisible(WebView view, String url) {
                 if (tab.view != view) return;
                 tab.historyTarget = null;
+                if (http(url) && url.equals(view.getUrl())) {
+                    SiteFilter.Page previous = tab.filterPage;
+                    if (previous == null || !url.equals(previous.url))
+                        tab.filterPage = previous == null ? filterPage(url) : previous.withHistoryUrl(url);
+                    applySiteProfile(tab, siteProfile(siteFor(url)), false, false);
+                }
                 recordVisibleEntry(tab, view, url);
                 restoreScroll(tab, view, url);
                 filter.applyCss(view, url);
@@ -468,6 +492,7 @@ public final class MainActivity extends Activity {
                 if (tab.view != view) return;
                 recordVisibleEntry(tab, view, url);
                 restoreScroll(tab, view, url);
+                userScripts.pageFinished(view, url);
             }
 
             @Override public void onReceivedError(WebView view, WebResourceRequest request, WebResourceError error) {
@@ -481,7 +506,10 @@ public final class MainActivity extends Activity {
                 if (tab.view != view) return;
                 if (http(url)) tab.url = url;
                 if (view.getProgress() >= 100) {
-                    tab.filterPage = filterPage(url);
+                    if (http(url) && !tab.filterPagePrepared) {
+                        SiteFilter.Page previous = tab.filterPage;
+                        tab.filterPage = previous == null ? filterPage(url) : previous.withHistoryUrl(url);
+                    }
                     recordVisibleEntry(tab, view, url);
                     restoreScroll(tab, view, url);
                 }
@@ -587,6 +615,7 @@ public final class MainActivity extends Activity {
             }).show();
             return true;
         });
+        userScripts.attach(web);
         return web;
     }
 
@@ -619,11 +648,11 @@ public final class MainActivity extends Activity {
         prepareFreshNavigation(current);
         beginNavigation(current);
         current.url = url;
-        current.filterPage = filterPage(url);
         if (current.view == null) {
             current.view = createWebView(current);
             attach(current.view);
         }
+        prepareTopLoad(current, url, true, true);
         current.view.loadUrl(url);
         updateChrome();
         trimTabs();
@@ -649,6 +678,45 @@ public final class MainActivity extends Activity {
 
     private static String siteFor(String url) {
         return url == null ? null : SiteFilter.normal(Uri.parse(url).getHost());
+    }
+
+    private SiteProfile siteProfile(String host) {
+        return host == null ? SiteProfile.DEFAULT : SiteProfile.decode(siteProfiles.getInt(host, 0));
+    }
+
+    private void saveSiteProfile(String host, SiteProfile profile) {
+        int stored = profile.encode();
+        if (stored == 0) siteProfiles.edit().remove(host).apply();
+        else siteProfiles.edit().putInt(host, stored).apply();
+    }
+
+    private void prepareTopLoad(Tab tab, String url, boolean updateAgent, boolean stopOldLoad) {
+        SiteFilter.Page prepared = tab.filterPage;
+        if (!tab.filterPagePrepared || prepared == null || !url.equals(prepared.url))
+            tab.filterPage = filterPage(url);
+        tab.filterPagePrepared = true;
+        applySiteProfile(tab, siteProfile(siteFor(url)), updateAgent, stopOldLoad);
+    }
+
+    private void applySiteProfile(Tab tab, SiteProfile profile, boolean updateAgent, boolean stopOldLoad) {
+        WebView view = tab.view;
+        if (view == null) return;
+        WebSettings settings = view.getSettings();
+        int textZoom = Math.round(tab.baseTextZoom * profile.zoom / 100f);
+        if (settings.getTextZoom() != textZoom) settings.setTextZoom(textZoom);
+        if (settings.getBlockNetworkImage() != profile.blockImages) settings.setBlockNetworkImage(profile.blockImages);
+        if (!updateAgent || tab.desktopApplied == profile.desktop) return;
+        if (profile.desktop && !hasDesktopAgent()) return;
+        // WebView may restart a load when its UA changes. Only stop prior work for
+        // an explicit browser action that is about to start another navigation.
+        if (stopOldLoad && view.getProgress() < 100) view.stopLoading();
+        settings.setUserAgentString(profile.desktop ? desktopAgent : null);
+        tab.desktopApplied = profile.desktop;
+    }
+
+    private boolean hasDesktopAgent() {
+        if (desktopAgent == null) desktopAgent = SiteProfile.desktopAgent(WebSettings.getDefaultUserAgent(this));
+        return desktopAgent != null;
     }
 
     private static void recordVisibleEntry(Tab tab, WebView view, String url) {
@@ -941,6 +1009,7 @@ public final class MainActivity extends Activity {
         sheetAction(dialog, quick, ADD, "新建标签", true, () -> { addTab(null); focusAddress(); });
         sheetAction(dialog, quick, DOWNLOAD, "下载", true, this::showDownloads);
         sheetAction(dialog, quick, PRIVATE, "无痕", true, () -> startActivity(new Intent(this, PrivateActivity.class)));
+        sheetAction(dialog, quick, CODE, "油猴脚本", true, scriptTools::show);
         groupLabel(actions, "当前页面");
         LinearLayout context = sheetRow(actions);
         sheetAction(dialog, context, STAR, pageOpen && library.isBookmarked(url) ? "取消收藏" : "收藏",
@@ -973,29 +1042,108 @@ public final class MainActivity extends Activity {
         Tab tab = current;
         String url = tab.url, host = siteFor(url);
         if (host == null) return;
-        boolean filtered = filter().enabled(host);
+        SiteFilter filters = filter();
+        SiteProfile profile = siteProfile(host);
+        boolean filtered = filters.enabled(host);
         boolean https = "https".equalsIgnoreCase(Uri.parse(url).getScheme());
         Dialog dialog = new Dialog(this);
         LinearLayout panel = sheet(dialog, "站点控制");
+        ScrollView scroll = new ScrollView(this);
+        int height = getResources().getConfiguration().screenHeightDp;
+        panel.addView(scroll, new LinearLayout.LayoutParams(-1, dp(Math.min(317, Math.max(150, height - 130)))));
+        LinearLayout body = stack();
+        scroll.addView(body, new ScrollView.LayoutParams(-1, -2));
         TextView site = label(host, 17, TEXT);
         site.setSingleLine(true);
         site.setEllipsize(android.text.TextUtils.TruncateAt.MIDDLE);
         site.setPadding(dp(8), dp(6), 0, 0);
         site.setTypeface(Typeface.create("sans-serif-medium", Typeface.NORMAL));
-        panel.addView(site);
-        groupLabel(panel, (https ? "HTTPS" : "HTTP · 未加密") + "  ·  " + (filtered ? "过滤已开启" : "过滤已暂停"));
-        LinearLayout row = sheetRow(panel);
-        sheetAction(dialog, row, SHIELD, filtered ? "暂停过滤" : "恢复过滤", true, () -> {
-            filter().setEnabled(host, !filtered);
-            if (current == tab && current.view != null) reloadPreservingScroll();
+        body.addView(site);
+        groupLabel(body, (https ? "HTTPS" : "HTTP · 未加密") + "  ·  " + (filtered ? "过滤已开启" : "过滤已暂停"));
+        LinearLayout screen = sheetRow(body);
+        sheetAction(dialog, screen, DESKTOP, profile.desktop ? "切到手机版" : "切到桌面版", tab.view != null,
+                () -> {
+                    if (!profile.desktop && !hasDesktopAgent()) {
+                        toast("此 WebView 未提供可识别的 Chromium 版本");
+                        return;
+                    }
+                    saveSiteProfile(host, new SiteProfile(!profile.desktop, profile.blockImages, profile.zoom));
+                    if (sameOpenSite(tab, host)) reloadPreservingScroll();
+                });
+        sheetAction(dialog, screen, FONT, "字号 " + profile.zoom + "%", tab.view != null,
+                () -> showSiteTextSize(tab, host));
+        sheetAction(dialog, screen, IMAGE, profile.blockImages ? "恢复图片" : "停载图片", tab.view != null,
+                () -> {
+                    SiteProfile chosen = new SiteProfile(profile.desktop, !profile.blockImages, profile.zoom);
+                    saveSiteProfile(host, chosen);
+                    if (sameOpenSite(tab, host)) applySiteProfile(tab, chosen, false, false);
+                    toast(chosen.blockImages ? "此站暂停加载网络图片" : "此站已恢复加载网络图片");
+                });
+        groupLabel(body, "过滤与排错");
+        LinearLayout protection = sheetRow(body);
+        sheetAction(dialog, protection, SHIELD, filtered ? "暂停过滤" : "恢复过滤", true, () -> {
+            filters.setEnabled(host, !filtered);
+            if (sameOpenSite(tab, host)) reloadPreservingScroll();
             if (current != null) updateAddress();
         });
-        sheetAction(dialog, row, REFRESH, "刷新", tab.view != null, this::reloadPreservingScroll);
-        sheetAction(dialog, row, COPY, "复制网址", true, () -> {
+        SiteFilter.Page page = tab.filterPage;
+        FilterTrace.Snapshot hits = page != null && host.equals(page.host) ? page.trace.snapshot() : null;
+        String logLabel = hits != null && hits.count > 0 ? "拦截 " + hits.count : "拦截记录";
+        sheetAction(dialog, protection, HISTORY, logLabel, true, () -> showFilterTrace(tab, host));
+        sheetAction(dialog, protection, REFRESH, "刷新", tab.view != null,
+                () -> { if (sameOpenSite(tab, host)) reloadPreservingScroll(); });
+        LinearLayout actions = sheetRow(body);
+        sheetAction(dialog, actions, COPY, "复制网址", true, () -> {
             getSystemService(ClipboardManager.class).setPrimaryClip(ClipData.newPlainText("网址", url));
             toast("网址已复制");
         });
+        sheetAction(dialog, actions, REFRESH, "恢复默认", !filtered || profile.encode() != 0, () -> {
+            saveSiteProfile(host, SiteProfile.DEFAULT);
+            filters.setEnabled(host, true);
+            if (sameOpenSite(tab, host)) reloadPreservingScroll();
+            if (current != null) updateAddress();
+            toast("已恢复此站浏览和过滤设置");
+        });
         showSheet(dialog, panel);
+    }
+
+    private boolean sameOpenSite(Tab tab, String host) {
+        return current == tab && tab.view != null && host.equals(siteFor(tab.url));
+    }
+
+    private void showSiteTextSize(Tab tab, String host) {
+        int[] zoomLevels = {75, 90, 100, 110, 125, 150, 175, 200};
+        CharSequence[] labels = new CharSequence[zoomLevels.length];
+        int selected = -1;
+        SiteProfile old = siteProfile(host);
+        for (int i = 0; i < zoomLevels.length; i++) {
+            labels[i] = zoomLevels[i] + "%";
+            if (zoomLevels[i] == old.zoom) selected = i;
+        }
+        new AlertDialog.Builder(this).setTitle("此站字号").setSingleChoiceItems(labels, selected, (dialog, which) -> {
+            SiteProfile next = new SiteProfile(old.desktop, old.blockImages, zoomLevels[which]);
+            saveSiteProfile(host, next);
+            if (sameOpenSite(tab, host)) applySiteProfile(tab, next, false, false);
+            dialog.dismiss();
+        }).setNegativeButton("取消", null).show();
+    }
+
+    private void showFilterTrace(Tab tab, String host) {
+        SiteFilter.Page page = tab.filterPage;
+        FilterTrace.Snapshot log = page != null && host.equals(page.host) ? page.trace.snapshot() : null;
+        StringBuilder message = new StringBuilder();
+        if (log == null || log.count == 0) {
+            message.append("当前文档暂无拦截记录。");
+        } else {
+            message.append("当前文档拦截了 ").append(log.count).append(" 个网络请求。");
+            for (FilterTrace.Hit hit : log.recent) {
+                message.append("\n\n").append(hit.host).append('\n').append(hit.source);
+                if (!hit.reason.isEmpty()) message.append(" · ").append(hit.reason);
+            }
+        }
+        message.append("\n\n仅保留当前文档最近的命中，不记录请求完整网址、参数或 Cookie。");
+        new AlertDialog.Builder(this).setTitle("拦截记录").setMessage(message)
+                .setPositiveButton("关闭", null).show();
     }
 
     private LinearLayout stack() {
@@ -1082,8 +1230,9 @@ public final class MainActivity extends Activity {
                         + "\n跳过 " + rules.skipped + " 条不支持的规则。";
         new AlertDialog.Builder(this).setTitle("广告过滤规则")
                 .setMessage("EasyList · EasyPrivacy · AdGuard 中文\n\n" + summary
-                        + "\n\n可从底部菜单暂停当前站点的过滤。")
+                        + "\n\n点击地址栏盾牌可暂停当前站点的过滤。")
                 .setNegativeButton("关闭", null)
+                .setNeutralButton("自定义规则", (dialog, which) -> showCustomFilters())
                 .setPositiveButton("更新规则", (dialog, which) -> {
                     if (filter.update((count, applied) -> {
                         if (isDestroyed()) return;
@@ -1096,6 +1245,50 @@ public final class MainActivity extends Activity {
                     })) toast("正在后台更新规则");
                     else toast("规则正在更新");
                 }).show();
+    }
+
+    private void showCustomFilters() {
+        SiteFilter active = filter();
+        EditText rules = new EditText(this);
+        rules.setTextSize(14);
+        rules.setTypeface(Typeface.MONOSPACE);
+        rules.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE
+                | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
+        rules.setGravity(Gravity.START | Gravity.TOP);
+        rules.setMinLines(6);
+        rules.setMaxLines(11);
+        rules.setHint("||ads.example.com^\n@@||example.com^$document\nexample.com##.advertisement");
+        try { rules.setText(active.customSource()); }
+        catch (java.io.IOException failure) { toast("无法读取自定义规则"); return; }
+        LinearLayout body = stack();
+        body.setPadding(dp(22), 0, dp(22), dp(8));
+        TextView hint = label("每行一条 ABP 规则。以 ! 开头可添加注释。清空并保存即可移除全部自定义规则。", 14, MUTED);
+        body.addView(hint);
+        body.addView(rules, new LinearLayout.LayoutParams(-1, -2));
+        AlertDialog dialog = new AlertDialog.Builder(this).setTitle("自定义过滤规则")
+                .setView(body).setNegativeButton("取消", null).setPositiveButton("保存", null).create();
+        dialog.show();
+        dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(view -> {
+            String source = rules.getText().toString();
+            view.setEnabled(false);
+            rules.setEnabled(false);
+            dialog.getButton(AlertDialog.BUTTON_NEGATIVE).setEnabled(false);
+            dialog.setCancelable(false);
+            active.saveCustom(source, (count, error) -> {
+                if (isDestroyed() || !dialog.isShowing()) return;
+                if (error != null) {
+                    view.setEnabled(true);
+                    rules.setEnabled(true);
+                    dialog.getButton(AlertDialog.BUTTON_NEGATIVE).setEnabled(true);
+                    dialog.setCancelable(true);
+                    new AlertDialog.Builder(this).setTitle("规则未保存").setMessage(error)
+                            .setPositiveButton("返回编辑", null).show();
+                    return;
+                }
+                dialog.dismiss();
+                toast("已保存 " + count + " 条规则，刷新网页即可完整应用");
+            });
+        });
     }
 
     private void shareLink(String url) {
@@ -1282,16 +1475,19 @@ public final class MainActivity extends Activity {
         current.historyTarget = target == null ? null : target.getUrl();
         setScrollTarget(current, target == null ? null
                 : current.positions.get(destinationIndex, target.getUrl()));
-        if (target != null) current.filterPage = filterPage(target.getUrl());
+        if (target != null) prepareTopLoad(current, target.getUrl(), true, true);
         beginNavigation(current);
         view.goBackOrForward(offset);
         return true;
     }
 
     private void reloadPreservingScroll() {
+        if (current == null || current.view == null || !http(current.url)) return;
         rememberScroll(current);
         setScrollTarget(current, current.positions.get(ScrollPositions.URL_ONLY, current.url));
         beginNavigation(current);
+        current.filterPagePrepared = false;
+        prepareTopLoad(current, current.url, true, true);
         current.view.reload();
     }
 
@@ -1307,6 +1503,10 @@ public final class MainActivity extends Activity {
 
     @Override protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == ScriptTools.PICK_FILE) {
+            if (resultCode == RESULT_OK && data != null) scriptTools.importFile(data.getData());
+            return;
+        }
         if (requestCode == FILE_PICKER && picker != null) {
             picker.onReceiveValue(WebChromeClient.FileChooserParams.parseResult(resultCode, data));
             picker = null;
@@ -1324,6 +1524,7 @@ public final class MainActivity extends Activity {
     }
 
     @Override protected void onStop() {
+        userScripts.flushValues();
         visible = false;
         dropSpare();
         if (current != null) {
@@ -1340,6 +1541,7 @@ public final class MainActivity extends Activity {
     }
 
     @Override protected void onDestroy() {
+        userScripts.flushValues();
         if (siteFilter != null) siteFilter.close();
         handler.removeCallbacksAndMessages(null);
         dropSpare();

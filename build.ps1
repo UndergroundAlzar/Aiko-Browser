@@ -6,7 +6,7 @@ param(
     [string] $BuildTools,
     [string] $SigningKey = (Join-Path $PSScriptRoot 'build/local-preview.p12'),
     [string] $SigningAlias = 'aiko-preview',
-    [string] $OutputFile = (Join-Path $PSScriptRoot 'build/Aiko-Browser-0.1.7.apk')
+    [string] $OutputFile = (Join-Path $PSScriptRoot 'build/Aiko-Browser-0.1.9.apk')
 )
 $ErrorActionPreference = 'Stop'
 if (-not $AndroidJar -and $SdkRoot) { $AndroidJar = Join-Path $SdkRoot 'platforms/android-36/android.jar' }
@@ -32,6 +32,52 @@ function Run-Native {
     & $Program @ArgList
     if ($LASTEXITCODE -ne 0) { throw "$([IO.Path]::GetFileName($Program)) failed with exit code $LASTEXITCODE" }
 }
+function Get-Dependency {
+    param([string]$Url, [string]$Hash)
+    $cache = Join-Path $PSScriptRoot 'build/deps'
+    [IO.Directory]::CreateDirectory($cache) | Out-Null
+    $target = Join-Path $cache ([IO.Path]::GetFileName($Url))
+    if ((Test-Path -LiteralPath $target) -and (Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash -ieq $Hash) {
+        return $target
+    }
+    $temporary = $target + '.' + [Guid]::NewGuid().ToString('N') + '.download'
+    try {
+        Invoke-WebRequest -Uri $Url -OutFile $temporary -TimeoutSec 40
+        if ((Get-FileHash -LiteralPath $temporary -Algorithm SHA256).Hash -ine $Hash) {
+            throw 'AndroidX dependency checksum mismatch'
+        }
+        Move-Item -LiteralPath $temporary -Destination $target -Force
+    } finally {
+        if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary }
+    }
+    return $target
+}
+function Expand-AarEntry {
+    param([string]$Archive, [string]$EntryName, [string]$File)
+    $zip = [IO.Compression.ZipFile]::OpenRead($Archive)
+    try {
+        $entry = $zip.GetEntry($EntryName)
+        if (-not $entry) { throw "Missing $EntryName in $Archive" }
+        [IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $File, $false)
+    } finally {
+        $zip.Dispose()
+    }
+}
+$maven = 'https://dl.google.com/dl/android/maven2/androidx'
+$webkitAar = Get-Dependency "$maven/webkit/webkit/1.18.0/webkit-1.18.0.aar" 'f15a0bd7d51f4bb8dffdd3a2cf5829f9a7de9ad4ba2682fa85d619032050581f'
+$coreAar = Get-Dependency "$maven/core/core/1.1.0/core-1.1.0.aar" '76c7cfbe596fe3c09a6983bf1c89e889299c08ac9a3b52ce5182a088d056647e'
+$annotations = Get-Dependency "$maven/annotation/annotation-jvm/1.8.1/annotation-jvm-1.8.1.jar" '9aab326d9492800991854360ac248f493ce7f7c3183519309b78ace9e240f6f6'
+$experimentalAar = Get-Dependency "$maven/annotation/annotation-experimental/1.3.0/annotation-experimental-1.3.0.aar" 'abfd29c8556e5bd0325a9f769ab9e9d154ff4a5515c476cdd5a2a8285b1b19dc'
+$jspecify = Get-Dependency 'https://repo.maven.apache.org/maven2/org/jspecify/jspecify/1.0.0/jspecify-1.0.0.jar' '1fad6e6be7557781e4d33729d49ae1cdc8fdda6fe477bb0cc68ce351eafdfbab'
+$kotlinAnnotations = Get-Dependency 'https://repo.maven.apache.org/maven2/org/jetbrains/kotlin/kotlin-stdlib/2.1.20/kotlin-stdlib-2.1.20.jar' '1bcc74e8ce84e2c25eaafde10f1248349cce3062b6e36978cbeec610db1e930a'
+$webkitJar = Join-Path $build 'webkit.jar'
+$coreJar = Join-Path $build 'core.jar'
+$experimentalJar = Join-Path $build 'annotation-experimental.jar'
+$webkitKeep = Join-Path $build 'webkit-keep.pro'
+Expand-AarEntry $webkitAar 'classes.jar' $webkitJar
+Expand-AarEntry $coreAar 'classes.jar' $coreJar
+Expand-AarEntry $experimentalAar 'classes.jar' $experimentalJar
+Expand-AarEntry $webkitAar 'proguard.txt' $webkitKeep
 $java = Join-Path $JavaHome 'bin/java.exe'
 $javac = Join-Path $JavaHome 'bin/javac.exe'
 $jar = Join-Path $JavaHome 'bin/jar.exe'
@@ -46,10 +92,12 @@ Run-Native $aapt @('compile','--dir',"$primary/res",'-o',$res)
 Run-Native $aapt @('link','-I',$AndroidJar,'--manifest',"$primary/AndroidManifest.xml",'--java',$generated,
     '-A',"$primary/assets",'-o',$unsigned,$res)
 $sources = @(Get-ChildItem -Path "$primary/java",$generated -Recurse -Filter '*.java' | ForEach-Object FullName)
-Run-Native $javac (@('--release','11','-encoding','UTF-8','-classpath',$AndroidJar,'-d',$classes) + $sources)
+$classpath = @($AndroidJar,$webkitJar,$coreJar,$annotations,$experimentalJar,$jspecify,$kotlinAnnotations) -join [IO.Path]::PathSeparator
+Run-Native $javac (@('--release','11','-encoding','UTF-8','-classpath',$classpath,'-d',$classes) + $sources)
 Run-Native $jar @('cf',$classJar,'-C',$classes,'.')
-Run-Native $java @('-cp',"$BuildTools/lib/d8.jar",'com.android.tools.r8.D8','--release','--min-api','29',
-    '--lib',$AndroidJar,'--output',$dex,$classJar)
+Run-Native $java @('-cp',"$BuildTools/lib/d8.jar",'com.android.tools.r8.R8','--release','--min-api','29',
+    '--lib',$AndroidJar,'--classpath',$annotations,'--classpath',$experimentalJar,'--classpath',$jspecify,'--classpath',$kotlinAnnotations,
+    '--pg-conf',"$PSScriptRoot/androidx-keep.pro",'--pg-conf',$webkitKeep,'--output',$dex,$classJar,$webkitJar,$coreJar)
 Run-Native $jar @('uf',$unsigned,'-C',$dex,'classes.dex')
 Run-Native $zipalign @('-f','4',$unsigned,$aligned)
 

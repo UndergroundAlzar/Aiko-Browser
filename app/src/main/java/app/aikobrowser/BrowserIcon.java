@@ -13,7 +13,7 @@ import android.view.View;
 /** Monochrome controls with a common 24 dp drawing grid and native touch feedback. */
 final class BrowserIcon extends View {
     enum Kind { BACK, FORWARD, SEARCH, SHIELD, TABS, MENU, REFRESH, STOP, GO, ADD, CLOSE,
-                STAR, HISTORY, FIND, SHARE, DOWNLOAD, PRIVATE, HOME, SPEED, COPY }
+                STAR, HISTORY, FIND, SHARE, DOWNLOAD, PRIVATE, HOME, SPEED, COPY, CODE, DESKTOP, FONT, IMAGE }
 
     private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Path path = new Path();
@@ -126,6 +126,19 @@ final class BrowserIcon extends View {
             case COPY:
                 c.drawRoundRect(8, 8, 20, 20, 2, 2, paint);
                 line(c, 16, 5, 16, 4, 4, 4, 4, 16, 5, 16); break;
+            case CODE:
+                line(c, 7.5f, 7, 3, 12, 7.5f, 17);
+                line(c, 16.5f, 7, 21, 12, 16.5f, 17);
+                line(c, 14, 5.5f, 10, 18.5f); break;
+            case DESKTOP:
+                c.drawRoundRect(3, 5, 21, 16, 2, 2, paint);
+                line(c, 12, 16, 12, 20); line(c, 8, 20, 16, 20); break;
+            case FONT:
+                line(c, 4, 7, 20, 7); line(c, 12, 7, 12, 19); line(c, 9, 19, 15, 19); break;
+            case IMAGE:
+                c.drawRoundRect(3, 5, 21, 19, 2, 2, paint);
+                c.drawCircle(8, 9, 1, paint);
+                line(c, 4, 18, 10, 13, 13, 16, 16, 12, 20, 17); break;
             default: break;
         }
         c.restore();

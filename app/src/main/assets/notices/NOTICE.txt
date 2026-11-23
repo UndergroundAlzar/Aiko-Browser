@@ -1,0 +1,12 @@
+Userscript WebView bindings
+
+AndroidX WebKit 1.18.0 and the runtime subset of AndroidX Core 1.1.0
+Copyright The Android Open Source Project
+Licensed under the Apache License, Version 2.0 (Apache-2.0.txt).
+https://developer.android.com/jetpack/androidx/releases/webkit
+https://developer.android.com/jetpack/androidx/releases/core
+
+The WebKit adapter includes Chromium support-library boundary interfaces.
+Copyright The Chromium Authors
+See Chromium-BSD.txt.
+https://chromium.googlesource.com/chromium/src/

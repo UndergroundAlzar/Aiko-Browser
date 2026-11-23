@@ -20,6 +20,7 @@ final class FilterRules {
     private final FragmentIndex fragments;
     private final Map<String, List<Cosmetic>> cosmetics;
     private final Set<String> suffixes;
+    private final String evidence;
     final int networkCount, cosmeticCount, skipped;
 
     private FilterRules(Builder b) {
@@ -28,6 +29,7 @@ final class FilterRules {
         pageExceptions = b.pageExceptions;
         cosmetics = b.cosmetics;
         suffixes = b.suffixes;
+        evidence = b.evidence.toString();
         networkCount = b.networkCount;
         cosmeticCount = b.cosmeticCount;
         skipped = b.skipped;
@@ -92,9 +94,13 @@ final class FilterRules {
     }
 
     boolean blocks(String topHost, String topKey, String host, String url, int type, String fetchSite) {
-        if (topHost == null || host == null || url == null || url.length() > 4096) return false;
+        return blockingRule(topHost, topKey, host, url, type, fetchSite) != null;
+    }
+
+    Rule blockingRule(String topHost, String topKey, String host, String url, int type, String fetchSite) {
+        if (topHost == null || host == null || url == null || url.length() > 4096) return null;
         String path = null;
-        int verdict = 0;
+        Rule blocked = null;
         boolean partyKnown = fetchSite != null && (fetchSite.equals("cross-site")
                 || fetchSite.equals("same-site") || fetchSite.equals("same-origin"));
         boolean third = partyKnown ? fetchSite.equals("cross-site")
@@ -105,8 +111,8 @@ final class FilterRules {
             for (Rule rule : list) {
                 if (rule.pattern != null && path == null) path = anchoredUrl(url);
                 if (rule.applies(topHost, path, url, third, type)) {
-                    if (rule.allow) return false;
-                    verdict = 1;
+                    if (rule.allow) return null;
+                    if (blocked == null) blocked = rule;
                 }
             }
         }
@@ -119,13 +125,17 @@ final class FilterRules {
                 if (list == null) continue;
                 for (Rule rule : list) {
                     if (rule.applies(topHost, null, url, third, type)) {
-                        if (rule.allow) return false;
-                        verdict = 1;
+                        if (rule.allow) return null;
+                        if (blocked == null) blocked = rule;
                     }
                 }
             }
         }
-        return verdict != 0;
+        return blocked;
+    }
+
+    String description(Rule rule) {
+        return evidence.substring(rule.evidenceStart, rule.evidenceEnd);
     }
 
     private static final class FragmentIndex {
@@ -183,7 +193,9 @@ final class FilterRules {
         final Map<Long, List<Rule>> fragments = new HashMap<>();
         final Map<String, List<Cosmetic>> cosmetics = new HashMap<>();
         final Set<String> suffixes = new HashSet<>(), disabled = new HashSet<>();
-        final Set<String> lines = new LinkedHashSet<>();
+        final Map<String, String> lines = new LinkedHashMap<>();
+        // Store matched text together, rather than retaining a separate String for every rule.
+        final StringBuilder evidence = new StringBuilder();
         int networkCount, cosmeticCount, skipped;
 
         void suffixes(Reader input) throws IOException {
@@ -200,33 +212,46 @@ final class FilterRules {
         }
 
         void read(Reader input) throws IOException {
+            read(input, "过滤规则");
+        }
+
+        void read(Reader input, String source) throws IOException {
             try (BufferedReader reader = new BufferedReader(input)) {
                 for (String line; (line = reader.readLine()) != null;) {
                     line = line.trim();
                     if (line.isEmpty() || line.startsWith("!") || line.startsWith("[")) continue;
                     if (line.length() > 1500 || lines.size() >= 200000) { skipped++; continue; }
-                    int first = line.indexOf('$');
-                    if (first > 0 && line.contains("badfilter")
-                            && line.substring(first + 1).matches("(?:[^,]+,)*badfilter(?:,[^,]+)*")) {
-                        ArrayList<String> opts = new ArrayList<>(Arrays.asList(line.substring(first + 1).split(",")));
-                        opts.remove("badfilter");
-                        disabled.add(line.substring(0, first) + (opts.isEmpty() ? "" : "$" + String.join(",", opts)));
-                    } else {
-                        lines.add(line);
-                    }
+                    String target = disabledRule(line);
+                    if (target != null) disabled.add(target); else lines.putIfAbsent(line, source);
                 }
             }
         }
 
         FilterRules build() {
-            for (String text : lines) if (!disabled.contains(text)) {
-                int marker = text.indexOf("#@#");
-                boolean cosmeticAllow = marker >= 0;
-                if (!cosmeticAllow) marker = text.indexOf("##");
-                boolean added = marker >= 0 ? cosmetic(text, marker, cosmeticAllow) : network(text);
-                if (!added) skipped++;
+            for (Map.Entry<String, String> entry : lines.entrySet()) if (!disabled.contains(entry.getKey())) {
+                if (!addRule(entry.getKey(), entry.getValue())) skipped++;
             }
             return new FilterRules(this);
+        }
+
+        static String disabledRule(String line) {
+            int first = line.indexOf('$');
+            if (first <= 0 || !line.contains("badfilter")
+                    || !line.substring(first + 1).matches("(?:[^,]+,)*badfilter(?:,[^,]+)*")) return null;
+            ArrayList<String> options = new ArrayList<>(Arrays.asList(line.substring(first + 1).split(",")));
+            options.remove("badfilter");
+            return line.substring(0, first) + (options.isEmpty() ? "" : "$" + String.join(",", options));
+        }
+
+        boolean addRule(String text) {
+            return addRule(text, null);
+        }
+
+        private boolean addRule(String text, String source) {
+            int marker = text.indexOf("#@#");
+            boolean cosmeticAllow = marker >= 0;
+            if (!cosmeticAllow) marker = text.indexOf("##");
+            return marker >= 0 ? cosmetic(text, marker, cosmeticAllow) : network(text, source);
         }
 
         private boolean cosmetic(String text, int index, boolean allow) {
@@ -242,7 +267,7 @@ final class FilterRules {
             return true;
         }
 
-        private boolean network(String text) {
+        private boolean network(String text, String source) {
             boolean allow = text.startsWith("@@");
             String body = allow ? text.substring(2) : text;
             int dollar = body.indexOf('$');
@@ -285,7 +310,7 @@ final class FilterRules {
                     pattern = pattern(tail, true);
                     if (pattern == null) return false;
                 }
-                add(page ? pageExceptions : hosts, host, new Rule(pattern, scope, allow,
+                add(page ? pageExceptions : hosts, host, rule(text, source, pattern, scope, allow,
                         party, types, exceptTypes, cosmeticOnly, true));
             } else {
                 if (page) return false;
@@ -297,10 +322,18 @@ final class FilterRules {
                 // A key late in the longest literal avoids putting every HTTPS rule in the same bucket.
                 long key = 0;
                 for (int i = literal.length() - 5; i < literal.length(); i++) key = step(key, literal.charAt(i));
-                add(fragments, key, new Rule(pattern, scope, allow, party, types, exceptTypes, false, false));
+                add(fragments, key, rule(text, source, pattern, scope, allow, party, types, exceptTypes, false, false));
             }
             networkCount++;
             return true;
+        }
+
+        private Rule rule(String text, String source, Pattern pattern, Scope scope, boolean allow,
+                          int party, int types, int exceptTypes, boolean cosmeticOnly, boolean anchored) {
+            int start = evidence.length();
+            if (!allow && source != null) evidence.append(text);
+            return new Rule(pattern, scope, allow, party, types, exceptTypes, cosmeticOnly, anchored,
+                    source, start, evidence.length());
         }
     }
 
@@ -326,13 +359,15 @@ final class FilterRules {
         }
     }
 
-    private static final class Rule {
+    static final class Rule {
         final Pattern pattern;
         final Scope scope;
         final boolean allow, cosmeticOnly, anchored;
         final int party, types, exceptTypes;
+        final String source;
+        final int evidenceStart, evidenceEnd;
         Rule(Pattern pattern, Scope scope, boolean allow, int party, int types, int exceptTypes,
-             boolean cosmeticOnly, boolean anchored) {
+             boolean cosmeticOnly, boolean anchored, String source, int evidenceStart, int evidenceEnd) {
             this.pattern = pattern;
             this.scope = scope;
             this.allow = allow;
@@ -341,6 +376,9 @@ final class FilterRules {
             this.exceptTypes = exceptTypes;
             this.cosmeticOnly = cosmeticOnly;
             this.anchored = anchored;
+            this.source = source;
+            this.evidenceStart = evidenceStart;
+            this.evidenceEnd = evidenceEnd;
         }
         boolean applies(String top, String path, String url, boolean third, int type) {
             if ((party != 0 && (party > 0) != third)

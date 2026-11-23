@@ -10,6 +10,8 @@ import java.io.*;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.zip.GZIPInputStream;
@@ -56,7 +58,7 @@ final class SiteFilter {
         started = true;
         worker.execute(() -> {
             try {
-                rules = compile();
+                rules = compile(loadCustom());
             } catch (IOException | RuntimeException e) {
                 android.util.Log.w("AikoFilter", "Could not load filter lists", e);
             }
@@ -91,7 +93,7 @@ final class SiteFilter {
             boolean compiled = false;
             if (refreshed > 0) {
                 try {
-                    rules = compile();
+                    rules = compile(loadCustom());
                     compiled = true;
                 } catch (IOException | RuntimeException e) {
                     android.util.Log.w("AikoFilter", "Kept existing compiled rules", e);
@@ -107,12 +109,64 @@ final class SiteFilter {
         return true;
     }
 
+    String customSource() throws IOException {
+        try {
+            byte[] bytes = Files.readAllBytes(customFile().getBaseFile().toPath());
+            if (bytes.length > 4 * CustomFilterList.MAX_CHARS) throw new IOException("Custom rules too large");
+            return new String(bytes, StandardCharsets.UTF_8);
+        } catch (NoSuchFileException missing) {
+            return "";
+        }
+    }
+
+    interface CustomResult { void done(int count, String error); }
+
+    void saveCustom(String source, CustomResult callback) {
+        worker.execute(() -> {
+            int count = 0;
+            String error = null;
+            try {
+                CustomFilterList list = CustomFilterList.parse(source);
+                FilterRules next = compile(list.rules);
+                AtomicFile file = customFile();
+                FileOutputStream stream = file.startWrite();
+                try {
+                    stream.write(source.getBytes(StandardCharsets.UTF_8));
+                    file.finishWrite(stream);
+                } catch (IOException | RuntimeException failure) {
+                    file.failWrite(stream);
+                    throw failure;
+                }
+                rules = next;
+                count = list.count;
+            } catch (IllegalArgumentException invalid) {
+                error = invalid.getMessage();
+            } catch (IOException | RuntimeException failure) {
+                android.util.Log.w("AikoFilter", "Could not save custom filters", failure);
+                error = "保存失败，继续使用原有规则。";
+            }
+            final int saved = count;
+            final String detail = error;
+            main.post(() -> callback.done(saved, detail));
+        });
+    }
+
     void close() { worker.shutdown(); }
 
-    private FilterRules compile() throws IOException {
+    private String loadCustom() {
+        try {
+            return CustomFilterList.parse(customSource()).rules;
+        } catch (IOException | IllegalArgumentException invalid) {
+            android.util.Log.w("AikoFilter", "Ignoring invalid custom filter data");
+            return "";
+        }
+    }
+
+    private FilterRules compile(String customRules) throws IOException {
         FilterRules.Builder builder = new FilterRules.Builder();
         builder.suffixes(new InputStreamReader(
                 new GZIPInputStream(app.getAssets().open("filters/psl.txt.gz")), StandardCharsets.UTF_8));
+        builder.read(new StringReader(customRules), "自定义规则");
         for (int i = 0; i < IDS.length; i++) {
             AtomicFile cache = cache(i);
             InputStream source;
@@ -121,13 +175,17 @@ final class SiteFilter {
             } catch (FileNotFoundException e) {
                 source = new GZIPInputStream(app.getAssets().open("filters/" + IDS[i] + ".txt.gz"));
             }
-            builder.read(new InputStreamReader(source, StandardCharsets.UTF_8));
+            builder.read(new InputStreamReader(source, StandardCharsets.UTF_8), TITLES[i]);
         }
         return builder.build();
     }
 
     private AtomicFile cache(int i) {
         return new AtomicFile(new File(app.getFilesDir(), "filter-" + IDS[i] + ".txt"));
+    }
+
+    private AtomicFile customFile() {
+        return new AtomicFile(new File(app.getFilesDir(), "filters-user.txt"));
     }
 
     private static byte[] fetch(String url, String title) throws IOException {
@@ -164,10 +222,19 @@ final class SiteFilter {
 
     static final class Page {
         final String url, host;
+        final FilterTrace trace;
         volatile Decision decision;
         Page(String url) {
+            this(url, null);
+        }
+        private Page(String url, Page previous) {
             this.url = url;
             host = normal(Uri.parse(url).getHost());
+            trace = previous != null && host != null && host.equals(previous.host)
+                    ? previous.trace : new FilterTrace();
+        }
+        Page withHistoryUrl(String nextUrl) {
+            return url.equals(nextUrl) ? this : new Page(nextUrl, this);
         }
     }
 
@@ -189,7 +256,12 @@ final class SiteFilter {
         String scheme = uri.getScheme(), host = normal(uri.getHost());
         if (host == null || (!"http".equals(scheme) && !"https".equals(scheme))) return false;
         FilterRules snapshot = rules;
-        if (snapshot == FilterRules.EMPTY) return bootstrapBlocks(page.host, host);
+        if (snapshot == FilterRules.EMPTY) {
+            String tracker = bootstrapMatch(page.host, host);
+            if (tracker == null) return false;
+            page.trace.addBootstrap(host, tracker);
+            return true;
+        }
         Decision decision = page.decision;
         if (decision == null || decision.rules != snapshot) page.decision = decision = new Decision(snapshot, page);
         if (decision.excepted) return false;
@@ -200,7 +272,10 @@ final class SiteFilter {
             String mode = header(headers, "Sec-Fetch-Mode");
             if ("cors".equals(mode) || "same-origin".equals(mode)) type = 64;
         }
-        return snapshot.blocks(page.host, decision.key, host, uri.toString(), type, relation);
+        FilterRules.Rule match = snapshot.blockingRule(page.host, decision.key, host, uri.toString(), type, relation);
+        if (match == null) return false;
+        page.trace.add(host, snapshot, match);
+        return true;
     }
 
     private static String header(java.util.Map<String, String> headers, String name) {
@@ -239,12 +314,12 @@ final class SiteFilter {
         storage.edit().putStringSet("allow", next).apply();
     }
 
-    boolean bootstrapBlocks(String site, String host) {
-        if (host == null || !enabled(site) || host.equalsIgnoreCase(site)) return false;
+    private String bootstrapMatch(String site, String host) {
+        if (host.equalsIgnoreCase(site)) return null;
         for (String tracker : TRACKERS) {
-            if (atDomain(host, tracker) && !atDomain(site, tracker)) return true;
+            if (atDomain(host, tracker) && !atDomain(site, tracker)) return tracker;
         }
-        return false;
+        return null;
     }
 
     static String normal(String host) {
