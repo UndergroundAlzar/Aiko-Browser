@@ -15,7 +15,7 @@ import javax.net.ssl.HttpsURLConnection;
 final class UserScriptInput {
     static String read(InputStream stream, int maxBytes) throws IOException {
         if (stream == null) throw new IOException("无法打开脚本");
-        ByteArrayOutputStream data = new ByteArrayOutputStream();
+        ByteArrayOutputStream data = new ByteArrayOutputStream(Math.min(Math.max(1024, maxBytes), 16384));
         byte[] buffer = new byte[8192];
         for (int count; (count = stream.read(buffer)) != -1;) {
             if (count > maxBytes - data.size()) throw new IOException("脚本文件太大");

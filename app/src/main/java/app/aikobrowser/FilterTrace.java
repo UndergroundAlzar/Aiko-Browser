@@ -8,7 +8,7 @@ import java.util.List;
 final class FilterTrace {
     static final int LIMIT = 12;
     private static final int MAX_REASON = 260;
-    private long count;
+    private volatile long count;
     private ArrayList<Hit> hits;
 
     static final class Hit {
@@ -32,6 +32,8 @@ final class FilterTrace {
             this.recent = recent;
         }
     }
+
+    long count() { return count; }
 
     synchronized void add(String host, FilterRules rules, FilterRules.Rule rule) {
         if (record(host, rule)) append(host, rule.source, rules.description(rule), rule);

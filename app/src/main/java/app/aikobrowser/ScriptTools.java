@@ -209,8 +209,9 @@ final class ScriptTools {
 
     private LinearLayout inset(EditText input) {
         LinearLayout around = new LinearLayout(activity);
-        int padding = activity.dp(22);
-        around.setPadding(padding, 0, padding, activity.dp(6));
+        float density = activity.getResources().getDisplayMetrics().density;
+        int padding = Math.round(22 * density);
+        around.setPadding(padding, 0, padding, Math.round(6 * density));
         around.addView(input, new LinearLayout.LayoutParams(-1, -2));
         return around;
     }

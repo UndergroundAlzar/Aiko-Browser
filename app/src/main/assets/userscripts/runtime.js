@@ -126,12 +126,27 @@ function (config, body) {
     if (config.runAt === "document-start") {
         run();
     } else if (config.runAt === "document-body" && !document.body && document.readyState === "loading") {
-        const observer = new MutationObserver(() => {
-            if (!document.body) return;
+        let done = false;
+        let observed = document.documentElement || document;
+        const finish = (invoke) => {
+            if (done) return;
+            done = true;
             observer.disconnect();
-            run();
+            document.removeEventListener("DOMContentLoaded", onReady);
+            if (invoke) run();
+        };
+        const onReady = () => finish(!!document.body);
+        const observer = new MutationObserver(() => {
+            if (document.body) {
+                finish(true);
+            } else if (document.documentElement && observed !== document.documentElement) {
+                observer.disconnect();
+                observed = document.documentElement;
+                observer.observe(observed, {childList: true});
+            }
         });
-        observer.observe(document, {childList: true, subtree: true});
+        observer.observe(observed, {childList: true});
+        document.addEventListener("DOMContentLoaded", onReady, {once: true});
     } else if (config.runAt === "document-idle") {
         whenReady(() => {
             if (typeof requestIdleCallback === "function") requestIdleCallback(run, {timeout: 700});

@@ -70,6 +70,7 @@ final class RangeDownload {
         this.cookie = cookie;
         this.pacer = pacer;
         this.workerSetup = workerSetup;
+        control.attachPacer(pacer);
         checkpoint = new File(part.getPath() + ".state");
     }
 
@@ -193,6 +194,10 @@ final class RangeDownload {
                         }
                         if (remaining > 0 && System.nanoTime() - deadline >= 0) {
                             if (failure.get() == null && !control.stopped && downloaded() != saved) {
+                                if (pacer.yielding()) {
+                                    deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(250);
+                                    continue;
+                                }
                                 try {
                                     saved = save(channel);
                                 } catch (IOException error) {
@@ -302,25 +307,57 @@ final class RangeDownload {
                     s.active = true;
                 }
             }
-            byte[] bytes = new byte[64 * 1024];
+            int bufSize = segments.size() <= 16 ? 256 * 1024 : 128 * 1024;
+            if (s.end >= 0L) {
+                long spanLeft = s.end - s.next;
+                if (spanLeft > 0L && spanLeft < bufSize) bufSize = (int) Math.max(8192L, spanLeft);
+            }
+            byte[] bytes = new byte[bufSize];
             ByteBuffer buffer = ByteBuffer.wrap(bytes);
-            long lastTime = System.nanoTime(), lastOffset = start;
+            int buffered = 0;
+            long lastFlush = System.nanoTime();
+            long lastTime = lastFlush, lastOffset = start;
             try (InputStream input = connection.getInputStream()) {
-                while (s.end < 0 || s.next < s.end) {
-                    pacer.await(control);
-                    int limit = s.end < 0L ? bytes.length : (int) Math.min(bytes.length, s.end - s.next);
-                    int n = input.read(bytes, 0, limit);
-                    if (n < 0) break;
-                    long pos = s.next;
-                    buffer.clear();
-                    buffer.limit(n);
-                    while (buffer.hasRemaining()) pos += channel.write(buffer, pos);
-                    s.next = pos;
-                    long now = System.nanoTime();
-                    if (now - lastTime >= 300_000_000L) {
-                        s.bytesPerSecond = (long) ((pos - lastOffset) * 1e9 / (now - lastTime));
-                        lastOffset = pos;
-                        lastTime = now;
+                boolean completedCleanly = false;
+                try {
+                    while (s.end < 0 || s.next + buffered < s.end) {
+                        if (pacer.yielding() || control.stopped) {
+                            if (buffered > 0) {
+                                flushSegment(s, channel, buffer, buffered);
+                                buffered = 0;
+                                lastFlush = System.nanoTime();
+                            }
+                            pacer.await(control);
+                        }
+                        int free = bytes.length - buffered;
+                        int limit = s.end < 0L ? free : (int) Math.min(free, s.end - (s.next + buffered));
+                        if (limit <= 0) break;
+                        int n = input.read(bytes, buffered, limit);
+                        if (n < 0) break;
+                        buffered += n;
+                        long now = System.nanoTime();
+                        boolean segmentDone = s.end >= 0L && s.next + buffered >= s.end;
+                        if (buffered >= bytes.length || segmentDone || pacer.yielding() || control.stopped
+                                || now - lastFlush >= 250_000_000L) {
+                            long pos = flushSegment(s, channel, buffer, buffered);
+                            buffered = 0;
+                            lastFlush = now;
+                            if (now - lastTime >= 300_000_000L) {
+                                s.bytesPerSecond = (long) ((pos - lastOffset) * 1e9 / (now - lastTime));
+                                lastOffset = pos;
+                                lastTime = now;
+                            }
+                        }
+                    }
+                    if (buffered > 0) {
+                        flushSegment(s, channel, buffer, buffered);
+                        buffered = 0;
+                    }
+                    completedCleanly = true;
+                } finally {
+                    if (!completedCleanly && buffered > 0) {
+                        try { flushSegment(s, channel, buffer, buffered); }
+                        catch (IOException ignored) { }
                     }
                 }
             }
@@ -331,6 +368,15 @@ final class RangeDownload {
             s.bytesPerSecond = 0;
             close(connection);
         }
+    }
+
+    private static long flushSegment(Segment s, FileChannel channel, ByteBuffer buffer, int length) throws IOException {
+        long pos = s.next;
+        buffer.position(0);
+        buffer.limit(length);
+        while (buffer.hasRemaining()) pos += channel.write(buffer, pos);
+        s.next = pos;
+        return pos;
     }
 
     private HttpURLConnection open(String range, String condition) throws IOException {
@@ -469,7 +515,7 @@ final class RangeDownload {
             offsets[i] = s.next;
             bytes += offsets[i] - s.start;
         }
-        channel.force(true);
+        channel.force(false);
         File draft = draftFile(checkpoint);
         try (FileOutputStream file = new FileOutputStream(draft);
              DataOutputStream out = new DataOutputStream(new BufferedOutputStream(file))) {
@@ -499,12 +545,16 @@ final class RangeDownload {
 
     static final class Control {
         private final Set<HttpURLConnection> connections = ConcurrentHashMap.newKeySet();
+        private volatile TransferPacer pacer;
         volatile boolean stopped;
+        void attachPacer(TransferPacer target) { pacer = target; }
         void stop() { stopped = true; interruptConnections(); }
         void check() throws InterruptedIOException {
             if (stopped || Thread.currentThread().isInterrupted()) throw new InterruptedIOException("已暂停");
         }
         void interruptConnections() {
+            TransferPacer target = pacer;
+            if (target != null) target.wake();
             for (HttpURLConnection c : connections) c.disconnect();
         }
     }

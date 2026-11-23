@@ -20,7 +20,7 @@ final class UserScript {
     final List<UrlPattern> includes, excludes;
     final Set<String> grants;
     final Set<String> origins;
-    final boolean requiresIsolation, pageWorld;
+    final boolean requiresIsolation, pageWorld, anyPort;
 
     private UserScript(String source, String code, Map<String, String> metadata,
                        List<UrlPattern> includes, List<UrlPattern> excludes, Set<String> grants) {
@@ -35,11 +35,13 @@ final class UserScript {
         this.grants = Collections.unmodifiableSet(grants);
         requiresIsolation = !grants.isEmpty() || "DOM".equals(metadata.get("sandbox"));
         pageWorld = "raw".equals(metadata.get("sandbox"));
+        boolean hasAnyPort = false;
         Set<String> allowed = new LinkedHashSet<>();
         for (UrlPattern rule : includes) {
-            rule.addOrigins(allowed);
-            if (allowed.contains("*")) break;
+            if (rule.port < 0) hasAnyPort = true;
+            if (!allowed.contains("*")) rule.addOrigins(allowed);
         }
+        anyPort = hasAnyPort;
         origins = allowed.contains("*") ? Collections.singleton("*") : Collections.unmodifiableSet(allowed);
     }
 
@@ -146,15 +148,17 @@ final class UserScript {
 
     static final class UrlPattern {
         final String original, scheme, host, path;
-        final boolean subdomains;
+        final boolean subdomains, wildcardPort;
         final int port;
 
-        private UrlPattern(String original, String scheme, String host, boolean subdomains, int port, String path) {
+        private UrlPattern(String original, String scheme, String host, boolean subdomains,
+                           int port, boolean wildcardPort, String path) {
             this.original = original;
             this.scheme = scheme;
             this.host = host;
             this.subdomains = subdomains;
             this.port = port;
+            this.wildcardPort = wildcardPort;
             this.path = path;
         }
 
@@ -173,10 +177,13 @@ final class UserScript {
             if (subdomains) authority = authority.substring(2);
             int colon = authority.lastIndexOf(':');
             int port = -1;
+            boolean wildcardPort = false;
             if (colon > authority.lastIndexOf(']')) {
                 String valuePort = authority.substring(colon + 1);
                 authority = authority.substring(0, colon);
-                if (!valuePort.equals("*")) {
+                if (valuePort.equals("*")) {
+                    wildcardPort = true;
+                } else {
                     try { port = Integer.parseInt(valuePort); }
                     catch (NumberFormatException ex) { throw invalid("网址模式的端口无效"); }
                     if (port < 1 || port > 65535) throw invalid("网址模式的端口无效");
@@ -193,13 +200,14 @@ final class UserScript {
             } catch (IllegalArgumentException ex) {
                 throw invalid("网址模式的域名无效");
             }
-            return new UrlPattern(value, scheme, host, subdomains, port, path);
+            return new UrlPattern(value, scheme, host, subdomains, port, wildcardPort, path);
         }
 
         void addOrigins(Set<String> allowed) {
-            // AndroidX uses the default port if omitted. Preserve match-pattern any-port
-            // behavior with a scoped check inside the script and (for native messages) Java.
-            if (port < 0 || host.equals("*")) {
+            // Narrow to default-port origin rules unless host or port is explicitly wildcarded,
+            // so Chromium avoids creating isolated worlds on unrelated sites & iframes.
+            // Rare non-default port visits for omitted-port patterns are handled dynamically by UserScripts.
+            if (host.equals("*") || wildcardPort) {
                 allowed.add("*");
                 return;
             }
@@ -208,8 +216,18 @@ final class UserScript {
         }
 
         private void addOrigin(Set<String> allowed, String protocol) {
-            allowed.add(protocol + "://" + host + ":" + port);
-            if (subdomains) allowed.add(protocol + "://*." + host + ":" + port);
+            String suffix = port > 0 ? ":" + port : "";
+            allowed.add(protocol + "://" + host + suffix);
+            if (subdomains && !isIpLiteral(host)) allowed.add(protocol + "://*." + host + suffix);
+        }
+
+        private static boolean isIpLiteral(String host) {
+            if (host.startsWith("[")) return true;
+            for (int i = 0; i < host.length(); i++) {
+                char c = host.charAt(i);
+                if ((c < '0' || c > '9') && c != '.') return false;
+            }
+            return !host.isEmpty();
         }
 
         boolean matches(URI uri) {

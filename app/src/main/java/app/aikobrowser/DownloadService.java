@@ -10,6 +10,8 @@ import android.webkit.CookieManager;
 
 import java.io.*;
 import java.net.URL;
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.util.concurrent.ExecutorService;
@@ -20,6 +22,20 @@ public final class DownloadService extends Service {
     private static final String RUN = "app.aikobrowser.download.RUN";
     private static final String PAUSE = "app.aikobrowser.download.PAUSE";
     private static final int NOTIFICATION_ID = 7;
+    private static final long PUBLISH_CHUNK_BYTES = 2L * 1024 * 1024;
+    // LOAD_LOCK guards only in-memory `current` transitions (never held across disk/IPC I/O).
+    private static final Object LOAD_LOCK = new Object();
+    private static final Object DISK_LOAD_LOCK = new Object();
+    private static final Handler MAIN = new Handler(Looper.getMainLooper());
+    private static final ExecutorService IO = Executors.newSingleThreadExecutor(task -> {
+        Thread thread = new Thread(() -> {
+            try { android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND); }
+            catch (SecurityException ignored) { }
+            task.run();
+        }, "aiko-download-io");
+        thread.setDaemon(true);
+        return thread;
+    });
     static final TransferPacer PACER = new TransferPacer();
     static volatile Job current;
 
@@ -30,7 +46,7 @@ public final class DownloadService extends Service {
         final File part;
         volatile RangeDownload transfer;
         volatile String state = "等待启动";
-        volatile boolean busy, saving, finished, cancelled;
+        volatile boolean busy, saving, finished, cancelled, pauseRequested, needsRecordWrite;
         volatile Uri output;
         volatile DownloadRecord record;
 
@@ -44,57 +60,102 @@ public final class DownloadService extends Service {
         }
     }
 
-    private final ExecutorService worker = Executors.newSingleThreadExecutor();
+    private final ExecutorService worker = Executors.newSingleThreadExecutor(task -> new Thread(() -> {
+        try { android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND); }
+        catch (SecurityException ignored) { }
+        task.run();
+    }, "aiko-download-worker"));
     private final Handler handler = new Handler(Looper.getMainLooper());
+    private HandlerThread notifThread;
+    private Handler notifHandler;
+    private NotificationManager notificationManager;
+    private PendingIntent openIntent, pauseIntent;
     private final Runnable update = new Runnable() {
         @Override public void run() {
             Job job = current;
             if (job == null || !job.busy) return;
-            getSystemService(NotificationManager.class).notify(NOTIFICATION_ID, notification(job));
-            handler.postDelayed(this, 1000);
+            NotificationManager nm = notificationManager;
+            if (nm != null) nm.notify(NOTIFICATION_ID, notification(job));
+            Handler nh = notifHandler;
+            if (nh != null) nh.postDelayed(this, 1000);
         }
     };
 
     static Job start(Context context, String address, String name, String ua, int lanes)
             throws Exception {
-        Job previous = loadCurrent(context);
-        if (previous != null && (previous.busy || (!previous.finished && !previous.cancelled))) {
-            throw new IOException("请先完成或取消当前任务");
-        }
         URL url = new URL(address);
         RangeDownload.requireHttp(url);
-        File folder = new File(context.getFilesDir(), "transfers");
-        if (!folder.isDirectory() && !folder.mkdirs()) throw new IOException("无法创建下载目录");
+        Context app = context.getApplicationContext();
+        File folder = new File(app.getFilesDir(), "transfers");
         DownloadRecord record = new DownloadRecord(url, safeName(name), ua, lanes);
         Job job = new Job(record, partFile(folder, url));
-        record.write(folder);
-        current = job;
-        launch(context, job);
+        job.needsRecordWrite = true;
+        job.state = "准备下载";
+        job.busy = true;
+        Job previous;
+        synchronized (LOAD_LOCK) {
+            previous = current;
+            if (previous != null && (previous.busy || (!previous.finished && !previous.cancelled))) {
+                throw new IOException("请先完成或取消当前任务");
+            }
+            current = job;
+        }
+        try {
+            context.startForegroundService(new Intent(context, DownloadService.class).setAction(RUN));
+        } catch (RuntimeException e) {
+            job.busy = false;
+            job.state = "无法启动后台下载";
+            synchronized (LOAD_LOCK) {
+                if (current == job) current = previous;
+            }
+            throw e;
+        }
         return job;
     }
 
+    static void loadCurrentAsync(Context context, Runnable onReady) {
+        if (current != null) {
+            if (Looper.myLooper() == Looper.getMainLooper()) onReady.run();
+            else MAIN.post(onReady);
+            return;
+        }
+        Context app = context.getApplicationContext();
+        IO.execute(() -> {
+            loadCurrent(app);
+            MAIN.post(onReady);
+        });
+    }
+
     static Job loadCurrent(Context context) {
-        if (current != null) return current;
-        File folder = new File(context.getFilesDir(), "transfers");
-        DownloadRecord record = DownloadRecord.read(folder);
-        if (record == null) return null;
-        Job job = new Job(record, partFile(folder, record.url));
-        job.transfer = new RangeDownload(job.url, job.part, job.lanes, job.userAgent, null);
-        job.transfer.showSavedProgress();
-        if (record.phase != DownloadRecord.TRANSFERRING) {
-            Uri output = Uri.parse(record.output);
-            if (record.phase == DownloadRecord.COMPLETE || isPublished(context.getContentResolver(), output)) {
-                job.output = output;
-                job.finished = true;
-                job.state = "已完成 · 下载目录";
+        Job existing = current;
+        if (existing != null) return existing;
+        synchronized (DISK_LOAD_LOCK) {
+            existing = current;
+            if (existing != null) return existing;
+            File folder = new File(context.getFilesDir(), "transfers");
+            DownloadRecord record = DownloadRecord.read(folder);
+            if (record == null) return current;
+            Job job = new Job(record, partFile(folder, record.url));
+            job.transfer = new RangeDownload(job.url, job.part, job.lanes, job.userAgent, null);
+            job.transfer.showSavedProgress();
+            if (record.phase != DownloadRecord.TRANSFERRING) {
+                Uri output = Uri.parse(record.output);
+                if (record.phase == DownloadRecord.COMPLETE || isPublished(context.getContentResolver(), output)) {
+                    job.output = output;
+                    job.finished = true;
+                    job.state = "已完成 · 下载目录";
+                }
+            }
+            if (!job.finished) {
+                job.state = job.transfer.resumable ? "已恢复任务 · 可续传"
+                        : record.phase == DownloadRecord.PUBLISHING ? "写入中断 · 点继续保存" : "已恢复任务 · 等待继续";
+            }
+            synchronized (LOAD_LOCK) {
+                if (current != null) return current;
+                current = job;
+                return job;
             }
         }
-        if (!job.finished) {
-            job.state = job.transfer.resumable ? "已恢复任务 · 可续传"
-                    : record.phase == DownloadRecord.PUBLISHING ? "写入中断 · 点继续保存" : "已恢复任务 · 等待继续";
-        }
-        current = job;
-        return job;
     }
 
     private static File partFile(File folder, URL url) {
@@ -104,7 +165,7 @@ public final class DownloadService extends Service {
         } catch (java.security.NoSuchAlgorithmException error) {
             throw new AssertionError(error);
         }
-        StringBuilder key = new StringBuilder();
+        StringBuilder key = new StringBuilder(64);
         for (byte b : hash) {
             key.append(Character.forDigit((b & 255) >>> 4, 16));
             key.append(Character.forDigit(b & 15, 16));
@@ -113,16 +174,13 @@ public final class DownloadService extends Service {
     }
 
     static void launch(Context context, Job job) {
-        if (job.busy || job.finished || job.cancelled) return;
-        String cookies = CookieManager.getInstance().getCookie(job.url.toExternalForm());
-        job.transfer = new RangeDownload(job.url, job.part, job.lanes, job.userAgent, cookies,
-                PACER, () -> {
-                    try { android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND); }
-                    catch (SecurityException ignored) { }
-                });
-        job.state = "准备下载";
-        job.busy = true;
-        current = job;
+        synchronized (LOAD_LOCK) {
+            if (job.busy || job.finished || job.cancelled) return;
+            job.pauseRequested = false;
+            job.state = "准备下载";
+            job.busy = true;
+            current = job;
+        }
         try {
             context.startForegroundService(new Intent(context, DownloadService.class).setAction(RUN));
         } catch (RuntimeException e) {
@@ -134,11 +192,20 @@ public final class DownloadService extends Service {
 
     static void pause(Job job) {
         if (job == null || !job.busy || job.saving) return;
+        job.pauseRequested = true;
         job.state = "正在暂停";
-        RangeDownload.Control control = job.transfer.control;
-        control.stopped = true;
-        // Some HTTP implementations can block in disconnect; keep it off the UI thread.
-        new Thread(control::interruptConnections, "aiko-download-stop").start();
+        RangeDownload transfer = job.transfer;
+        if (transfer != null) {
+            RangeDownload.Control control = transfer.control;
+            control.stopped = true;
+            // Some HTTP implementations can block in disconnect; keep it off the UI thread.
+            new Thread(() -> {
+                try { android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND); }
+                catch (SecurityException ignored) { }
+                control.interruptConnections();
+            }, "aiko-download-stop").start();
+        }
+        PACER.wake();
     }
 
     static void cancel(Context context, Job job) {
@@ -149,8 +216,11 @@ public final class DownloadService extends Service {
         } else {
             job.state = "已取消";
             job.busy = true;
+            Context app = context.getApplicationContext();
             new Thread(() -> {
-                try { discardJob(context, job); }
+                try { android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND); }
+                catch (SecurityException ignored) { }
+                try { discardJob(app, job); }
                 catch (IOException error) { job.state = "清理失败"; job.cancelled = false; }
                 finally { job.busy = false; }
             }, "aiko-download-discard").start();
@@ -159,8 +229,18 @@ public final class DownloadService extends Service {
 
     @Override public void onCreate() {
         super.onCreate();
+        notificationManager = getSystemService(NotificationManager.class);
         NotificationChannel channel = new NotificationChannel(CHANNEL, "文件下载", NotificationManager.IMPORTANCE_LOW);
-        getSystemService(NotificationManager.class).createNotificationChannel(channel);
+        notificationManager.createNotificationChannel(channel);
+        openIntent = PendingIntent.getActivity(this, 1,
+                new Intent(this, MainActivity.class).putExtra("downloads", true)
+                        .addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
+                PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
+        pauseIntent = PendingIntent.getService(this, 2,
+                new Intent(this, DownloadService.class).setAction(PAUSE), PendingIntent.FLAG_IMMUTABLE);
+        notifThread = new HandlerThread("aiko-download-notif", android.os.Process.THREAD_PRIORITY_BACKGROUND);
+        notifThread.start();
+        notifHandler = new Handler(notifThread.getLooper());
     }
 
     @Override public int onStartCommand(Intent intent, int flags, int startId) {
@@ -174,12 +254,16 @@ public final class DownloadService extends Service {
             return START_NOT_STICKY;
         }
         startForeground(NOTIFICATION_ID, notification(job));
-        handler.removeCallbacks(update);
-        handler.postDelayed(update, 1000);
+        Handler nh = notifHandler;
+        if (nh != null) {
+            nh.removeCallbacks(update);
+            nh.postDelayed(update, 1000);
+        }
         worker.execute(() -> {
             perform(job);
             handler.post(() -> {
-                handler.removeCallbacks(update);
+                Handler bg = notifHandler;
+                if (bg != null) bg.removeCallbacks(update);
                 stopForeground(STOP_FOREGROUND_REMOVE);
                 stopSelfResult(startId);
                 job.busy = false;
@@ -189,17 +273,56 @@ public final class DownloadService extends Service {
     }
 
     private void perform(Job job) {
-        android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND);
+        try { android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND); }
+        catch (SecurityException ignored) { }
         try {
+            if (job.pauseRequested || job.cancelled) {
+                job.state = "已暂停";
+                return;
+            }
+            if (job.needsRecordWrite) {
+                File folder = job.part.getParentFile();
+                if (folder != null && !folder.isDirectory() && !folder.mkdirs()) {
+                    throw new IOException("无法创建下载目录");
+                }
+                if (folder != null) {
+                    DownloadRecord previous = DownloadRecord.read(folder);
+                    if (previous != null) {
+                        File oldPart = partFile(folder, previous.url);
+                        if (!oldPart.equals(job.part)) {
+                            try {
+                                new RangeDownload(previous.url, oldPart, previous.lanes,
+                                        previous.userAgent, null).discard();
+                            } catch (IOException ignored) { }
+                        }
+                    }
+                    job.record.write(folder);
+                }
+                job.needsRecordWrite = false;
+            }
+            String cookies = null;
+            try { cookies = CookieManager.getInstance().getCookie(job.url.toExternalForm()); }
+            catch (RuntimeException ignored) { }
+            RangeDownload transfer = new RangeDownload(job.url, job.part, job.lanes, job.userAgent, cookies,
+                    PACER, () -> {
+                        try { android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND); }
+                        catch (SecurityException ignored) { }
+                    });
+            job.transfer = transfer;
+            if (job.pauseRequested || job.cancelled) {
+                transfer.control.stopped = true;
+                job.state = "已暂停";
+                return;
+            }
             job.state = "下载中";
             boolean staged = job.record.phase == DownloadRecord.PUBLISHING
                     && job.part.isFile() && job.part.length() == job.record.size;
             if (!staged && job.record.phase == DownloadRecord.PUBLISHING) {
                 throw new IOException("待保存文件不完整，请取消后重新下载");
             }
-            if (staged || job.transfer.transfer()) {
+            if (staged || transfer.transfer()) {
                 job.saving = true;
-                if (job.transfer.control.stopped || job.cancelled) {
+                if (transfer.control.stopped || job.pauseRequested || job.cancelled) {
                     job.state = "已暂停";
                     return;
                 }
@@ -207,7 +330,7 @@ public final class DownloadService extends Service {
                 job.output = publish(job);
                 job.finished = true;
                 job.state = "已完成 · 下载目录";
-                try { job.transfer.discard(); } catch (IOException ignored) { }
+                try { transfer.discard(); } catch (IOException ignored) { }
             } else {
                 job.state = "已暂停";
             }
@@ -256,10 +379,8 @@ public final class DownloadService extends Service {
             ParcelFileDescriptor descriptor = resolver.openFileDescriptor(uri, "rwt");
             if (descriptor == null) throw new IOException("无法打开下载文件");
             try (FileOutputStream out = new ParcelFileDescriptor.AutoCloseOutputStream(descriptor);
-                 InputStream in = new FileInputStream(job.part)) {
-                byte[] buffer = new byte[256 * 1024];
-                int n;
-                while ((n = in.read(buffer)) >= 0) out.write(buffer, 0, n);
+                 FileInputStream in = new FileInputStream(job.part)) {
+                copyPublished(in.getChannel(), out.getChannel());
                 out.getFD().sync();
             }
             ContentValues values = new ContentValues();
@@ -269,6 +390,48 @@ public final class DownloadService extends Service {
             return uri;
         } catch (RuntimeException error) {
             throw new IOException("无法保存下载文件", error);
+        }
+    }
+
+    private static void copyPublished(FileChannel src, FileChannel dst) throws IOException {
+        long size = src.size();
+        long pos = 0;
+        boolean useTransferTo = true;
+        while (pos < size && useTransferTo) {
+            PACER.awaitYieldQuietly();
+            long count = Math.min(PUBLISH_CHUNK_BYTES, size - pos);
+            try {
+                long moved = src.transferTo(pos, count, dst);
+                if (moved > 0) {
+                    pos += moved;
+                } else {
+                    useTransferTo = false;
+                }
+            } catch (IOException unsupported) {
+                if (pos == 0) {
+                    useTransferTo = false;
+                } else {
+                    throw unsupported;
+                }
+            }
+        }
+        if (pos < size) {
+            src.position(pos);
+            dst.position(pos);
+            ByteBuffer buffer = ByteBuffer.allocate(256 * 1024);
+            long sinceYield = 0;
+            while (pos < size) {
+                if (sinceYield >= PUBLISH_CHUNK_BYTES) {
+                    PACER.awaitYieldQuietly();
+                    sinceYield = 0;
+                }
+                buffer.clear();
+                int n = src.read(buffer);
+                if (n < 0) break;
+                buffer.flip();
+                while (buffer.hasRemaining()) pos += dst.write(buffer);
+                sinceYield += n;
+            }
         }
     }
 
@@ -315,19 +478,13 @@ public final class DownloadService extends Service {
     }
 
     private Notification notification(Job job) {
-        PendingIntent open = PendingIntent.getActivity(this, 1,
-                new Intent(this, MainActivity.class).putExtra("downloads", true)
-                        .addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
-                PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
-        PendingIntent pause = PendingIntent.getService(this, 2,
-                new Intent(this, DownloadService.class).setAction(PAUSE), PendingIntent.FLAG_IMMUTABLE);
         RangeDownload download = job.transfer;
         long total = download == null ? 0 : download.total;
         int percent = total > 0 ? (int) Math.min(100, 100.0 * download.downloaded() / total) : 0;
         return new Notification.Builder(this, CHANNEL).setSmallIcon(android.R.drawable.stat_sys_download)
                 .setContentTitle(job.name).setContentText(job.state)
-                .setContentIntent(open).setProgress(100, percent, total <= 0).setOnlyAlertOnce(true)
-                .setOngoing(true).addAction(new Notification.Action.Builder(null, "暂停", pause).build()).build();
+                .setContentIntent(openIntent).setProgress(100, percent, total <= 0).setOnlyAlertOnce(true)
+                .setOngoing(true).addAction(new Notification.Action.Builder(null, "暂停", pauseIntent).build()).build();
     }
 
     @Override public IBinder onBind(Intent intent) { return null; }
@@ -339,7 +496,13 @@ public final class DownloadService extends Service {
     }
 
     @Override public void onDestroy() {
-        handler.removeCallbacks(update);
+        Handler nh = notifHandler;
+        if (nh != null) nh.removeCallbacks(update);
+        if (notifThread != null) {
+            notifThread.quitSafely();
+            notifThread = null;
+            notifHandler = null;
+        }
         worker.shutdown();
         super.onDestroy();
     }

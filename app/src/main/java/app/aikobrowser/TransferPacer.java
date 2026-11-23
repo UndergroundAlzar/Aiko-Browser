@@ -2,39 +2,43 @@ package app.aikobrowser;
 
 import java.io.InterruptedIOException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /** Briefly yields the downloader to a foreground page navigation. */
 final class TransferPacer {
-    private final Object lock = new Object();
+    // stateLock is only acquired by control/UI callers (never by download workers), preventing priority inversion.
+    private final Object stateLock = new Object();
+    private final Object waitLock = new Object();
+    private final AtomicInteger waiters = new AtomicInteger();
     private volatile long until;
     private volatile boolean browserFirst = true;
     private long generation;
 
     long protect(long milliseconds) {
-        synchronized (lock) {
+        if (!browserFirst) return 0;
+        synchronized (stateLock) {
             if (!browserFirst) return 0;
-            long now = System.nanoTime();
-            until = now + TimeUnit.MILLISECONDS.toNanos(Math.min(Math.max(1, milliseconds), 1600));
-            lock.notifyAll();
+            long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(Math.min(Math.max(1, milliseconds), 1600));
+            until = deadline == 0 ? 1L : deadline;
             return ++generation;
         }
     }
 
     void release(long ticket) {
         if (ticket == 0) return;
-        synchronized (lock) {
+        synchronized (stateLock) {
             if (ticket != generation) return;
             until = 0;
-            lock.notifyAll();
         }
+        wake();
     }
 
     void setBrowserFirst(boolean enabled) {
-        synchronized (lock) {
+        synchronized (stateLock) {
             browserFirst = enabled;
             if (!enabled) until = 0;
-            lock.notifyAll();
         }
+        if (!enabled) wake();
     }
 
     boolean browserFirst() { return browserFirst; }
@@ -44,22 +48,60 @@ final class TransferPacer {
         return end != 0 && end - System.nanoTime() > 0;
     }
 
+    void wake() {
+        if (waiters.get() > 0) {
+            synchronized (waitLock) {
+                waitLock.notifyAll();
+            }
+        }
+    }
+
     void await(RangeDownload.Control control) throws InterruptedIOException {
         control.check();
         if (!yielding()) return;
-        synchronized (lock) {
-            for (;;) {
-                control.check();
-                if (until == 0) return;
-                long remaining = until - System.nanoTime();
-                if (remaining <= 0) return;
-                try {
-                    TimeUnit.NANOSECONDS.timedWait(lock, Math.min(remaining, 80_000_000L));
-                } catch (InterruptedException error) {
-                    Thread.currentThread().interrupt();
-                    throw new InterruptedIOException("下载被中断");
+        control.attachPacer(this);
+        waiters.incrementAndGet();
+        try {
+            synchronized (waitLock) {
+                for (;;) {
+                    control.check();
+                    long end = until;
+                    if (end == 0) return;
+                    long remaining = end - System.nanoTime();
+                    if (remaining <= 0) return;
+                    try {
+                        TimeUnit.NANOSECONDS.timedWait(waitLock, remaining);
+                    } catch (InterruptedException error) {
+                        Thread.currentThread().interrupt();
+                        throw new InterruptedIOException("下载被中断");
+                    }
                 }
             }
+        } finally {
+            waiters.decrementAndGet();
+        }
+    }
+
+    void awaitYieldQuietly() {
+        if (!yielding()) return;
+        waiters.incrementAndGet();
+        try {
+            synchronized (waitLock) {
+                for (;;) {
+                    long end = until;
+                    if (end == 0) return;
+                    long remaining = end - System.nanoTime();
+                    if (remaining <= 0) return;
+                    try {
+                        TimeUnit.NANOSECONDS.timedWait(waitLock, remaining);
+                    } catch (InterruptedException error) {
+                        Thread.currentThread().interrupt();
+                        return;
+                    }
+                }
+            }
+        } finally {
+            waiters.decrementAndGet();
         }
     }
 }

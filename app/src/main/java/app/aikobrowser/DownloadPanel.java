@@ -2,12 +2,17 @@ package app.aikobrowser;
 
 import android.app.Dialog;
 import android.content.Intent;
+import android.content.res.ColorStateList;
 import android.graphics.Canvas;
 import android.graphics.Paint;
 import android.graphics.Typeface;
+import android.graphics.drawable.Drawable;
+import android.graphics.drawable.GradientDrawable;
+import android.graphics.drawable.RippleDrawable;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
+import android.text.TextUtils;
 import android.view.Gravity;
 import android.view.MotionEvent;
 import android.view.View;
@@ -20,12 +25,29 @@ import java.util.List;
 import java.util.Locale;
 
 final class DownloadPanel {
-    private static final int TRACK = 0xff442d3b;
+    private static final int CANVAS = 0xFF0B0D12;
+    private static final int SURFACE = 0xFF131722;
+    private static final int ELEVATED = 0xFF1B2130;
+    private static final int PILL = 0xFF21283B;
+    private static final int STROKE = 0x24FFFFFF;
+    private static final int HANDLE = 0x38FFFFFF;
+    private static final int TEXT = 0xFFF3F6FC;
+    private static final int MUTED = 0xFF9AA5BD;
+    private static final int ACCENT = 0xFF7C9BFF;
+    private static final int SUCCESS = 0xFF4ADE80;
+    private static final int WARN = 0xFFFBBF24;
+    private static final int TRACK = 0xFF242D42;
+    private static final int DONE_SEGMENT = 0xFF4C63B6;
+    private static final int RIPPLE = 0x307C9BFF;
+    private static final Typeface MEDIUM = Typeface.create("sans-serif-medium", Typeface.NORMAL);
+
     private final MainActivity activity;
+    private final float density;
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final Runnable tick = this::render;
     private Dialog dialog;
     private TextView file, status, metric, rate, remaining, section, details, priority, pause, cancel, finish;
+    private View metricsRow, segmentCard;
     private ProgressBar overall;
     private MapView map;
     private ListView lanes;
@@ -34,54 +56,146 @@ final class DownloadPanel {
     private long lastTime, lastBytes;
     private double speed;
     private int selected = -1;
+    private int lastProgress = -1;
+    private boolean lastIndeterminate, lastFinishedTint, lastYieldTint;
+    private Boolean lastBrowserFirst;
 
-    DownloadPanel(MainActivity activity) { this.activity = activity; }
+    DownloadPanel(MainActivity activity) {
+        this.activity = activity;
+        this.density = activity.getResources().getDisplayMetrics().density;
+    }
 
     void show() {
-        DownloadService.loadCurrent(activity);
         dialog = new Dialog(activity);
         dialog.requestWindowFeature(Window.FEATURE_NO_TITLE);
+
         LinearLayout card = new LinearLayout(activity);
-        card.setPadding(dp(20), dp(16), dp(20), dp(12));
+        card.setPadding(dp(20), dp(10), dp(20), dp(18));
         card.setOrientation(LinearLayout.VERTICAL);
-        card.setBackground(activity.shape(MainActivity.PANEL, 24));
-        add(card, "下载", 20, MainActivity.TEXT, 34).setTypeface(null, Typeface.BOLD);
-        file = add(card, "", 16, MainActivity.TEXT, 28);
+        card.setBackground(sheetBackground());
+
+        // Centered drag handle pill
+        View handle = new View(activity);
+        handle.setBackground(pill(HANDLE, 2, 0));
+        LinearLayout.LayoutParams handleLp = new LinearLayout.LayoutParams(dp(38), dp(4));
+        handleLp.gravity = Gravity.CENTER_HORIZONTAL;
+        handleLp.bottomMargin = dp(12);
+        card.addView(handle, handleLp);
+
+        // Header row: title + priority toggle pill
+        LinearLayout header = new LinearLayout(activity);
+        header.setGravity(Gravity.CENTER_VERTICAL);
+        LinearLayout.LayoutParams headerLp = new LinearLayout.LayoutParams(-1, -2);
+        headerLp.bottomMargin = dp(14);
+        card.addView(header, headerLp);
+
+        TextView title = label("下载", 20, TEXT);
+        title.setTypeface(MEDIUM, Typeface.BOLD);
+        header.addView(title, new LinearLayout.LayoutParams(0, -2, 1));
+
+        priority = label("", 12, SUCCESS);
+        priority.setTypeface(MEDIUM);
+        priority.setGravity(Gravity.CENTER);
+        priority.setPadding(dp(12), dp(6), dp(12), dp(6));
+        priority.setBackground(ripplePill(PILL, 16, STROKE));
+        priority.setOnClickListener(v -> {
+            activity.toggleTransferPriority();
+            render();
+        });
+        header.addView(priority, new LinearLayout.LayoutParams(-2, dp(32)));
+
+        // Primary job status card
+        LinearLayout infoCard = new LinearLayout(activity);
+        infoCard.setOrientation(LinearLayout.VERTICAL);
+        infoCard.setPadding(dp(16), dp(14), dp(16), dp(14));
+        infoCard.setBackground(pill(ELEVATED, 16, STROKE));
+        LinearLayout.LayoutParams infoLp = new LinearLayout.LayoutParams(-1, -2);
+        infoLp.bottomMargin = dp(12);
+        card.addView(infoCard, infoLp);
+
+        file = label("", 15, TEXT);
+        file.setTypeface(MEDIUM);
         file.setSingleLine(true);
-        file.setEllipsize(android.text.TextUtils.TruncateAt.MIDDLE);
-        status = add(card, "", 13, MainActivity.MUTED, 24);
-        metric = add(card, "", 14, MainActivity.TEXT, 28);
+        file.setEllipsize(TextUtils.TruncateAt.MIDDLE);
+        infoCard.addView(file, new LinearLayout.LayoutParams(-1, -2));
+
+        status = label("", 12, MUTED);
+        status.setSingleLine(true);
+        status.setEllipsize(TextUtils.TruncateAt.END);
+        LinearLayout.LayoutParams statusLp = new LinearLayout.LayoutParams(-1, -2);
+        statusLp.topMargin = dp(4);
+        infoCard.addView(status, statusLp);
+
         overall = new ProgressBar(activity, null, android.R.attr.progressBarStyleHorizontal);
         overall.setMax(1000);
-        overall.setProgressTintList(android.content.res.ColorStateList.valueOf(MainActivity.RUBY));
-        overall.setProgressBackgroundTintList(android.content.res.ColorStateList.valueOf(TRACK));
-        card.addView(overall, new LinearLayout.LayoutParams(-1, dp(10)));
+        overall.setProgressTintList(ColorStateList.valueOf(ACCENT));
+        overall.setProgressBackgroundTintList(ColorStateList.valueOf(TRACK));
+        LinearLayout.LayoutParams barLp = new LinearLayout.LayoutParams(-1, dp(8));
+        barLp.topMargin = dp(12);
+        barLp.bottomMargin = dp(10);
+        infoCard.addView(overall, barLp);
+
+        metric = label("", 13, TEXT);
+        metric.setSingleLine(true);
+        metric.setEllipsize(TextUtils.TruncateAt.END);
+        infoCard.addView(metric, new LinearLayout.LayoutParams(-1, -2));
+
         LinearLayout metrics = new LinearLayout(activity);
-        card.addView(metrics, new LinearLayout.LayoutParams(-1, dp(34)));
-        rate = metricLabel(metrics, MainActivity.RUBY, Gravity.START);
-        remaining = metricLabel(metrics, MainActivity.MUTED, Gravity.END);
-        section = add(card, "", 13, MainActivity.MUTED, 26);
+        metricsRow = metrics;
+        LinearLayout.LayoutParams metricsLp = new LinearLayout.LayoutParams(-1, -2);
+        metricsLp.topMargin = dp(6);
+        infoCard.addView(metrics, metricsLp);
+        rate = metricLabel(metrics, ACCENT, Gravity.START);
+        rate.setTypeface(MEDIUM);
+        remaining = metricLabel(metrics, MUTED, Gravity.END);
+
+        // Segment overview + map + collapsible lane list
+        LinearLayout segBox = new LinearLayout(activity);
+        segmentCard = segBox;
+        segBox.setOrientation(LinearLayout.VERTICAL);
+        segBox.setPadding(dp(14), dp(12), dp(14), dp(10));
+        segBox.setBackground(pill(ELEVATED, 16, STROKE));
+        LinearLayout.LayoutParams segLp = new LinearLayout.LayoutParams(-1, -2);
+        segLp.bottomMargin = dp(14);
+        card.addView(segBox, segLp);
+
+        LinearLayout segHeader = new LinearLayout(activity);
+        segHeader.setGravity(Gravity.CENTER_VERTICAL);
+        segBox.addView(segHeader, new LinearLayout.LayoutParams(-1, -2));
+
+        section = label("", 12, MUTED);
+        section.setSingleLine(true);
+        section.setEllipsize(TextUtils.TruncateAt.END);
+        segHeader.addView(section, new LinearLayout.LayoutParams(0, -2, 1));
+
+        details = label("分段详情 ▾", 12, ACCENT);
+        details.setTypeface(MEDIUM);
+        details.setPadding(dp(10), dp(4), dp(10), dp(4));
+        details.setBackground(ripplePill(PILL, 12, STROKE));
+        details.setOnClickListener(v -> toggleLanes());
+        segHeader.addView(details, new LinearLayout.LayoutParams(-2, -2));
+
         map = new MapView();
-        card.addView(map, new LinearLayout.LayoutParams(-1, dp(42)));
-        details = add(card, "分段详情  ▾", 14, MainActivity.RUBY, 39);
+        LinearLayout.LayoutParams mapLp = new LinearLayout.LayoutParams(-1, dp(36));
+        mapLp.topMargin = dp(6);
+        segBox.addView(map, mapLp);
+
         adapter = new SegmentAdapter();
         lanes = new ListView(activity);
         lanes.setAdapter(adapter);
         lanes.setDivider(null);
-        card.addView(lanes, new LinearLayout.LayoutParams(-1,
-                dp(Math.min(208, Math.max(48, activity.getResources().getConfiguration().screenHeightDp - 380)))));
+        lanes.setVerticalScrollBarEnabled(false);
+        LinearLayout.LayoutParams lanesLp = new LinearLayout.LayoutParams(-1,
+                dp(Math.min(200, Math.max(60, activity.getResources().getConfiguration().screenHeightDp - 420))));
+        lanesLp.topMargin = dp(6);
+        segBox.addView(lanes, lanesLp);
         lanes.setVisibility(View.GONE);
-        details.setOnClickListener(v -> toggleLanes());
+
         map.setOnClickListener(v -> {
             int target = map.touchedIndex;
             map.touchedIndex = -1;
             if (target < 0) toggleLanes();
             else jumpToSegment(target);
-        });
-        priority = add(card, "", 13, MainActivity.RUBY, 35);
-        priority.setOnClickListener(v -> {
-            activity.toggleTransferPriority();
-            render();
         });
         lanes.setOnItemClickListener((parent, view, position, id) -> {
             if (position >= adapter.getCount()) return;
@@ -93,9 +207,10 @@ final class DownloadPanel {
                     .setPositiveButton("关闭", null).show();
         });
 
+        // Bottom control actions
         LinearLayout controls = new LinearLayout(activity);
         card.addView(controls, new LinearLayout.LayoutParams(-1, dp(46)));
-        button(controls, "新建", () -> {
+        button(controls, "新建", false, () -> {
             DownloadService.Job job = DownloadService.current;
             if (job != null && (job.busy || (!job.finished && !job.cancelled))) {
                 activity.toast("请先完成或取消当前任务");
@@ -104,7 +219,7 @@ final class DownloadPanel {
             dialog.dismiss();
             activity.showNewDownload("", "", null);
         });
-        pause = button(controls, "暂停", () -> {
+        pause = button(controls, "暂停", false, () -> {
             DownloadService.Job job = DownloadService.current;
             if (job == null || job.finished || job.cancelled) return;
             try {
@@ -115,7 +230,7 @@ final class DownloadPanel {
             }
             render();
         });
-        cancel = button(controls, "取消任务", () -> {
+        cancel = button(controls, "取消", false, () -> {
             DownloadService.Job job = DownloadService.current;
             if (job == null || job.finished || job.cancelled || job.saving) return;
             new android.app.AlertDialog.Builder(activity).setTitle("取消此下载？")
@@ -126,7 +241,7 @@ final class DownloadPanel {
                         render();
                     }).show();
         });
-        finish = button(controls, "关闭", () -> {
+        finish = button(controls, "关闭", true, () -> {
             DownloadService.Job job = DownloadService.current;
             if (job != null && job.finished && job.output != null) {
                 Intent intent = new Intent(Intent.ACTION_VIEW).setData(job.output)
@@ -138,27 +253,31 @@ final class DownloadPanel {
                 dialog.dismiss();
             }
         });
+
         dialog.setOnDismissListener(d -> handler.removeCallbacks(tick));
         activity.showSheet(dialog, card);
         render();
+        if (DownloadService.current == null) {
+            DownloadService.loadCurrentAsync(activity, this::render);
+        }
     }
 
     private void toggleLanes() {
         boolean open = lanes.getVisibility() == View.VISIBLE;
-        lanes.setVisibility(open ? View.GONE : View.VISIBLE);
+        setVisibility(lanes, open ? View.GONE : View.VISIBLE);
         render();
     }
 
     private void jumpToSegment(int target) {
         selected = target;
-        lanes.setVisibility(View.VISIBLE);
+        setVisibility(lanes, View.VISIBLE);
         render();
         if (target < adapter.getCount()) lanes.setSelectionFromTop(target, dp(3));
     }
 
     private void render() {
         handler.removeCallbacks(tick);
-        if (!dialog.isShowing()) return;
+        if (dialog == null || !dialog.isShowing()) return;
         DownloadService.Job job = DownloadService.current;
         RangeDownload d = job == null ? null : job.transfer;
         List<RangeDownload.Segment> segments = d == null ? Collections.emptyList() : d.segments;
@@ -179,70 +298,119 @@ final class DownloadPanel {
                 lastTime = now;
             }
         }
-        file.setText(job == null ? "还没有下载任务" : job.name);
-        status.setText(job == null ? "点新建，输入文件链接" : job.state
-                + (d == null || !job.busy || job.saving ? "" : DownloadService.PACER.yielding()
-                        ? " · 网页优先" : " · " + d.mode));
-        priority.setText(DownloadService.PACER.browserFirst() ? "浏览优先 · 点按切换" : "下载全速 · 点按切换");
+
+        boolean yielding = d != null && job != null && job.busy && !job.saving && DownloadService.PACER.yielding();
+        boolean browserFirst = DownloadService.PACER.browserFirst();
+        setText(file, job == null ? "还没有下载任务" : job.name);
+        setText(status, job == null ? "点新建，输入文件链接开始多线程下载" : job.state
+                + (d == null || !job.busy || job.saving ? "" : yielding ? " · 网页优先" : " · " + d.mode));
+        if (job != null && job.finished) {
+            if (!lastFinishedTint) {
+                status.setTextColor(SUCCESS);
+                overall.setProgressTintList(ColorStateList.valueOf(SUCCESS));
+                lastFinishedTint = true;
+                lastYieldTint = false;
+            }
+        } else if (yielding) {
+            if (!lastYieldTint || lastFinishedTint) {
+                status.setTextColor(WARN);
+                overall.setProgressTintList(ColorStateList.valueOf(WARN));
+                lastYieldTint = true;
+                lastFinishedTint = false;
+            }
+        } else if (lastFinishedTint || lastYieldTint) {
+            status.setTextColor(MUTED);
+            overall.setProgressTintList(ColorStateList.valueOf(ACCENT));
+            lastFinishedTint = false;
+            lastYieldTint = false;
+        }
+
+        if (lastBrowserFirst == null || lastBrowserFirst != browserFirst) {
+            lastBrowserFirst = browserFirst;
+            setText(priority, browserFirst ? "浏览优先" : "下载全速");
+            priority.setTextColor(browserFirst ? SUCCESS : WARN);
+        }
+
         String time = speed > 0 && total > bytes ? "剩余 " + eta((long) Math.ceil((total - bytes) / speed)) : "";
         String percent = total > 0 ? String.format(Locale.ROOT, " (%.1f%%)", 100.0 * bytes / total) : "";
         setText(metric, job == null ? "" : size(bytes) + (total > 0 ? " / " + size(total) : "") + percent);
         setText(rate, speed > 0 ? size((long) speed) + "/s" : "");
         setText(remaining, time);
-        ((View) rate.getParent()).setVisibility(job == null || !job.busy ? View.GONE : View.VISIBLE);
-        overall.setIndeterminate(job != null && job.busy && total <= 0);
-        overall.setProgress(total > 0 ? (int) Math.min(1000, 1000.0 * bytes / total) : 0);
-        section.setText(job == null ? "" : segments.size() + " 个分段  ·  "
-                + (d == null ? 0 : d.activeLanes()) + " 路活动  ·  上限 " + job.lanes + " 路");
-        map.segments = segments;
-        map.total = total;
-        map.invalidate();
-        adapter.segments = segments;
-        if (lanes.getVisibility() == View.VISIBLE) adapter.notifyDataSetChanged();
-        details.setVisibility(segments.isEmpty() ? View.GONE : View.VISIBLE);
-        map.setVisibility(segments.isEmpty() ? View.GONE : View.VISIBLE);
-        setText(details, lanes.getVisibility() == View.GONE ? "分段详情  ▾"
-                : selected < 0 ? "收起分段  ▴" : "分段 " + (selected + 1) + "  ·  收起  ▴");
-        pause.setEnabled(job != null && !job.finished && !job.cancelled && !job.saving
-                && !job.state.equals("正在暂停"));
-        pause.setAlpha(pause.isEnabled() ? 1 : 0.35f);
-        pause.setText(job == null || job.busy ? "暂停" : "继续");
-        cancel.setEnabled(job != null && !job.finished && !job.cancelled && !job.saving);
-        cancel.setAlpha(cancel.isEnabled() ? 1 : 0.35f);
-        finish.setText(job != null && job.finished ? "打开文件" : "关闭");
+        setVisibility(metricsRow, job == null || !job.busy ? View.GONE : View.VISIBLE);
+
+        boolean indeterminate = job != null && job.busy && total <= 0;
+        if (indeterminate != lastIndeterminate) {
+            overall.setIndeterminate(indeterminate);
+            lastIndeterminate = indeterminate;
+        }
+        int progress = total > 0 ? (int) Math.min(1000, 1000.0 * bytes / total) : 0;
+        if (progress != lastProgress) {
+            overall.setProgress(progress);
+            lastProgress = progress;
+        }
+
+        boolean hasSegments = !segments.isEmpty();
+        setVisibility(segmentCard, hasSegments ? View.VISIBLE : View.GONE);
+        if (hasSegments) {
+            setText(section, segments.size() + " 分段 · " + (d == null ? 0 : d.activeLanes())
+                    + " 路活动 · 上限 " + job.lanes + " 路");
+            map.segments = segments;
+            map.total = total;
+            map.finished = job.finished;
+            map.invalidate();
+            adapter.segments = segments;
+            if (lanes.getVisibility() == View.VISIBLE) adapter.notifyDataSetChanged();
+            setText(details, lanes.getVisibility() == View.GONE ? "分段详情 ▾"
+                    : selected < 0 ? "收起 ▴" : "分段 " + (selected + 1) + " ▴");
+        }
+
+        boolean canPause = job != null && !job.finished && !job.cancelled && !job.saving
+                && !"正在暂停".equals(job.state);
+        setInteractive(pause, canPause);
+        setText(pause, job == null || job.busy ? "暂停" : "继续");
+        boolean canCancel = job != null && !job.finished && !job.cancelled && !job.saving;
+        setInteractive(cancel, canCancel);
+        setText(finish, job != null && job.finished ? "打开文件" : "关闭");
         if (job != null && job.busy) handler.postDelayed(tick, 250);
     }
 
     private final class MapView extends View {
         private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final float padY, radius, markHeight;
         List<RangeDownload.Segment> segments = Collections.emptyList();
         long total;
+        boolean finished;
         int touchedIndex = -1;
         int downIndex = -1;
+
         MapView() {
             super(activity);
+            padY = dp(10);
+            radius = dp(4);
+            markHeight = dp(3);
             setContentDescription("文件分段地图，点按跳到相应分段");
         }
+
         @Override protected void onDraw(Canvas c) {
-            float width = getWidth(), bottom = getHeight() - dp(9), top = dp(9);
+            float width = getWidth(), top = padY, bottom = getHeight() - padY;
             paint.setColor(TRACK);
-            c.drawRoundRect(0f, top, width, bottom, dp(2), dp(2), paint);
+            c.drawRoundRect(0f, top, width, bottom, radius, radius, paint);
             if (total <= 0) return;
             for (int i = 0; i < segments.size(); i++) {
                 RangeDownload.Segment s = segments.get(i);
                 float x = (float) (width * ((double) s.start / total));
                 float full = (float) (width * ((double) (s.end < 0 ? total : s.end) / total));
                 float done = (float) (width * ((double) s.next / total));
-                paint.setColor(s.active ? MainActivity.RUBY : 0xffca829b);
+                paint.setColor(finished ? SUCCESS : s.active ? ACCENT : DONE_SEGMENT);
                 if (done > x) c.drawRect(x, top, Math.min(full, done), bottom, paint);
                 if (x > 0 && segments.size() < width) {
-                    paint.setColor(MainActivity.PANEL);
+                    paint.setColor(ELEVATED);
                     c.drawRect(x, top, x + 1f, bottom, paint);
                 }
                 if (i == selected) {
-                    paint.setColor(MainActivity.TEXT);
-                    c.drawRect(x, top - dp(3), full, top, paint);
-                    c.drawRect(x, bottom, full, bottom + dp(3), paint);
+                    paint.setColor(TEXT);
+                    c.drawRect(x, top - markHeight, full, top, paint);
+                    c.drawRect(x, bottom, full, bottom + markHeight, paint);
                 }
             }
         }
@@ -282,7 +450,7 @@ final class DownloadPanel {
             TextView row;
             if (view instanceof TextView) row = (TextView) view;
             else {
-                row = activity.label("", 12, MainActivity.TEXT);
+                row = label("", 12, TEXT);
                 row.setTypeface(Typeface.MONOSPACE);
                 row.setGravity(Gravity.CENTER_VERTICAL);
                 row.setMinHeight(dp(34));
@@ -291,48 +459,83 @@ final class DownloadPanel {
             RangeDownload.Segment s = segments.get(i);
             long span = s.end < 0 ? 0 : s.end - s.start;
             long progress = s.next - s.start;
+            boolean complete = span > 0 && progress == span;
             String state = s.active ? size(s.bytesPerSecond) + "/s"
-                    : span > 0 && progress == span ? "完成" : s.retrying ? "正在重试" : "等待";
-            row.setText(String.format(Locale.ROOT, "%03d   %s%s   %s", i + 1,
+                    : complete ? "完成" : s.retrying ? "正在重试" : "等待";
+            setText(row, String.format(Locale.ROOT, "%03d   %s%s   %s", i + 1,
                     size(progress), span > 0 ? " / " + size(span) : "", state));
-            row.setTextColor(s.active ? MainActivity.RUBY : MainActivity.TEXT);
-            row.setBackgroundColor(i == selected ? MainActivity.FIELD : 0);
+            row.setTextColor(s.active ? ACCENT : complete ? SUCCESS : s.retrying ? WARN : MUTED);
+            row.setBackgroundColor(i == selected ? PILL : 0);
             return row;
         }
     }
 
     private TextView metricLabel(LinearLayout parent, int color, int alignment) {
-        TextView text = activity.label("", 14, color);
+        TextView text = label("", 13, color);
         text.setGravity(Gravity.CENTER_VERTICAL | alignment);
         text.setSingleLine();
-        text.setEllipsize(android.text.TextUtils.TruncateAt.END);
-        parent.addView(text, new LinearLayout.LayoutParams(0, -1, 1));
+        text.setEllipsize(TextUtils.TruncateAt.END);
+        parent.addView(text, new LinearLayout.LayoutParams(0, -2, 1));
         return text;
     }
 
     private static void setText(TextView field, String value) {
-        if (!android.text.TextUtils.equals(field.getText(), value)) field.setText(value);
+        if (!TextUtils.equals(field.getText(), value)) field.setText(value);
     }
 
-    private TextView add(LinearLayout parent, String value, int sp, int color, int height) {
-        TextView text = activity.label(value, sp, color);
-        text.setGravity(Gravity.CENTER_VERTICAL);
-        parent.addView(text, new LinearLayout.LayoutParams(-1, dp(height)));
-        return text;
+    private static void setVisibility(View view, int visibility) {
+        if (view.getVisibility() != visibility) view.setVisibility(visibility);
     }
 
-    private TextView button(LinearLayout row, String title, Runnable action) {
-        TextView v = activity.label(title, 14, MainActivity.TEXT);
+    private static void setInteractive(View view, boolean enabled) {
+        if (view.isEnabled() != enabled) view.setEnabled(enabled);
+        float alpha = enabled ? 1f : 0.36f;
+        if (view.getAlpha() != alpha) view.setAlpha(alpha);
+    }
+
+    private TextView label(String text, float size, int color) {
+        TextView v = new TextView(activity);
+        v.setText(text);
+        v.setTextSize(size);
+        v.setTextColor(color);
+        return v;
+    }
+
+    private TextView button(LinearLayout row, String title, boolean accent, Runnable action) {
+        TextView v = label(title, 13, accent ? CANVAS : TEXT);
+        v.setTypeface(MEDIUM);
         v.setGravity(Gravity.CENTER);
-        v.setBackground(activity.shape(MainActivity.FIELD, 10));
-        LinearLayout.LayoutParams size = new LinearLayout.LayoutParams(0, dp(38), 1);
-        size.setMargins(dp(2), dp(4), dp(2), 0);
+        v.setBackground(ripplePill(accent ? ACCENT : PILL, 12, accent ? 0 : STROKE));
+        LinearLayout.LayoutParams size = new LinearLayout.LayoutParams(0, dp(42), 1);
+        size.setMargins(dp(3), dp(2), dp(3), 0);
         row.addView(v, size);
         v.setOnClickListener(w -> action.run());
         return v;
     }
 
-    private int dp(int v) { return activity.dp(v); }
+    private Drawable sheetBackground() {
+        GradientDrawable bg = new GradientDrawable();
+        float top = dp(24);
+        float bottom = dp(20);
+        bg.setCornerRadii(new float[]{top, top, top, top, bottom, bottom, bottom, bottom});
+        bg.setColor(SURFACE);
+        bg.setStroke(Math.max(1, dp(1)), STROKE);
+        return bg;
+    }
+
+    private GradientDrawable pill(int color, int radiusDp, int strokeColor) {
+        GradientDrawable d = new GradientDrawable();
+        d.setCornerRadius(dp(radiusDp));
+        d.setColor(color);
+        if (strokeColor != 0) d.setStroke(Math.max(1, dp(1)), strokeColor);
+        return d;
+    }
+
+    private Drawable ripplePill(int color, int radiusDp, int strokeColor) {
+        return new RippleDrawable(ColorStateList.valueOf(RIPPLE), pill(color, radiusDp, strokeColor), null);
+    }
+
+    private int dp(int v) { return Math.round(v * density); }
 
     private static String size(long n) {
         if (n < 1024) return n + " B";

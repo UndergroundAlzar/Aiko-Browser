@@ -1,12 +1,23 @@
 <resources>
     <style name="AikoTheme" parent="android:style/Theme.Material.NoActionBar">
-        <item name="android:windowBackground">#151217</item>
-        <item name="android:statusBarColor">#151217</item>
-        <item name="android:navigationBarColor">#151217</item>
-        <item name="android:colorAccent">#FF587D</item>
+        <item name="android:windowBackground">#0B0D12</item>
+        <item name="android:colorBackground">#0B0D12</item>
+        <item name="android:statusBarColor">#0B0D12</item>
+        <item name="android:navigationBarColor">#0B0D12</item>
+        <item name="android:colorAccent">#7C9BFF</item>
+        <item name="android:colorPrimary">#131722</item>
+        <item name="android:colorPrimaryDark">#0B0D12</item>
         <item name="android:windowLightNavigationBar">false</item>
         <item name="android:windowLightStatusBar">false</item>
-        <item name="android:fontFamily">sans</item>
+        <item name="android:fontFamily">sans-serif</item>
         <item name="android:windowActionModeOverlay">true</item>
+        <item name="android:alertDialogTheme">@style/AikoDialogTheme</item>
+    </style>
+
+    <style name="AikoDialogTheme" parent="android:style/Theme.Material.Dialog.Alert">
+        <item name="android:colorBackground">#131722</item>
+        <item name="android:colorAccent">#7C9BFF</item>
+        <item name="android:textColorPrimary">#F3F6FC</item>
+        <item name="android:textColorSecondary">#9AA5BD</item>
     </style>
 </resources>
