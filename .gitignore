@@ -1,0 +1,14 @@
+/build/
+/.claude-flow/
+/.gradle/
+/local.properties
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.dpapi
+*.idsig
+*.apk
+.env
+.env.*
+__pycache__/
