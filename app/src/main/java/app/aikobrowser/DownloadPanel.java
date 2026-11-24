@@ -4,7 +4,10 @@ import android.app.Dialog;
 import android.content.Intent;
 import android.content.res.ColorStateList;
 import android.graphics.Canvas;
+import android.graphics.LinearGradient;
 import android.graphics.Paint;
+import android.graphics.Path;
+import android.graphics.Shader;
 import android.graphics.Typeface;
 import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
@@ -20,6 +23,7 @@ import android.view.ViewGroup;
 import android.view.Window;
 import android.widget.*;
 
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
@@ -33,24 +37,44 @@ final class DownloadPanel {
     private final float density;
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final Runnable tick = this::render;
+    private Runnable onOpenSniffedMedia;
+    private int sniffedMediaCount;
     private Dialog dialog;
-    private TextView file, status, metric, rate, remaining, section, details, priority, pause, cancel, finish;
-    private View metricsRow, segmentCard;
+    private TextView file, status, metric, rate, remaining, threadBadge, peakRate, section, details,
+            priority, sniffButton, pause, cancel, finish;
+    private View metricsRow, telemetryRow, segmentCard;
     private ProgressBar overall;
+    private SparklineView sparkline;
     private MapView map;
     private ListView lanes;
     private SegmentAdapter adapter;
     private DownloadService.Job lastJob;
     private long lastTime, lastBytes;
-    private double speed;
+    private double speed, peakSpeed;
     private int selected = -1;
     private int lastProgress = -1;
     private boolean lastIndeterminate, lastFinishedTint, lastYieldTint;
     private Boolean lastBrowserFirst;
 
     DownloadPanel(MainActivity activity) {
+        this(activity, null, 0);
+    }
+
+    DownloadPanel(MainActivity activity, Runnable onOpenSniffedMedia, int sniffedMediaCount) {
         this.activity = activity;
         this.density = activity.getResources().getDisplayMetrics().density;
+        this.onOpenSniffedMedia = onOpenSniffedMedia;
+        this.sniffedMediaCount = Math.max(0, sniffedMediaCount);
+    }
+
+    void setOnSniffMedia(Runnable onOpenSniffedMedia, int sniffedMediaCount) {
+        this.onOpenSniffedMedia = onOpenSniffedMedia;
+        this.sniffedMediaCount = Math.max(0, sniffedMediaCount);
+    }
+
+    void show(Runnable onOpenSniffedMedia, int sniffedMediaCount) {
+        setOnSniffMedia(onOpenSniffedMedia, sniffedMediaCount);
+        show();
     }
 
     void show() {
@@ -73,7 +97,7 @@ final class DownloadPanel {
         handleLp.bottomMargin = dp(12);
         card.addView(handle, handleLp);
 
-        // Header row: title + priority toggle pill
+        // Header row: title + optional Sniffed Media quick pill + priority toggle pill
         LinearLayout header = new LinearLayout(activity);
         header.setGravity(Gravity.CENTER_VERTICAL);
         LinearLayout.LayoutParams headerLp = new LinearLayout.LayoutParams(-1, -2);
@@ -84,6 +108,24 @@ final class DownloadPanel {
         title.setTypeface(AikoTheme.MEDIUM, Typeface.BOLD);
         title.setLetterSpacing(-0.01f);
         header.addView(title, new LinearLayout.LayoutParams(0, -2, 1));
+
+        if (onOpenSniffedMedia != null) {
+            String sniffText = sniffedMediaCount > 0 ? ("页面媒体 (" + sniffedMediaCount + ")") : "页面媒体";
+            sniffButton = label(sniffText, 12, AikoTheme.ACCENT);
+            sniffButton.setTypeface(AikoTheme.MEDIUM);
+            sniffButton.setGravity(Gravity.CENTER);
+            sniffButton.setPadding(dp(11), dp(6), dp(11), dp(6));
+            sniffButton.setBackground(ripplePill(AikoTheme.PILL, 16, AikoTheme.STROKE_ACCENT));
+            AikoTheme.attachPressFeedback(sniffButton, 0.94f);
+            sniffButton.setOnClickListener(v -> {
+                Runnable cb = onOpenSniffedMedia;
+                if (dialog != null && dialog.isShowing()) dialog.dismiss();
+                if (cb != null) cb.run();
+            });
+            LinearLayout.LayoutParams sniffLp = new LinearLayout.LayoutParams(-2, dp(32));
+            sniffLp.rightMargin = dp(8);
+            header.addView(sniffButton, sniffLp);
+        }
 
         priority = label("", 12, AikoTheme.EMERALD);
         priority.setTypeface(AikoTheme.MEDIUM);
@@ -97,7 +139,7 @@ final class DownloadPanel {
         });
         header.addView(priority, new LinearLayout.LayoutParams(-2, dp(32)));
 
-        // Primary job status card
+        // Primary job status card with live 128-thread speed sparkline
         LinearLayout infoCard = new LinearLayout(activity);
         infoCard.setOrientation(LinearLayout.VERTICAL);
         infoCard.setPadding(dp(16), dp(14), dp(16), dp(14));
@@ -142,7 +184,35 @@ final class DownloadPanel {
         rate.setTypeface(AikoTheme.MEDIUM);
         remaining = metricLabel(metrics, AikoTheme.TEXT_MUTED, Gravity.END);
 
-        // Segment overview + map + collapsible lane list
+        // Live speed sparkline + parallel thread telemetry strip (visible while transferring)
+        LinearLayout telemetry = new LinearLayout(activity);
+        telemetryRow = telemetry;
+        telemetry.setOrientation(LinearLayout.VERTICAL);
+        LinearLayout.LayoutParams teleLp = new LinearLayout.LayoutParams(-1, -2);
+        teleLp.topMargin = dp(10);
+        infoCard.addView(telemetry, teleLp);
+
+        LinearLayout teleHeader = new LinearLayout(activity);
+        teleHeader.setGravity(Gravity.CENTER_VERTICAL);
+        telemetry.addView(teleHeader, new LinearLayout.LayoutParams(-1, -2));
+
+        threadBadge = label("", 11, AikoTheme.ACCENT_CYAN);
+        threadBadge.setTypeface(AikoTheme.MEDIUM);
+        threadBadge.setSingleLine(true);
+        teleHeader.addView(threadBadge, new LinearLayout.LayoutParams(0, -2, 1));
+
+        peakRate = label("", 11, AikoTheme.TEXT_DIM);
+        peakRate.setSingleLine(true);
+        peakRate.setGravity(Gravity.END);
+        teleHeader.addView(peakRate, new LinearLayout.LayoutParams(-2, -2));
+
+        sparkline = new SparklineView();
+        LinearLayout.LayoutParams sparkLp = new LinearLayout.LayoutParams(-1, dp(42));
+        sparkLp.topMargin = dp(6);
+        telemetry.addView(sparkline, sparkLp);
+        telemetry.setVisibility(View.GONE);
+
+        // Segment overview + multi-segment parallel progress map + collapsible lane list
         LinearLayout segBox = new LinearLayout(activity);
         segmentCard = segBox;
         segBox.setOrientation(LinearLayout.VERTICAL);
@@ -170,7 +240,7 @@ final class DownloadPanel {
         segHeader.addView(details, new LinearLayout.LayoutParams(-2, -2));
 
         map = new MapView();
-        LinearLayout.LayoutParams mapLp = new LinearLayout.LayoutParams(-1, dp(36));
+        LinearLayout.LayoutParams mapLp = new LinearLayout.LayoutParams(-1, dp(38));
         mapLp.topMargin = dp(6);
         segBox.addView(map, mapLp);
 
@@ -180,7 +250,7 @@ final class DownloadPanel {
         lanes.setDivider(null);
         lanes.setVerticalScrollBarEnabled(false);
         LinearLayout.LayoutParams lanesLp = new LinearLayout.LayoutParams(-1,
-                dp(Math.min(200, Math.max(60, activity.getResources().getConfiguration().screenHeightDp - 420))));
+                dp(Math.min(200, Math.max(60, activity.getResources().getConfiguration().screenHeightDp - 460))));
         lanesLp.topMargin = dp(6);
         segBox.addView(lanes, lanesLp);
         lanes.setVisibility(View.GONE);
@@ -275,9 +345,16 @@ final class DownloadPanel {
         DownloadService.Job job = DownloadService.current;
         RangeDownload d = job == null ? null : job.transfer;
         List<RangeDownload.Segment> segments = d == null ? Collections.emptyList() : d.segments;
-        if (job != lastJob || selected >= segments.size()) selected = -1;
+        if (job != lastJob) {
+            selected = -1;
+            peakSpeed = 0;
+            if (sparkline != null) sparkline.reset();
+        } else if (selected >= segments.size()) {
+            selected = -1;
+        }
         long total = job != null && job.finished && job.record.size >= 0 ? job.record.size : d == null ? -1 : d.total;
         long bytes = job != null && job.finished && total >= 0 ? total : d == null ? 0 : d.downloaded();
+        boolean sampled = false;
         if (job != lastJob || bytes < lastBytes || d == null || !job.busy || job.saving) {
             speed = 0;
             lastBytes = bytes;
@@ -285,18 +362,20 @@ final class DownloadPanel {
             lastJob = job;
         } else {
             long now = SystemClock.elapsedRealtime();
-            if (now - lastTime >= 400) {
+            if (now - lastTime >= 350) {
                 double next = 1000.0 * (bytes - lastBytes) / (now - lastTime);
                 speed = speed == 0 || next == 0 ? next : 0.65 * next + 0.35 * speed;
+                if (speed > peakSpeed) peakSpeed = speed;
                 lastBytes = bytes;
                 lastTime = now;
+                sampled = true;
             }
         }
 
         boolean yielding = d != null && job != null && job.busy && !job.saving && DownloadService.PACER.yielding();
         boolean browserFirst = DownloadService.PACER.browserFirst();
         setText(file, job == null ? "还没有下载任务" : job.name);
-        setText(status, job == null ? "点新建，输入文件链接开始多线程下载" : job.state
+        setText(status, job == null ? "点新建，输入文件链接开始最高 128 路并行下载" : job.state
                 + (d == null || !job.busy || job.saving ? "" : yielding ? " · 网页优先" : " · " + d.mode));
         if (job != null && job.finished) {
             if (!lastFinishedTint) {
@@ -330,7 +409,17 @@ final class DownloadPanel {
         setText(metric, job == null ? "" : size(bytes) + (total > 0 ? " / " + size(total) : "") + percent);
         setText(rate, speed > 0 ? size((long) speed) + "/s" : "");
         setText(remaining, time);
+        boolean activeTransfer = job != null && job.busy && !job.saving;
         setVisibility(metricsRow, job == null || !job.busy ? View.GONE : View.VISIBLE);
+        setVisibility(telemetryRow, activeTransfer ? View.VISIBLE : View.GONE);
+
+        int activeLanes = d == null ? 0 : d.activeLanes();
+        if (activeTransfer) {
+            setText(threadBadge, "⚡ " + activeLanes + " / " + job.lanes + " 线程并行");
+            setText(peakRate, peakSpeed > 0 ? ("峰值 " + size((long) peakSpeed) + "/s") : "测速中…");
+            if (sampled) sparkline.pushSample((float) speed);
+            sparkline.setYielding(yielding);
+        }
 
         boolean indeterminate = job != null && job.busy && total <= 0;
         if (indeterminate != lastIndeterminate) {
@@ -346,7 +435,7 @@ final class DownloadPanel {
         boolean hasSegments = !segments.isEmpty();
         setVisibility(segmentCard, hasSegments ? View.VISIBLE : View.GONE);
         if (hasSegments) {
-            setText(section, segments.size() + " 分段 · " + (d == null ? 0 : d.activeLanes())
+            setText(section, segments.size() + " 分段 · " + activeLanes
                     + " 路活动 · 上限 " + job.lanes + " 路");
             map.segments = segments;
             map.total = total;
@@ -368,9 +457,153 @@ final class DownloadPanel {
         if (job != null && job.busy) handler.postDelayed(tick, 250);
     }
 
+    /** Zero-allocation live speed sparkline with gradient area fill and glowing tip dot. */
+    private final class SparklineView extends View {
+        private static final int CAP = 48;
+        private final float[] samples = new float[CAP];
+        private int count;
+        private int head;
+        private boolean yielding;
+
+        private final Paint bgPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint gridPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint fillPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint strokePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint dotPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Path linePath = new Path();
+        private final Path fillPath = new Path();
+        private final float radius;
+        private final float padX;
+        private final float padY;
+        private int shaderW, shaderH, shaderAccent, shaderCyan;
+
+        SparklineView() {
+            super(activity);
+            radius = dp(8);
+            padX = dp(4);
+            padY = dp(5);
+
+            bgPaint.setStyle(Paint.Style.FILL);
+            gridPaint.setStyle(Paint.Style.STROKE);
+            gridPaint.setStrokeWidth(Math.max(1f, 0.75f * density));
+
+            fillPaint.setStyle(Paint.Style.FILL);
+
+            strokePaint.setStyle(Paint.Style.STROKE);
+            strokePaint.setStrokeWidth(1.8f * density);
+            strokePaint.setStrokeCap(Paint.Cap.ROUND);
+            strokePaint.setStrokeJoin(Paint.Join.ROUND);
+
+            dotPaint.setStyle(Paint.Style.FILL);
+            setContentDescription("实时下载速度曲线");
+        }
+
+        void reset() {
+            Arrays.fill(samples, 0f);
+            count = 0;
+            head = 0;
+            invalidate();
+        }
+
+        void pushSample(float bytesPerSec) {
+            samples[head] = Math.max(0f, bytesPerSec);
+            head = (head + 1) % CAP;
+            if (count < CAP) count++;
+            invalidate();
+        }
+
+        void setYielding(boolean value) {
+            if (yielding != value) {
+                yielding = value;
+                invalidate();
+            }
+        }
+
+        @Override protected void onSizeChanged(int w, int h, int oldw, int oldh) {
+            super.onSizeChanged(w, h, oldw, oldh);
+            rebuildShaders(w, h);
+        }
+
+        private void rebuildShaders(int w, int h) {
+            if (w <= 0 || h <= 0) return;
+            int accent = yielding ? AikoTheme.AMBER : AikoTheme.ACCENT;
+            int cyan = yielding ? AikoTheme.AMBER : AikoTheme.ACCENT_CYAN;
+            if (w == shaderW && h == shaderH && accent == shaderAccent && cyan == shaderCyan) return;
+            shaderW = w;
+            shaderH = h;
+            shaderAccent = accent;
+            shaderCyan = cyan;
+            int topFill = (accent & 0x00FFFFFF) | 0x44000000;
+            int botFill = (accent & 0x00FFFFFF) | 0x04000000;
+            fillPaint.setShader(new LinearGradient(0f, padY, 0f, h - padY, topFill, botFill, Shader.TileMode.CLAMP));
+            strokePaint.setShader(new LinearGradient(padX, 0f, w - padX, 0f, accent, cyan, Shader.TileMode.CLAMP));
+        }
+
+        @Override protected void onDraw(Canvas c) {
+            int w = getWidth(), h = getHeight();
+            if (w <= 0 || h <= 0) return;
+            rebuildShaders(w, h);
+
+            bgPaint.setColor(AikoTheme.PILL);
+            c.drawRoundRect(0f, 0f, w, h, radius, radius, bgPaint);
+
+            gridPaint.setColor(AikoTheme.DIVIDER);
+            float midY = h * 0.5f;
+            c.drawLine(padX, midY, w - padX, midY, gridPaint);
+
+            if (count == 0) return;
+
+            float maxVal = 1024f;
+            for (int i = 0; i < count; i++) {
+                float v = samples[(head - count + i + CAP) % CAP];
+                if (v > maxVal) maxVal = v;
+            }
+            maxVal *= 1.12f;
+
+            float drawW = Math.max(1f, w - padX * 2f);
+            float drawH = Math.max(1f, h - padY * 2f);
+            float bottom = h - padY;
+
+            linePath.rewind();
+            fillPath.rewind();
+
+            float lastX = padX;
+            float lastY = bottom;
+            int denom = Math.max(1, CAP - 1);
+            int startSlot = CAP - count;
+            for (int i = 0; i < count; i++) {
+                float v = samples[(head - count + i + CAP) % CAP];
+                float x = padX + drawW * ((startSlot + i) / (float) denom);
+                float y = bottom - (v / maxVal) * drawH;
+                if (i == 0) {
+                    linePath.moveTo(x, y);
+                    fillPath.moveTo(x, bottom);
+                    fillPath.lineTo(x, y);
+                } else {
+                    linePath.lineTo(x, y);
+                    fillPath.lineTo(x, y);
+                }
+                lastX = x;
+                lastY = y;
+            }
+            fillPath.lineTo(lastX, bottom);
+            fillPath.close();
+
+            if (count >= 2) {
+                c.drawPath(fillPath, fillPaint);
+                c.drawPath(linePath, strokePaint);
+            }
+            dotPaint.setColor((shaderCyan & 0x00FFFFFF) | 0x44000000);
+            c.drawCircle(lastX, lastY, 4.5f * density, dotPaint);
+            dotPaint.setColor(shaderCyan);
+            c.drawCircle(lastX, lastY, 2.2f * density, dotPaint);
+        }
+    }
+
+    /** Zero-allocation multi-segment parallel progress map supporting up to 128 simultaneous lanes. */
     private final class MapView extends View {
         private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
-        private final float padY, radius, markHeight;
+        private final float padY, radius, markHeight, tipWidth;
         List<RangeDownload.Segment> segments = Collections.emptyList();
         long total;
         boolean finished;
@@ -379,9 +612,10 @@ final class DownloadPanel {
 
         MapView() {
             super(activity);
-            padY = dp(10);
-            radius = dp(4);
+            padY = dp(9);
+            radius = dp(5);
             markHeight = dp(3);
+            tipWidth = Math.max(1.5f, 1.5f * density);
             setContentDescription("文件分段地图，点按跳到相应分段");
         }
 
@@ -391,14 +625,32 @@ final class DownloadPanel {
             c.drawRoundRect(0f, top, width, bottom, radius, radius, paint);
             if (total <= 0) return;
             int doneColor = doneSegmentColor();
-            for (int i = 0; i < segments.size(); i++) {
+            int segCount = segments.size();
+            for (int i = 0; i < segCount; i++) {
                 RangeDownload.Segment s = segments.get(i);
                 float x = (float) (width * ((double) s.start / total));
                 float full = (float) (width * ((double) (s.end < 0 ? total : s.end) / total));
-                float done = (float) (width * ((double) s.next / total));
-                paint.setColor(finished ? AikoTheme.EMERALD : s.active ? AikoTheme.ACCENT : doneColor);
-                if (done > x) c.drawRect(x, top, Math.min(full, done), bottom, paint);
-                if (x > 0 && segments.size() < width) {
+                float done = Math.min(full, (float) (width * ((double) s.next / total)));
+                if (finished) {
+                    paint.setColor(AikoTheme.EMERALD);
+                } else if (s.retrying) {
+                    paint.setColor(AikoTheme.AMBER);
+                } else if (s.active) {
+                    paint.setColor(AikoTheme.ACCENT);
+                } else {
+                    paint.setColor(doneColor);
+                }
+                if (done > x) {
+                    c.drawRect(x, top, done, bottom, paint);
+                    if (!finished && s.active && done - x > tipWidth && done < full) {
+                        paint.setColor(AikoTheme.ACCENT_CYAN);
+                        c.drawRect(done - tipWidth, top, done, bottom, paint);
+                    }
+                } else if (!finished && s.retrying && full > x) {
+                    paint.setColor((AikoTheme.AMBER & 0x00FFFFFF) | 0x44000000);
+                    c.drawRect(x, top, full, bottom, paint);
+                }
+                if (x > 0 && segCount < width) {
                     paint.setColor(AikoTheme.CARD);
                     c.drawRect(x, top, x + 1f, bottom, paint);
                 }

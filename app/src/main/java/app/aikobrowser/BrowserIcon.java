@@ -21,7 +21,9 @@ final class BrowserIcon extends View {
         BACK, FORWARD, DOWN, SEARCH, SHIELD, TABS, MENU, REFRESH, STOP, GO, ADD, CLOSE,
         STAR, HISTORY, FIND, SHARE, DOWNLOAD, PRIVATE, HOME, SPEED, COPY, CODE,
         DESKTOP, FONT, IMAGE, READER, MUTE, UNMUTE, PIN, ENGINE, PICKER, DARK,
-        PDF, BOLT, GESTURE, CHECK, PALETTE, INFO, VIDEO
+        PDF, BOLT, GESTURE, CHECK, PALETTE, INFO, VIDEO,
+        TRANSLATE, QR, GALLERY, BACKUP, UNLOCK, DEVTOOLS, PWA, SUN_MOON, GRID,
+        SNIFF, UNDO, FLASH_CMD, SPEAKER, PEEK, TIMER
     }
 
     static final float STROKE_WEIGHT = 1.85f;
@@ -440,5 +442,149 @@ final class BrowserIcon extends View {
         video.lineTo(15.6f, 12.0f);
         video.lineTo(10.0f, 14.8f);
         video.close();
+
+        // Translate (Babel): crisp 文 glyph on upper-left + A glyph on lower-right
+        Path translate = stroke(Kind.TRANSLATE);
+        poly(translate, 4.25f, 7.25f, 12.75f, 7.25f);
+        poly(translate, 8.5f, 4.5f, 8.5f, 7.25f);
+        translate.moveTo(11.2f, 7.25f);
+        translate.quadTo(10.2f, 11.4f, 5.2f, 14.2f);
+        translate.moveTo(6.4f, 9.4f);
+        translate.quadTo(8.5f, 11.8f, 11.6f, 13.6f);
+        poly(translate, 12.4f, 19.5f, 16.0f, 10.5f, 19.6f, 19.5f);
+        poly(translate, 13.7f, 16.5f, 18.3f, 16.5f);
+
+        // QR: three crisp finder squares + minimal data blocks
+        Path qr = stroke(Kind.QR);
+        qr.addRoundRect(4.25f, 4.25f, 10.25f, 10.25f, 1.3f, 1.3f, Path.Direction.CW);
+        qr.addRoundRect(13.75f, 4.25f, 19.75f, 10.25f, 1.3f, 1.3f, Path.Direction.CW);
+        qr.addRoundRect(4.25f, 13.75f, 10.25f, 19.75f, 1.3f, 1.3f, Path.Direction.CW);
+        poly(qr, 14.25f, 14.25f, 14.25f, 19.5f);
+        poly(qr, 14.25f, 16.5f, 17.5f, 16.5f, 17.5f, 19.5f);
+        Path qrFill = fill(Kind.QR);
+        qrFill.addCircle(7.25f, 7.25f, 1.05f, Path.Direction.CW);
+        qrFill.addCircle(16.75f, 7.25f, 1.05f, Path.Direction.CW);
+        qrFill.addCircle(7.25f, 16.75f, 1.05f, Path.Direction.CW);
+        qrFill.addCircle(19.0f, 14.4f, 1.0f, Path.Direction.CW);
+
+        // Gallery: layered twin photo frames + mountain silhouette + sun dot
+        Path gallery = stroke(Kind.GALLERY);
+        gallery.addRoundRect(3.75f, 6.75f, 17.25f, 19.5f, 2.2f, 2.2f, Path.Direction.CW);
+        poly(gallery, 4.2f, 17.2f, 8.2f, 13.4f, 11.4f, 16.2f, 13.8f, 14.0f, 16.8f, 17.2f);
+        gallery.moveTo(7.25f, 6.75f);
+        gallery.lineTo(7.25f, 5.75f);
+        gallery.quadTo(7.25f, 4.25f, 8.75f, 4.25f);
+        gallery.lineTo(18.75f, 4.25f);
+        gallery.quadTo(20.25f, 4.25f, 20.25f, 5.75f);
+        gallery.lineTo(20.25f, 15.25f);
+        gallery.quadTo(20.25f, 16.75f, 18.75f, 16.75f);
+        gallery.lineTo(17.25f, 16.75f);
+        fill(Kind.GALLERY).addCircle(7.6f, 10.2f, 1.05f, Path.Direction.CW);
+
+        // Backup: crisp cloud silhouette with centered upward sync arrow
+        Path backup = stroke(Kind.BACKUP);
+        backup.moveTo(7.0f, 18.5f);
+        backup.cubicTo(4.2f, 18.5f, 3.5f, 14.3f, 6.4f, 13.0f);
+        backup.cubicTo(6.3f, 8.2f, 12.8f, 5.5f, 15.7f, 9.8f);
+        backup.cubicTo(19.6f, 9.6f, 21.0f, 14.2f, 18.8f, 17.1f);
+        backup.cubicTo(18.2f, 18.0f, 17.2f, 18.5f, 16.0f, 18.5f);
+        poly(backup, 12.0f, 19.25f, 12.0f, 12.0f);
+        poly(backup, 9.25f, 14.5f, 12.0f, 11.75f, 14.75f, 14.5f);
+
+        // Unlock: rounded padlock body + open shackle + filled keyhole
+        Path unlock = stroke(Kind.UNLOCK);
+        unlock.addRoundRect(5.25f, 11.0f, 18.75f, 19.75f, 2.4f, 2.4f, Path.Direction.CW);
+        unlock.moveTo(8.5f, 11.0f);
+        unlock.lineTo(8.5f, 7.75f);
+        unlock.arcTo(8.5f, 4.25f, 15.5f, 11.25f, 180f, 150f, false);
+        fill(Kind.UNLOCK).addCircle(12.0f, 15.3f, 1.25f, Path.Direction.CW);
+
+        // DevTools: rounded terminal frame with > prompt and _ cursor
+        Path devtools = stroke(Kind.DEVTOOLS);
+        devtools.addRoundRect(3.75f, 5.0f, 20.25f, 19.0f, 2.6f, 2.6f, Path.Direction.CW);
+        poly(devtools, 7.5f, 9.5f, 10.75f, 12.25f, 7.5f, 15.0f);
+        poly(devtools, 12.5f, 15.0f, 16.75f, 15.0f);
+
+        // PWA: standalone app tile with top-right + install mark
+        Path pwa = stroke(Kind.PWA);
+        pwa.moveTo(12.5f, 5.25f);
+        pwa.lineTo(7.25f, 5.25f);
+        pwa.quadTo(4.75f, 5.25f, 4.75f, 7.75f);
+        pwa.lineTo(4.75f, 16.75f);
+        pwa.quadTo(4.75f, 19.25f, 7.25f, 19.25f);
+        pwa.lineTo(16.25f, 19.25f);
+        pwa.quadTo(18.75f, 19.25f, 18.75f, 16.75f);
+        pwa.lineTo(18.75f, 11.75f);
+        poly(pwa, 17.5f, 4.25f, 17.5f, 9.75f);
+        poly(pwa, 14.75f, 7.0f, 20.25f, 7.0f);
+
+        // Sun/Moon: balanced day-night contrast dial (outer ring + filled right semicircle + sun rays)
+        Path sunMoon = stroke(Kind.SUN_MOON);
+        sunMoon.addCircle(12.0f, 12.0f, 4.8f, Path.Direction.CW);
+        poly(sunMoon, 12.0f, 4.0f, 12.0f, 5.2f);
+        poly(sunMoon, 12.0f, 18.8f, 12.0f, 20.0f);
+        poly(sunMoon, 4.0f, 12.0f, 5.2f, 12.0f);
+        poly(sunMoon, 6.3f, 6.3f, 7.2f, 7.2f);
+        poly(sunMoon, 6.3f, 17.7f, 7.2f, 16.8f);
+        Path smFill = fill(Kind.SUN_MOON);
+        smFill.arcTo(7.2f, 7.2f, 16.8f, 16.8f, -90f, 180f, true);
+        smFill.close();
+
+        // Grid: crisp 2x2 rounded tab cards
+        Path grid = stroke(Kind.GRID);
+        grid.addRoundRect(4.5f, 4.5f, 10.5f, 10.5f, 1.8f, 1.8f, Path.Direction.CW);
+        grid.addRoundRect(13.5f, 4.5f, 19.5f, 10.5f, 1.8f, 1.8f, Path.Direction.CW);
+        grid.addRoundRect(4.5f, 13.5f, 10.5f, 19.5f, 1.8f, 1.8f, Path.Direction.CW);
+        grid.addRoundRect(13.5f, 13.5f, 19.5f, 19.5f, 1.8f, 1.8f, Path.Direction.CW);
+
+        // Sniff: media radar arcs + directional sweep needle + center node
+        Path sniff = stroke(Kind.SNIFF);
+        sniff.addArc(4.25f, 4.25f, 19.75f, 19.75f, -55f, 290f);
+        sniff.addArc(7.75f, 7.75f, 16.25f, 16.25f, -35f, 250f);
+        poly(sniff, 12.0f, 12.0f, 17.4f, 6.6f);
+        fill(Kind.SNIFF).addCircle(12.0f, 12.0f, 1.35f, Path.Direction.CW);
+
+        // Undo: clean counter-clockwise curved return arrow
+        Path undo = stroke(Kind.UNDO);
+        poly(undo, 8.75f, 5.25f, 5.25f, 8.75f, 8.75f, 12.25f);
+        undo.moveTo(5.75f, 8.75f);
+        undo.lineTo(14.0f, 8.75f);
+        undo.arcTo(9.5f, 8.75f, 18.75f, 18.0f, -90f, 180f, false);
+        undo.lineTo(9.0f, 18.0f);
+
+        // Flash Command: rounded keycap housing a crisp quick-command slash '/'
+        Path flashCmd = stroke(Kind.FLASH_CMD);
+        flashCmd.addRoundRect(4.5f, 4.5f, 19.5f, 19.5f, 3.2f, 3.2f, Path.Direction.CW);
+        poly(flashCmd, 14.0f, 8.0f, 10.0f, 16.0f);
+
+        // Speaker: crisp speaker cone + twin concentric broadcast waves
+        Path speaker = stroke(Kind.SPEAKER);
+        speaker.moveTo(4.0f, 9.5f);
+        speaker.lineTo(7.5f, 9.5f);
+        speaker.lineTo(12.0f, 5.75f);
+        speaker.lineTo(12.0f, 18.25f);
+        speaker.lineTo(7.5f, 14.5f);
+        speaker.lineTo(4.0f, 14.5f);
+        speaker.close();
+        speaker.addArc(8.4f, 8.2f, 16.0f, 15.8f, -48f, 96f);
+        speaker.addArc(4.9f, 4.7f, 19.5f, 19.3f, -48f, 96f);
+
+        // Peek: clean eye silhouette + centered pupil ring
+        Path peek = stroke(Kind.PEEK);
+        peek.moveTo(3.5f, 12.0f);
+        peek.cubicTo(6.2f, 7.2f, 17.8f, 7.2f, 20.5f, 12.0f);
+        peek.cubicTo(17.8f, 16.8f, 6.2f, 16.8f, 3.5f, 12.0f);
+        peek.close();
+        peek.addCircle(12.0f, 12.0f, 2.75f, Path.Direction.CW);
+        fill(Kind.PEEK).addCircle(12.0f, 12.0f, 1.0f, Path.Direction.CW);
+
+        // Timer: stopwatch body + crown + angled hand + pivot dot
+        Path timer = stroke(Kind.TIMER);
+        timer.addCircle(12.0f, 13.25f, 6.75f, Path.Direction.CW);
+        poly(timer, 9.5f, 4.0f, 14.5f, 4.0f);
+        poly(timer, 12.0f, 4.0f, 12.0f, 6.5f);
+        poly(timer, 17.0f, 8.25f, 18.75f, 6.5f);
+        poly(timer, 12.0f, 13.25f, 15.0f, 10.25f);
+        fill(Kind.TIMER).addCircle(12.0f, 13.25f, 1.15f, Path.Direction.CW);
     }
 }

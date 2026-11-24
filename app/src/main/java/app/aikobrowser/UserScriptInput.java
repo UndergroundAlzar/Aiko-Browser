@@ -13,8 +13,22 @@ import java.util.Locale;
 
 import javax.net.ssl.HttpsURLConnection;
 
-/** Import explicit user-selected text and URLs. No page cookies or native request API for scripts. */
+/** Import explicit user-selected text, remote scripts, and cached @require/@resource assets. */
 final class UserScriptInput {
+    private static final String USER_AGENT =
+            "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) AikoBrowser/0.4.0";
+
+    static byte[] readBytes(InputStream stream, int maxBytes) throws IOException {
+        if (stream == null) throw new IOException("无法读取数据流");
+        ByteArrayOutputStream data = new ByteArrayOutputStream(Math.min(Math.max(1024, maxBytes), 16384));
+        byte[] buffer = new byte[8192];
+        for (int count; (count = stream.read(buffer)) != -1;) {
+            if (count > maxBytes - data.size()) throw new IOException("文件大小超过限制");
+            data.write(buffer, 0, count);
+        }
+        return data.toByteArray();
+    }
+
     static String read(InputStream stream, int maxBytes) throws IOException {
         if (stream == null) throw new IOException("无法打开脚本");
         ByteArrayOutputStream data = new ByteArrayOutputStream(Math.min(Math.max(1024, maxBytes), 16384));
@@ -30,6 +44,18 @@ final class UserScriptInput {
     static final class Downloaded {
         final String source, site;
         Downloaded(String source, String site) { this.source = source; this.site = site; }
+    }
+
+    static final class BinaryDownload {
+        final byte[] bytes;
+        final String contentType;
+        final String finalUrl;
+
+        BinaryDownload(byte[] bytes, String contentType, String finalUrl) {
+            this.bytes = bytes;
+            this.contentType = contentType;
+            this.finalUrl = finalUrl;
+        }
     }
 
     static Downloaded download(String input) throws IOException {
@@ -143,7 +169,7 @@ final class UserScriptInput {
     }
 
     /**
-     * Fetches a remote .user.js script over HTTP/HTTPS (up to maxBytes, 15s timeout).
+     * Fetches a remote .user.js (or .meta.js) script over HTTP/HTTPS (up to maxBytes, 15s timeout).
      * Follows safe redirects (allows HTTP->HTTPS upgrade, blocks HTTPS->HTTP downgrade),
      * percent-encodes unsafe path/query/redirect characters, and rejects HTML web pages.
      */
@@ -158,8 +184,7 @@ final class UserScriptInput {
             connection.setUseCaches(false);
             connection.setInstanceFollowRedirects(false);
             connection.setRequestProperty("Accept", "text/javascript, application/javascript, text/plain, */*;q=0.5");
-            connection.setRequestProperty("User-Agent",
-                    "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) AikoBrowser/0.3.1");
+            connection.setRequestProperty("User-Agent", USER_AGENT);
             try {
                 int status = connection.getResponseCode();
                 if (status == 200) {
@@ -199,5 +224,47 @@ final class UserScriptInput {
             }
         }
         throw new IOException("脚本地址跳转次数过多");
+    }
+
+    /** Downloads a @require or @resource dependency over HTTP/HTTPS with strict size & redirect safety. */
+    static BinaryDownload downloadBinary(String input, int maxBytes, int timeoutMs) throws IOException {
+        URI endpoint = safeRemoteAddress(input);
+        if (endpoint == null) throw new IOException("无效的依赖地址");
+        int boundedTimeout = Math.max(3000, Math.min(30_000, timeoutMs));
+        URL url = endpoint.toURL();
+        for (int redirects = 0; redirects <= 5; redirects++) {
+            HttpURLConnection connection = (HttpURLConnection) url.openConnection();
+            connection.setConnectTimeout(boundedTimeout);
+            connection.setReadTimeout(boundedTimeout);
+            connection.setUseCaches(false);
+            connection.setInstanceFollowRedirects(false);
+            connection.setRequestProperty("Accept", "*/*");
+            connection.setRequestProperty("User-Agent", USER_AGENT);
+            try {
+                int status = connection.getResponseCode();
+                if (status == 200) {
+                    String contentType = connection.getContentType();
+                    try (InputStream stream = connection.getInputStream()) {
+                        byte[] bytes = readBytes(stream, maxBytes);
+                        return new BinaryDownload(bytes, contentType == null ? "" : contentType, url.toExternalForm());
+                    }
+                }
+                if (status != 301 && status != 302 && status != 303 && status != 307 && status != 308) {
+                    throw new IOException("依赖服务器返回 HTTP " + status);
+                }
+                String location = connection.getHeaderField("Location");
+                if (location == null || location.trim().isEmpty()) throw new IOException("依赖地址跳转无效");
+                URL next = new URL(url, location.trim());
+                URI safeNext = safeRemoteAddress(next.toExternalForm());
+                if (safeNext == null) throw new IOException("依赖跳转地址无效");
+                if ("https".equalsIgnoreCase(url.getProtocol()) && !"https".equalsIgnoreCase(safeNext.getScheme())) {
+                    throw new IOException("依赖地址尝试降级为非 HTTPS");
+                }
+                url = safeNext.toURL();
+            } finally {
+                connection.disconnect();
+            }
+        }
+        throw new IOException("依赖地址跳转次数过多");
     }
 }

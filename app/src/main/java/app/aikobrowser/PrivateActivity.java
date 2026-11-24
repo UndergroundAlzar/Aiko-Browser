@@ -48,6 +48,7 @@ import java.util.stream.Stream;
 
 /** Short-lived, single-tab browsing in its own Android process and WebView directory. */
 public final class PrivateActivity extends Activity {
+    public static final String EXTRA_INITIAL_URL = "aiko_private_url";
     private static final String SUFFIX = "aiko_private";
 
     private static boolean initialized, closing;
@@ -111,6 +112,11 @@ public final class PrivateActivity extends Activity {
                         status.setText("独立无痕窗口");
                         subtitle.setText("独立进程与目录 · 关闭窗口立即清除痕迹");
                         address.setEnabled(true);
+                        String initialUrl = getIntent() == null ? null : getIntent().getStringExtra(EXTRA_INITIAL_URL);
+                        if (HttpUrlUtil.isHttp(initialUrl)) {
+                            address.setText(initialUrl);
+                            submit();
+                        }
                     } catch (RuntimeException error) {
                         failure();
                     }
@@ -304,7 +310,8 @@ public final class PrivateActivity extends Activity {
         if (!initialized || closed || !address.isEnabled()) return;
         String input = address.getText().toString().trim();
         if (input.isEmpty()) return;
-        String url = SearchEngines.resolveInput(this, input);
+        BangCatalog.Match bang = BangCatalog.resolveBuiltinBang(input);
+        String url = bang != null ? bang.url : SearchEngines.resolveInput(this, input);
         if (!HttpUrlUtil.isHttp(url)) return;
         InputMethodManager imm = (InputMethodManager) getSystemService(INPUT_METHOD_SERVICE);
         if (imm != null) imm.hideSoftInputFromWindow(address.getWindowToken(), 0);

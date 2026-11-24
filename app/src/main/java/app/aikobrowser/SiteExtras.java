@@ -17,9 +17,13 @@ public final class SiteExtras {
     public static final int DARK_FOLLOW = 0;
     public static final int DARK_FORCE_ON = 1;
     public static final int DARK_FORCE_OFF = 2;
+    public static final int[] AUTO_REFRESH_PRESETS = {0, 15, 30, 60, 300};
+    private static final int MAX_CUSTOM_CSS_CHARS = 16_384;
 
     private static final String PREFS = "site_extras";
     private static final String HOST_PREFIX = "h:";
+    private static final String CSS_PREFIX = "css:";
+    private static final String REFRESH_PREFIX = "ref:";
     private static final String KEY_GLOBAL_DARK = "g:dark_web";
     private static final String KEY_AUTO_HIDE = "g:auto_hide_bar";
     private static final String KEY_EDGE_GESTURES = "g:edge_gestures";
@@ -59,6 +63,8 @@ public final class SiteExtras {
     private final Object lock = new Object();
     private SharedPreferences prefs;
     private HashMap<String, Integer> hostBits;
+    private HashMap<String, String> hostCss;
+    private HashMap<String, Integer> hostRefresh;
     private boolean globalDarkWeb;
     private boolean autoHideBar = true;
     private boolean edgeGestures = true;
@@ -77,6 +83,8 @@ public final class SiteExtras {
             if (loaded) return;
             prefs = appContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
             hostBits = new HashMap<>();
+            hostCss = new HashMap<>();
+            hostRefresh = new HashMap<>();
             globalDarkWeb = prefs.getBoolean(KEY_GLOBAL_DARK, false);
             autoHideBar = prefs.getBoolean(KEY_AUTO_HIDE, true);
             edgeGestures = prefs.getBoolean(KEY_EDGE_GESTURES, true);
@@ -85,9 +93,16 @@ public final class SiteExtras {
                 for (Map.Entry<String, ?> e : all.entrySet()) {
                     String k = e.getKey();
                     Object v = e.getValue();
-                    if (k != null && k.startsWith(HOST_PREFIX) && v instanceof Integer) {
+                    if (k == null || v == null) continue;
+                    if (k.startsWith(HOST_PREFIX) && v instanceof Integer) {
                         int bits = (Integer) v;
                         if (bits != 0) hostBits.put(k.substring(HOST_PREFIX.length()), bits);
+                    } else if (k.startsWith(CSS_PREFIX) && v instanceof String) {
+                        String css = ((String) v).trim();
+                        if (!css.isEmpty()) hostCss.put(k.substring(CSS_PREFIX.length()), css);
+                    } else if (k.startsWith(REFRESH_PREFIX) && v instanceof Integer) {
+                        int sec = normalizeAutoRefreshSec((Integer) v);
+                        if (sec > 0) hostRefresh.put(k.substring(REFRESH_PREFIX.length()), sec);
                     }
                 }
             }
@@ -140,14 +155,99 @@ public final class SiteExtras {
         updateHostBit(host, BIT_FORCE_MAX_HZ, enabled);
     }
 
+    public String customCss(String host) {
+        String key = normalizeHost(host);
+        if (key.isEmpty()) return "";
+        ensureLoaded();
+        synchronized (lock) {
+            String css = hostCss.get(key);
+            return css == null ? "" : css;
+        }
+    }
+
+    public void setCustomCss(String host, String css) {
+        String key = normalizeHost(host);
+        if (key.isEmpty()) return;
+        String clean = css == null ? "" : css.trim();
+        if (clean.length() > MAX_CUSTOM_CSS_CHARS) {
+            clean = clean.substring(0, MAX_CUSTOM_CSS_CHARS).trim();
+        }
+        ensureLoaded();
+        synchronized (lock) {
+            String cur = hostCss.get(key);
+            if (clean.isEmpty()) {
+                if (cur == null) return;
+                hostCss.remove(key);
+            } else {
+                if (clean.equals(cur)) return;
+                hostCss.put(key, clean);
+            }
+        }
+        final String value = clean;
+        IO.execute(() -> {
+            SharedPreferences sp = appContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
+            if (value.isEmpty()) sp.edit().remove(CSS_PREFIX + key).apply();
+            else sp.edit().putString(CSS_PREFIX + key, value).apply();
+        });
+    }
+
+    public int autoRefreshSec(String host) {
+        String key = normalizeHost(host);
+        if (key.isEmpty()) return 0;
+        ensureLoaded();
+        synchronized (lock) {
+            Integer v = hostRefresh.get(key);
+            return v == null ? 0 : v;
+        }
+    }
+
+    public void setAutoRefreshSec(String host, int sec) {
+        String key = normalizeHost(host);
+        if (key.isEmpty()) return;
+        int norm = normalizeAutoRefreshSec(sec);
+        ensureLoaded();
+        synchronized (lock) {
+            Integer cur = hostRefresh.get(key);
+            if (norm == 0) {
+                if (cur == null) return;
+                hostRefresh.remove(key);
+            } else {
+                if (cur != null && cur == norm) return;
+                hostRefresh.put(key, norm);
+            }
+        }
+        IO.execute(() -> {
+            SharedPreferences sp = appContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
+            if (norm == 0) sp.edit().remove(REFRESH_PREFIX + key).apply();
+            else sp.edit().putInt(REFRESH_PREFIX + key, norm).apply();
+        });
+    }
+
+    public static int normalizeAutoRefreshSec(int sec) {
+        if (sec <= 0) return 0;
+        if (sec <= 15) return 15;
+        if (sec <= 30) return 30;
+        if (sec <= 60) return 60;
+        return 300;
+    }
+
     public void resetHost(String host) {
         String key = normalizeHost(host);
         if (key.isEmpty()) return;
         ensureLoaded();
+        boolean changed;
         synchronized (lock) {
-            if (hostBits.remove(key) == null) return;
+            boolean a = hostBits.remove(key) != null;
+            boolean b = hostCss.remove(key) != null;
+            boolean c = hostRefresh.remove(key) != null;
+            changed = a || b || c;
         }
-        persistHost(key, 0);
+        if (!changed) return;
+        IO.execute(() -> appContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+                .remove(HOST_PREFIX + key)
+                .remove(CSS_PREFIX + key)
+                .remove(REFRESH_PREFIX + key)
+                .apply());
     }
 
     public boolean isGlobalDarkWeb() {

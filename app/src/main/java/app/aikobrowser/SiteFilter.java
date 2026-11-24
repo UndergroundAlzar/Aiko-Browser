@@ -271,6 +271,7 @@ public final class SiteFilter {
     private final Object prefsLock = new Object();
     private final Object loadLock = new Object();
     private final Object cssCacheLock = new Object();
+    private final Object customFileLock = new Object();
     private final List<Runnable> readyWaiters = new ArrayList<>(2);
     private final LinkedHashMap<String, CssEntry> cssCache = new LinkedHashMap<String, CssEntry>(24, 0.75f, true) {
         @Override protected boolean removeEldestEntry(Map.Entry<String, CssEntry> eldest) {
@@ -797,19 +798,27 @@ public final class SiteFilter {
                     throw new IllegalArgumentException("Empty custom rule");
                 }
                 String existing;
-                try { existing = customSource(); }
-                catch (IOException ignored) { existing = ""; }
-                if (containsExactLine(existing, trimmed)) {
-                    saved = true;
-                } else {
-                    String nextSource = existing.isEmpty() ? trimmed
-                            : (existing.endsWith("\n") || existing.endsWith("\r")
-                                    ? existing + trimmed : existing + "\n" + trimmed);
-                    CustomFilterList list = CustomFilterList.parse(nextSource);
+                String nextSource;
+                CustomFilterList list;
+                synchronized (customFileLock) {
+                    try { existing = customSource(); }
+                    catch (IOException ignored) { existing = ""; }
+                    if (containsExactLine(existing, trimmed)) {
+                        saved = true;
+                        nextSource = null;
+                        list = null;
+                    } else {
+                        nextSource = existing.isEmpty() ? trimmed
+                                : (existing.endsWith("\n") || existing.endsWith("\r")
+                                        ? existing + trimmed : existing + "\n" + trimmed);
+                        list = CustomFilterList.parse(nextSource);
+                        writeAtomic(customFile(), nextSource.getBytes(StandardCharsets.UTF_8));
+                    }
+                }
+                if (list != null) {
                     int enabledMask = listMask;
                     List<Subscription> activeSubs = subs;
                     FilterRules next = compile(list.rules, enabledMask, activeSubs);
-                    writeAtomic(customFile(), nextSource.getBytes(StandardCharsets.UTF_8));
                     publishRules(next);
                     writeBinaryCache(next, fingerprint(list.rules, enabledMask, activeSubs));
                     saved = true;
@@ -819,6 +828,175 @@ public final class SiteFilter {
             }
             postConsumer(onDone, saved);
         });
+    }
+
+    /** Returns exact trimmed rule lines in filters-user.txt scoped to the given host (for Site Shield undo). */
+    public List<String> userRulesForHost(String host) {
+        String normHost = normal(host);
+        if (normHost == null) return Collections.emptyList();
+        try {
+            return filterUserRulesForHost(customSource(), normHost);
+        } catch (IOException | RuntimeException ignored) {
+            return Collections.emptyList();
+        }
+    }
+
+    /** Pure-Java helper matching exact custom filter lines in source scoped to host. */
+    public static List<String> filterUserRulesForHost(String source, String host) {
+        String normHost = normal(host);
+        if (normHost == null || source == null || source.isEmpty()) return Collections.emptyList();
+        ArrayList<String> matches = new ArrayList<>();
+        int len = source.length(), pos = 0;
+        while (pos < len) {
+            int end = pos;
+            while (end < len && source.charAt(end) != '\n' && source.charAt(end) != '\r') end++;
+            String line = source.substring(pos, end).trim();
+            if (!line.isEmpty() && !line.startsWith("!") && !line.equalsIgnoreCase("[Adblock Plus 2.0]")) {
+                if (ruleLineAppliesToHost(line, normHost)) {
+                    matches.add(line);
+                }
+            }
+            pos = end + 1;
+            if (end < len && source.charAt(end) == '\r' && pos < len && source.charAt(pos) == '\n') pos++;
+        }
+        return matches;
+    }
+
+    private static boolean ruleLineAppliesToHost(String line, String normHost) {
+        int cosmeticIdx = line.indexOf("##");
+        int excCosmeticIdx = line.indexOf("#@#");
+        int sepIdx = cosmeticIdx >= 0 && excCosmeticIdx >= 0
+                ? Math.min(cosmeticIdx, excCosmeticIdx)
+                : Math.max(cosmeticIdx, excCosmeticIdx);
+        if (sepIdx > 0) {
+            String domainsPart = line.substring(0, sepIdx);
+            String[] domains = domainsPart.split(",");
+            for (String rawDom : domains) {
+                String d = rawDom.trim();
+                if (d.isEmpty() || d.startsWith("~")) continue;
+                String nd = normal(d);
+                if (nd != null && (normHost.equals(nd) || atDomain(normHost, nd))) return true;
+            }
+            return false;
+        }
+        // Network rules: ||domain^ or @@||domain^ or $domain=...
+        String net = line.startsWith("@@") ? line.substring(2) : line;
+        if (net.startsWith("||")) {
+            int end = 2;
+            while (end < net.length()) {
+                char c = net.charAt(end);
+                if (c == '^' || c == '/' || c == '$' || c == '*' || c == ':') break;
+                end++;
+            }
+            if (end > 2) {
+                String nd = normal(net.substring(2, end));
+                if (nd != null && (normHost.equals(nd) || atDomain(normHost, nd))) return true;
+            }
+        }
+        int dollar = line.lastIndexOf('$');
+        if (dollar >= 0 && dollar + 1 < line.length()) {
+            String opts = line.substring(dollar + 1);
+            for (String opt : opts.split(",")) {
+                String o = opt.trim();
+                if (o.startsWith("domain=")) {
+                    String list = o.substring("domain=".length());
+                    for (String rawDom : list.split("\\|")) {
+                        String d = rawDom.trim();
+                        if (d.isEmpty() || d.startsWith("~")) continue;
+                        String nd = normal(d);
+                        if (nd != null && (normHost.equals(nd) || atDomain(normHost, nd))) return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Removes an exact rule line from filters-user.txt atomically (serialized with worker file I/O)
+     * and schedules a clean recompile. Returns true if the line existed and was removed.
+     */
+    public boolean removeUserRule(String exactRuleLine) {
+        String target = exactRuleLine == null ? "" : exactRuleLine.trim();
+        if (target.isEmpty()) return false;
+        try {
+            synchronized (customFileLock) {
+                String existing = customSource();
+                String updated = removeExactRuleLine(existing, target);
+                if (updated == null) return false;
+                writeAtomic(customFile(), updated.getBytes(StandardCharsets.UTF_8));
+            }
+            worker.execute(() -> {
+                ensurePrefsLoaded();
+                try {
+                    recompileFromCurrentState(true);
+                } catch (IOException | RuntimeException failure) {
+                    android.util.Log.w("AikoFilter", "Could not recompile after removing user rule", failure);
+                }
+            });
+            return true;
+        } catch (IOException | RuntimeException failure) {
+            android.util.Log.w("AikoFilter", "Could not remove custom filter rule", failure);
+            return false;
+        }
+    }
+
+    /**
+     * Off-UI-thread variant: removes an exact rule line from filters-user.txt on the filter worker,
+     * recompiles and publishes updated rules, and delivers completion status on the main thread.
+     */
+    public void removeUserRule(String exactRuleLine, Consumer<Boolean> onDone) {
+        String target = exactRuleLine == null ? "" : exactRuleLine.trim();
+        if (target.isEmpty()) {
+            postConsumer(onDone, Boolean.FALSE);
+            return;
+        }
+        worker.execute(() -> {
+            ensurePrefsLoaded();
+            boolean removed = false;
+            try {
+                String updated;
+                synchronized (customFileLock) {
+                    String existing = customSource();
+                    updated = removeExactRuleLine(existing, target);
+                    if (updated != null) {
+                        writeAtomic(customFile(), updated.getBytes(StandardCharsets.UTF_8));
+                    }
+                }
+                if (updated != null) {
+                    recompileFromCurrentState(true);
+                    removed = true;
+                }
+            } catch (IOException | RuntimeException failure) {
+                android.util.Log.w("AikoFilter", "Could not remove custom filter rule asynchronously", failure);
+            }
+            postConsumer(onDone, removed);
+        });
+    }
+
+    /** Pure-Java helper removing exact trimmed line from rule source; returns null if not present. */
+    public static String removeExactRuleLine(String source, String exactRuleLine) {
+        if (source == null || source.isEmpty() || exactRuleLine == null) return null;
+        String target = exactRuleLine.trim();
+        if (target.isEmpty()) return null;
+        StringBuilder out = new StringBuilder(source.length());
+        boolean removed = false;
+        int len = source.length(), pos = 0;
+        while (pos < len) {
+            int end = pos;
+            while (end < len && source.charAt(end) != '\n' && source.charAt(end) != '\r') end++;
+            String rawLine = source.substring(pos, end);
+            String trimmed = rawLine.trim();
+            if (!removed && trimmed.equals(target)) {
+                removed = true;
+            } else {
+                if (out.length() > 0) out.append('\n');
+                out.append(rawLine);
+            }
+            pos = end + 1;
+            if (end < len && source.charAt(end) == '\r' && pos < len && source.charAt(pos) == '\n') pos++;
+        }
+        return removed ? out.toString() : null;
     }
 
     private static boolean containsExactLine(String text, String target) {
@@ -837,12 +1015,14 @@ public final class SiteFilter {
     }
 
     String customSource() throws IOException {
-        try {
-            byte[] bytes = Files.readAllBytes(customFile().getBaseFile().toPath());
-            if (bytes.length > 4 * CustomFilterList.MAX_CHARS) throw new IOException("Custom rules too large");
-            return new String(bytes, StandardCharsets.UTF_8);
-        } catch (NoSuchFileException missing) {
-            return "";
+        synchronized (customFileLock) {
+            try {
+                byte[] bytes = Files.readAllBytes(customFile().getBaseFile().toPath());
+                if (bytes.length > 4 * CustomFilterList.MAX_CHARS) throw new IOException("Custom rules too large");
+                return new String(bytes, StandardCharsets.UTF_8);
+            } catch (NoSuchFileException missing) {
+                return "";
+            }
         }
     }
 
@@ -858,7 +1038,9 @@ public final class SiteFilter {
                 int enabledMask = listMask;
                 List<Subscription> activeSubs = subs;
                 FilterRules next = compile(list.rules, enabledMask, activeSubs);
-                writeAtomic(customFile(), source.getBytes(StandardCharsets.UTF_8));
+                synchronized (customFileLock) {
+                    writeAtomic(customFile(), source.getBytes(StandardCharsets.UTF_8));
+                }
                 publishRules(next);
                 writeBinaryCache(next, fingerprint(list.rules, enabledMask, activeSubs));
                 count = list.count;

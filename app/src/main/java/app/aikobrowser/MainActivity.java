@@ -59,12 +59,14 @@ import android.webkit.WebResourceError;
 import android.webkit.WebResourceRequest;
 import android.webkit.WebResourceResponse;
 import android.webkit.WebSettings;
+import android.webkit.WebStorage;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.widget.AbsListView;
 import android.widget.BaseAdapter;
 import android.widget.EditText;
 import android.widget.FrameLayout;
+import android.widget.GridView;
 import android.widget.HorizontalScrollView;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
@@ -81,16 +83,23 @@ import org.json.JSONTokener;
 
 import java.io.ByteArrayOutputStream;
 import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.text.SimpleDateFormat;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Calendar;
+import java.util.Collections;
 import java.util.Date;
+import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -115,7 +124,18 @@ public final class MainActivity extends Activity {
     private static final int FILE_PICKER = 11;
     private static final int BOOKMARKS_EXPORT = 13;
     private static final int BOOKMARKS_IMPORT = 14;
+    private static final int BACKUP_EXPORT = 15;
+    private static final int BACKUP_IMPORT = 16;
+    private static final int PICK_CUSTOM_FONT = 17;
     private static final int STATE_SAVE_MAX_BYTES = 256 * 1024;
+    private static final int MAX_CUSTOM_FONT_BYTES = 16 * 1024 * 1024;
+    private static final String CUSTOM_FONT_URL_PREFIX = "https://aiko-font.local/";
+    private static final String WEBRTC_BLOCK_JS =
+            "(function(){try{"
+            + "Object.defineProperty(window,'RTCPeerConnection',{configurable:true,get:function(){return undefined;}});"
+            + "Object.defineProperty(window,'webkitRTCPeerConnection',{configurable:true,get:function(){return undefined;}});"
+            + "Object.defineProperty(window,'mozRTCPeerConnection',{configurable:true,get:function(){return undefined;}});"
+            + "}catch(e){}})();";
     private static final Pattern URL_EXTRACT = Pattern.compile("https?://[^\\s<>\"'\\)\\]]+");
 
     private final Handler handler = new Handler(Looper.getMainLooper());
@@ -131,10 +151,13 @@ public final class MainActivity extends Activity {
     private final Runnable saveHistoryTask = this::flushHistorySafe;
     private final Runnable findDebounceTask = this::runDebouncedFind;
     private final Runnable reapplyInsetsTask = this::applyInsetsLayout;
+    private final Runnable autoRefreshTask = this::runAutoRefreshTick;
+    private final Runnable preloadNewTabTask = this::ensurePreloadedNewTab;
+    private final Runnable hideClipboardCapsuleTask = this::hideClipboardCapsule;
 
     private float density;
     private boolean isLowRam;
-    private int maxHotTabs = 5;
+    private int maxHotTabs = 6;
 
     private DisplayModeEngine displayMode;
     private PerfProfiles perfProfiles;
@@ -147,6 +170,13 @@ public final class MainActivity extends Activity {
     private SiteFilter siteFilter;
     private UserScripts userScripts;
     private ScriptTools scriptTools;
+    private StartPageConfig startPageConfig;
+    private BangCatalog bangCatalog;
+    private BabelConfig babelConfig;
+    private BabelEngine babelEngine;
+    private BabelUi babelUi;
+    private AikoV040Ui.ReadAloudController readAloud;
+    private AikoV040Ui.Host v040Host;
     private String desktopAgent;
     private boolean fetchingRemoteScript;
     private long lastAdpfBoostMs;
@@ -154,20 +184,24 @@ public final class MainActivity extends Activity {
     // Chrome view hierarchy
     private FrameLayout root, viewport, page;
     private View omniboxScrim;
+    private View nightComfortOverlay;
     private BottomDeckLayout bottomDeck;
-    private LinearLayout controls, addressRow, findBar;
+    private LinearLayout controls, addressRow, findBar, clipboardCapsule;
     private GradientDrawable addressCapsuleBg;
     private View homeSpacer, deckDivider;
     private EditText address, homeSearch, findInput;
-    private BrowserIcon backButton, omniboxDismissButton, tabButton, menuButton, siteButton,
-            addressClearButton, addressCopyButton, goButton, actionButton;
+    private BrowserIcon backButton, homeButton, babelButton, omniboxDismissButton, tabButton, menuButton, siteButton,
+            addressClearButton, addressCopyButton, addressQrButton, goButton, actionButton;
     private ProgressBar loading;
+    private TextView pwaTogglePill;
+    private boolean pwaStandaloneMode;
+    private boolean pwaControlsRevealed;
 
     // Reusable Home view & dynamic sections
     private ScrollView homeView;
     private FrameLayout homeEmblemFrame;
     private LinearLayout homeBoxRow, homeSpeedGrid, homeShelfSection, homeShelfList;
-    private BrowserIcon homeGoButton;
+    private BrowserIcon homeGoButton, homeQrButton;
     private TextView homeEngineBadge, homeStatusPill, homeAddPin;
     private boolean onHome;
 
@@ -176,6 +210,58 @@ public final class MainActivity extends Activity {
     private ScrollView omniboxScroll;
     private boolean editingOmnibox;
     private String lastSuggestionQuery;
+    private String lastClipboardHintText;
+
+    // Preloaded New Tab (iTab / custom URL zero-flash warmup)
+    private ScrollWebView preloadedNewTabView;
+    private String preloadedNewTabUrl;
+
+    // Background Audio + Media Sniffer + Form Drafts + Auto Refresh
+    private boolean bgAudioEnabled;
+    private Tab bgAudioTab;
+    private int cachedSniffedCount;
+    private int activeAutoRefreshSec;
+    private final Map<String, String> savedFormDrafts = new LinkedHashMap<String, String>(32, 0.75f, true) {
+        @Override protected boolean removeEldestEntry(Map.Entry<String, String> eldest) {
+            return size() > 24;
+        }
+    };
+
+    private final MediaPlaybackService.PlaybackListener mediaPlaybackListener = new MediaPlaybackService.PlaybackListener() {
+        @Override public void onTogglePlayPause() {
+            Tab target = bgAudioTab != null ? bgAudioTab : current;
+            if (target == null || target.view == null) return;
+            target.view.evaluateJavascript(
+                    "(function(){var m=document.querySelectorAll('video,audio');"
+                    + "var playing=false;for(var i=0;i<m.length;i++){if(!m[i].paused&&!m[i].ended){playing=true;break;}}"
+                    + "for(var j=0;j<m.length;j++){try{if(playing)m[j].pause();else m[j].play();}catch(e){}}"
+                    + "return !playing;})();",
+                    raw -> {
+                        boolean nowPlaying = "true".equals(raw);
+                        if (bgAudioEnabled) MediaPlaybackService.updateState(MainActivity.this, nowPlaying);
+                    });
+        }
+        @Override public void onStopBackgroundAudio() {
+            setBackgroundAudioEnabled(bgAudioTab, false, false);
+        }
+    };
+
+    private final QrSheet.ScanCallback qrScanCallback = new QrSheet.ScanCallback() {
+        @Override public void onQrScanned(String content) {
+            if (content == null || content.trim().isEmpty()) return;
+            String trimmed = content.trim();
+            if (HttpUrlUtil.isHttp(trimmed)) {
+                if (UserScripts.isUserScriptUrl(trimmed)) {
+                    handleRemoteUserScript(trimmed, URLUtil.guessFileName(trimmed, null, "application/javascript"), null);
+                } else {
+                    navigate(trimmed);
+                }
+            } else {
+                submitRawInput(trimmed);
+            }
+        }
+        @Override public void toast(String msg) { MainActivity.this.toast(msg); }
+    };
 
     // Opt-in 185Hz Live Frame-Pacing HUD pill (0% overhead when off)
     private TextView hudPill;
@@ -226,6 +312,10 @@ public final class MainActivity extends Activity {
         long lastCommitMs, lastFinishMs;
         boolean lastNavBfCache;
         int progress = 100;
+        boolean pinned;
+        String groupName = "";
+        long lastCrashRecoveryMs;
+        String pendingDraftJson;
 
         Tab(String url, String title) {
             this.url = url;
@@ -274,6 +364,22 @@ public final class MainActivity extends Activity {
         readingShelf = new ReadingShelf(this);
         userScripts = new UserScripts(this);
         scriptTools = new ScriptTools(this, userScripts);
+        startPageConfig = new StartPageConfig(this);
+        bangCatalog = new BangCatalog(this);
+        babelConfig = new BabelConfig(this);
+        babelEngine = new BabelEngine(babelConfig);
+        readAloud = new AikoV040Ui.ReadAloudController(this, this::toast);
+        babelUi = new BabelUi(this, babelConfig, babelEngine, new BabelUi.HostCallbacks() {
+            @Override public void toast(String msg) { MainActivity.this.toast(msg); }
+            @Override public void speakText(String text, String lang) {
+                if (readAloud != null) readAloud.speak(text, lang);
+            }
+            @Override public void onStateChanged() { updateChrome(); }
+        });
+        babelUi.setDisplayModeEngine(displayMode);
+        v040Host = buildV040Host();
+        wireUserScriptsHostActions();
+        MediaPlaybackService.setPlaybackListener(mediaPlaybackListener);
 
         perfProfiles.preloadAsync();
         library.preloadAsync();
@@ -285,10 +391,14 @@ public final class MainActivity extends Activity {
 
         // Read minimal startup prefs (browserFirst + tabs) & paint chrome on frame 1 (zero sync extras/filter disk reads!)
         DownloadService.PACER.setBrowserFirst(mainPrefs.getBoolean("browserFirst", true));
+        pwaStandaloneMode = getIntent() != null && getIntent().getBooleanExtra(PwaHelper.EXTRA_PWA_STANDALONE, false);
         buildChrome();
+        applyAutoNightSchedule();
+        applyNightComfortOverlay();
         restoreTabs(state == null ? incomingLink(getIntent()) : null);
+        applyPwaStandaloneChrome();
         setupHudIfEnabled();
-        if (state == null && getIntent().getBooleanExtra("downloads", false)) showDownloads();
+        if (state == null && getIntent() != null && getIntent().getBooleanExtra("downloads", false)) showDownloads();
         if (state == null) handleScriptIntent(getIntent());
 
         // Sync preloaded SiteExtras gesture flags & active PerfProfile off frame 1 without blocking UI thread
@@ -319,8 +429,106 @@ public final class MainActivity extends Activity {
         // Subtle home preconnect to configured search engine once engine is warm (honors Eco preload off)
         if (onHome && activeProfile.preloadLevel > PerfProfiles.PRELOAD_OFF) {
             String origin = SearchEngines.searchOrigin(SearchEngines.currentId(this), SearchEngines.customTemplate(this));
-            if (origin != null && !origin.isEmpty()) WebViewPerf.preconnect(origin, siteFilter);
+            if (origin != null && !origin.isEmpty()) {
+                WebViewPerf.preconnect(origin, siteFilter);
+                WebViewPerf.preconnectHost(origin);
+            }
         }
+        scheduleNewTabPreload(400L);
+    }
+
+    private AikoV040Ui.Host buildV040Host() {
+        return new AikoV040Ui.Host() {
+            @Override public Activity activity() { return MainActivity.this; }
+            @Override public float density() { return density; }
+            @Override public DisplayModeEngine displayMode() { return displayMode; }
+            @Override public StartPageConfig startPageConfig() { return startPageConfig; }
+            @Override public BangCatalog bangCatalog() { return bangCatalog; }
+            @Override public SiteFilter siteFilter() { return filter(); }
+            @Override public SiteExtras siteExtras() { return siteExtras; }
+            @Override public UserScripts userScripts() { return userScripts; }
+            @Override public void toast(String msg) { MainActivity.this.toast(msg); }
+            @Override public void navigate(String url) { MainActivity.this.navigate(url); }
+            @Override public void addTab(String url, boolean focusBox) { MainActivity.this.addTab(url, focusBox); }
+            @Override public void downloadUrl(String url, String filename, String ua) { showNewDownload(url, filename, ua); }
+            @Override public void copyText(String label, String text, String confirm) { MainActivity.this.copyText(label, text, confirm); }
+            @Override public void onStartPageOrBarChanged() {
+                applyInsetsLayout();
+                updateChrome();
+                releasePreloadedNewTab();
+                scheduleNewTabPreload(450L);
+            }
+            @Override public void onNightComfortChanged() {
+                applyAutoNightSchedule();
+                applyNightComfortOverlay();
+            }
+            @Override public void onTypographyOrPrivacyChanged() {
+                for (Tab t : tabs) {
+                    if (t.view != null && HttpUrlUtil.isHttp(t.url)) {
+                        applyPageToolkitStyles(t, t.view);
+                        if (startPageConfig.isBlockWebRtcLeak()) t.view.evaluateJavascript(WEBRTC_BLOCK_JS, null);
+                    }
+                }
+            }
+            @Override public void pickCustomFont() { startCustomFontPicker(); }
+            @Override public void startBackupExport() { MainActivity.this.startBackupExport(); }
+            @Override public void startBackupImport() { MainActivity.this.startBackupImport(); }
+            @Override public void reloadCurrentTab() { reloadPreservingScroll(); }
+            @Override public boolean effectiveDarkWeb(String host) { return MainActivity.this.effectiveDarkWeb(host); }
+        };
+    }
+
+    private void wireUserScriptsHostActions() {
+        userScripts.setHostActions(new UserScripts.HostActions() {
+            @Override public void downloadUrl(String url, String filename) {
+                handler.post(() -> {
+                    if (isDestroyed() || !HttpUrlUtil.isHttp(url)) return;
+                    String fname = (filename == null || filename.trim().isEmpty())
+                            ? URLUtil.guessFileName(url, null, null) : filename.trim();
+                    int lanes = Math.min(16, activeProfile.downloadLanes);
+                    try {
+                        DownloadService.start(MainActivity.this, url, fname, null, lanes);
+                        toast("油猴脚本已启动高速下载：" + fname);
+                    } catch (Exception e) {
+                        showNewDownload(url, fname, null);
+                    }
+                });
+            }
+
+            @Override public void openInTab(String url) {
+                handler.post(() -> {
+                    if (!isDestroyed() && HttpUrlUtil.isHttp(url)) addTab(url, false);
+                });
+            }
+
+            @Override public void requestConnectApproval(String scriptId, String scriptName, String host,
+                                                         java.util.function.Consumer<Boolean> decision) {
+                handler.post(() -> {
+                    if (isDestroyed() || isFinishing()) {
+                        if (decision != null) decision.accept(false);
+                        return;
+                    }
+                    AikoV040Ui.showConnectApprovalSheet(MainActivity.this, displayMode, density,
+                            scriptName, host, choice -> {
+                                if (choice == 2) {
+                                    if (decision != null) decision.accept(true);
+                                } else if (choice == 1) {
+                                    if (decision != null) decision.accept(true);
+                                    // Allow Once: revoke persisted host right after UserScripts dispatches this request
+                                    handler.postDelayed(() -> userScripts.revokeConnectHost(scriptId, host), 350L);
+                                } else {
+                                    if (decision != null) decision.accept(false);
+                                }
+                            });
+                });
+            }
+
+            @Override public void onMenuCommandsChanged(WebView view) {
+                handler.post(() -> {
+                    if (!isDestroyed()) updateChrome();
+                });
+            }
+        });
     }
 
     private void syncStaticPaletteAliases() {
@@ -364,12 +572,17 @@ public final class MainActivity extends Activity {
             goButton.tint(AikoTheme.ACCENT);
             goButton.setForeground(AikoTheme.ripple(AikoTheme.RIPPLE_ACCENT, dp(16)));
         }
-        BrowserIcon[] chromeBtns = {backButton, omniboxDismissButton, tabButton, menuButton, siteButton,
-                addressClearButton, addressCopyButton, actionButton};
+        BrowserIcon[] chromeBtns = {backButton, homeButton, babelButton, omniboxDismissButton, tabButton, menuButton,
+                siteButton, addressClearButton, addressCopyButton, addressQrButton, actionButton};
         for (BrowserIcon btn : chromeBtns) {
             if (btn != null) btn.setForeground(AikoTheme.ripple(AikoTheme.RIPPLE_ACCENT, dp(16)));
         }
         if (addressCopyButton != null) addressCopyButton.tint(AikoTheme.ACCENT_CYAN);
+        if (addressQrButton != null) addressQrButton.tint(AikoTheme.TEXT_MUTED);
+        if (homeQrButton != null) {
+            homeQrButton.tint(AikoTheme.TEXT_MUTED);
+            homeQrButton.setForeground(AikoTheme.ripple(AikoTheme.RIPPLE_ACCENT, dp(16)));
+        }
         if (omniboxOverlay != null) {
             omniboxOverlay.setBackground(AikoTheme.card(AikoTheme.SURFACE, AikoTheme.CAPSULE_STROKE, density, dp(20)));
         }
@@ -415,7 +628,8 @@ public final class MainActivity extends Activity {
         if (profile == null) return;
         boolean prevGlobalUltra = activeProfile.globalUltraScroll;
         activeProfile = PerfProfiles.sanitized(profile);
-        maxHotTabs = isLowRam ? Math.min(activeProfile.maxHotTabs, 4) : activeProfile.maxHotTabs;
+        int capFromProfile = WebViewPerf.maxActiveTabsForProfile(activeProfile);
+        maxHotTabs = isLowRam ? Math.min(capFromProfile, 3) : capFromProfile;
         if (displayMode != null) displayMode.applyProfile(activeProfile);
         DownloadService.setMaxLanesLimit(activeProfile.downloadLanes);
         for (Tab t : tabs) {
@@ -432,6 +646,8 @@ public final class MainActivity extends Activity {
                 }
             }
         }
+        if (PerfProfiles.ID_ECO.equals(activeProfile.id)) releasePreloadedNewTab();
+        else scheduleNewTabPreload(500L);
         trimTabs(maxHotTabs);
         if (onHome) refreshHomeContent();
         if (showToast) toast("性能模式：" + activeProfile.name);
@@ -475,6 +691,11 @@ public final class MainActivity extends Activity {
 
     private void handleIntent(Intent intent) {
         if (intent == null) return;
+        if (intent.hasExtra(PwaHelper.EXTRA_PWA_STANDALONE)) {
+            pwaStandaloneMode = intent.getBooleanExtra(PwaHelper.EXTRA_PWA_STANDALONE, false);
+            pwaControlsRevealed = false;
+            applyPwaStandaloneChrome();
+        }
         if (intent.getBooleanExtra("downloads", false)) showDownloads();
         if (handleScriptIntent(intent)) return;
         String link = incomingLink(intent);
@@ -491,6 +712,8 @@ public final class MainActivity extends Activity {
 
     private String incomingLink(Intent intent) {
         if (intent == null) return null;
+        String pwaUrl = intent.getStringExtra(PwaHelper.EXTRA_PWA_URL);
+        if (HttpUrlUtil.isHttp(pwaUrl)) return pwaUrl;
         String action = intent.getAction();
         if (Intent.ACTION_VIEW.equals(action)) {
             String link = intent.getDataString();
@@ -564,6 +787,16 @@ public final class MainActivity extends Activity {
             return true;
         });
 
+        homeButton = icon(HOME, "主页，长按定制主页", this::goHomeAction);
+        homeButton.tint(AikoTheme.TEXT_MUTED);
+        homeButton.setVisibility(View.GONE);
+        AikoTheme.attachPressFeedback(homeButton, 0.92f);
+        homeButton.setOnLongClickListener(v -> {
+            AikoV040Ui.showCustomizationSheet(v040Host);
+            return true;
+        });
+        controls.addView(homeButton, new LinearLayout.LayoutParams(dp(40), dp(44)));
+
         omniboxDismissButton = icon(DOWN, "收起地址栏", this::dismissOmnibox);
         omniboxDismissButton.tint(AikoTheme.TEXT_MUTED);
         omniboxDismissButton.setVisibility(View.GONE);
@@ -629,6 +862,15 @@ public final class MainActivity extends Activity {
         AikoTheme.attachPressFeedback(addressCopyButton, 0.92f);
         addressRow.addView(addressCopyButton, new LinearLayout.LayoutParams(dp(36), -1));
 
+        addressQrButton = icon(QR, "扫码或识别二维码", () -> {
+            dismissOmnibox();
+            QrSheet.showScannerHintOrImageDecode(this, qrScanCallback);
+        });
+        addressQrButton.tint(AikoTheme.TEXT_MUTED);
+        addressQrButton.setVisibility(View.GONE);
+        AikoTheme.attachPressFeedback(addressQrButton, 0.92f);
+        addressRow.addView(addressQrButton, new LinearLayout.LayoutParams(dp(36), -1));
+
         goButton = icon(GO, "前往", () -> submitAddress(address));
         goButton.tint(AikoTheme.ACCENT);
         goButton.setVisibility(View.GONE);
@@ -639,9 +881,25 @@ public final class MainActivity extends Activity {
         homeSpacer.setVisibility(View.GONE);
         controls.addView(homeSpacer, new LinearLayout.LayoutParams(0, -1, 1));
 
+        babelButton = icon(TRANSLATE, "巴别塔翻译，长按设置", () -> {
+            if (current != null && current.view != null && HttpUrlUtil.isHttp(current.url)) {
+                babelUi.togglePageTranslation(current.view, current.url);
+            } else {
+                babelUi.showSheet(null, null);
+            }
+        });
+        babelButton.tint(AikoTheme.TEXT_MUTED);
+        babelButton.setVisibility(View.GONE);
+        AikoTheme.attachPressFeedback(babelButton, 0.92f);
+        babelButton.setOnLongClickListener(v -> {
+            babelUi.showSheet(current != null ? current.view : null, current != null ? current.url : null);
+            return true;
+        });
+        controls.addView(babelButton, new LinearLayout.LayoutParams(dp(40), dp(44)));
+
         tabButton = icon(TABS, "标签页，长按新建", this::showTabs);
         AikoTheme.attachPressFeedback(tabButton, 0.92f);
-        tabButton.setOnLongClickListener(v -> { addTab(null, false); return true; });
+        tabButton.setOnLongClickListener(v -> { openNewTabDefault(false); return true; });
         controls.addView(tabButton, new LinearLayout.LayoutParams(dp(44), dp(44)));
 
         menuButton = icon(MENU, "浏览工具，长按打开下载", this::showTools);
@@ -669,11 +927,20 @@ public final class MainActivity extends Activity {
             }
             int vis = editing ? View.GONE : View.VISIBLE;
             backButton.setVisibility(editing || onHome ? View.GONE : View.VISIBLE);
+            if (homeButton != null) {
+                homeButton.setVisibility(!editing && startPageConfig != null && startPageConfig.isShowHomeButton()
+                        ? View.VISIBLE : View.GONE);
+            }
+            if (babelButton != null) {
+                babelButton.setVisibility(!editing && !onHome && startPageConfig != null && startPageConfig.isShowBabelButton()
+                        ? View.VISIBLE : View.GONE);
+            }
             omniboxDismissButton.setVisibility(editing ? View.VISIBLE : View.GONE);
             tabButton.setVisibility(vis);
             menuButton.setVisibility(vis);
             siteButton.setVisibility(vis);
             actionButton.setVisibility(editing ? View.GONE : View.VISIBLE);
+            if (addressQrButton != null) addressQrButton.setVisibility(editing ? View.VISIBLE : View.GONE);
             goButton.setVisibility(editing ? View.VISIBLE : View.GONE);
             address.setPadding(editing ? dp(12) : dp(2), 0, editing ? dp(4) : dp(2), 0);
             address.setEllipsize(editing ? null : TextUtils.TruncateAt.END);
@@ -800,6 +1067,40 @@ public final class MainActivity extends Activity {
             }
         });
 
+        // PWA Standalone floating toggle pill (hidden unless launched as standalone PWA)
+        pwaTogglePill = AikoTheme.badge(this, density, "Aiko",
+                AikoTheme.TEXT_MUTED, (AikoTheme.SURFACE & 0x00FFFFFF) | 0xCC000000, AikoTheme.STROKE);
+        pwaTogglePill.setElevation(dp(12));
+        pwaTogglePill.setAlpha(0.72f);
+        pwaTogglePill.setVisibility(View.GONE);
+        pwaTogglePill.setOnClickListener(v -> {
+            pwaControlsRevealed = !pwaControlsRevealed;
+            applyPwaStandaloneChrome();
+        });
+        pwaTogglePill.setOnLongClickListener(v -> {
+            pwaStandaloneMode = false;
+            pwaControlsRevealed = false;
+            applyPwaStandaloneChrome();
+            toast("已退出独立应用全屏模式");
+            return true;
+        });
+        FrameLayout.LayoutParams pwaLp = new FrameLayout.LayoutParams(-2, dp(28), Gravity.BOTTOM | Gravity.END);
+        pwaLp.rightMargin = dp(10);
+        pwaLp.bottomMargin = dp(18);
+        root.addView(pwaTogglePill, pwaLp);
+
+        // Full-screen non-touch-intercepting AMOLED Night Comfort dimmer/warmth overlay
+        nightComfortOverlay = new View(this) {
+            @Override public boolean dispatchTouchEvent(MotionEvent event) { return false; }
+            @Override public boolean onTouchEvent(MotionEvent event) { return false; }
+        };
+        nightComfortOverlay.setClickable(false);
+        nightComfortOverlay.setFocusable(false);
+        nightComfortOverlay.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+        nightComfortOverlay.setElevation(dp(40));
+        nightComfortOverlay.setVisibility(View.GONE);
+        root.addView(nightComfortOverlay, new FrameLayout.LayoutParams(-1, -1));
+
         setContentView(root);
         if (Build.VERSION.SDK_INT >= 30) {
             WindowInsetsController wic = getWindow().getInsetsController();
@@ -853,27 +1154,44 @@ public final class MainActivity extends Activity {
                 barHidden, barSettling, legacyImeOpen,
                 insetBottom, imeBottom, deckContentHeight, dp(6));
 
+        boolean pwaHideDeck = pwaStandaloneMode && !pwaControlsRevealed && !editingOmni && !findOpen && !isFullscreen;
+        boolean capsuleStyle = startPageConfig != null
+                && startPageConfig.getBarStyle() == StartPageConfig.BarStyle.CAPSULE
+                && !onHome && !editingOmni && !findOpen && !isFullscreen && !pwaHideDeck;
+
+        int vpBottom = pwaHideDeck ? insetBottom : (capsuleStyle && !barHidden ? layout.viewportBottomMargin + dp(10) : layout.viewportBottomMargin);
+
         // 1. Update viewport margins ONLY when changed (prevents spurious WebView relayout)
         FrameLayout.LayoutParams vlp = (FrameLayout.LayoutParams) viewport.getLayoutParams();
         if (vlp != null && (vlp.leftMargin != insetLeft || vlp.topMargin != insetTop
-                || vlp.rightMargin != insetRight || vlp.bottomMargin != layout.viewportBottomMargin)) {
+                || vlp.rightMargin != insetRight || vlp.bottomMargin != vpBottom)) {
             vlp.leftMargin = insetLeft;
             vlp.topMargin = insetTop;
             vlp.rightMargin = insetRight;
-            vlp.bottomMargin = layout.viewportBottomMargin;
+            vlp.bottomMargin = vpBottom;
             viewport.setLayoutParams(vlp);
         }
 
-        // 2. Update bottomDeck visibility, inset padding, Home/Web surface cohesion, and translationY
-        int targetDeckVis = layout.deckVisible ? View.VISIBLE : View.GONE;
+        // 2. Update bottomDeck visibility, inset padding, Capsule/Standard style, and translationY
+        int targetDeckVis = (layout.deckVisible && !pwaHideDeck) ? View.VISIBLE : View.GONE;
         if (bottomDeck.getVisibility() != targetDeckVis) {
             bottomDeck.setVisibility(targetDeckVis);
         }
-        if (bottomDeck.getPaddingBottom() != layout.deckPaddingBottom) {
-            bottomDeck.setPadding(0, 0, 0, layout.deckPaddingBottom);
+        FrameLayout.LayoutParams dlp = (FrameLayout.LayoutParams) bottomDeck.getLayoutParams();
+        int deckHMargin = capsuleStyle ? (Math.max(insetLeft, insetRight) + dp(10)) : 0;
+        int deckBMargin = capsuleStyle ? (insetBottom + dp(8)) : 0;
+        if (dlp != null && (dlp.leftMargin != deckHMargin || dlp.rightMargin != deckHMargin || dlp.bottomMargin != deckBMargin)) {
+            dlp.leftMargin = deckHMargin;
+            dlp.rightMargin = deckHMargin;
+            dlp.bottomMargin = deckBMargin;
+            bottomDeck.setLayoutParams(dlp);
         }
-        int ctrlLeft = insetLeft + dp(6);
-        int ctrlRight = insetRight + dp(6);
+        int deckPadBottom = capsuleStyle ? 0 : layout.deckPaddingBottom;
+        if (bottomDeck.getPaddingBottom() != deckPadBottom) {
+            bottomDeck.setPadding(0, 0, 0, deckPadBottom);
+        }
+        int ctrlLeft = capsuleStyle ? dp(8) : (insetLeft + dp(6));
+        int ctrlRight = capsuleStyle ? dp(8) : (insetRight + dp(6));
         if (controls != null && (controls.getPaddingLeft() != ctrlLeft || controls.getPaddingRight() != ctrlRight)) {
             controls.setPadding(ctrlLeft, dp(6), ctrlRight, dp(6));
         }
@@ -884,13 +1202,26 @@ public final class MainActivity extends Activity {
         }
 
         boolean seamlessHomeDeck = onHome && !editingOmni && !findOpen;
-        bottomDeck.setBackgroundColor(seamlessHomeDeck ? AikoTheme.BG : AikoTheme.SURFACE);
+        if (capsuleStyle) {
+            bottomDeck.setBackground(AikoTheme.card(AikoTheme.SURFACE, AikoTheme.CAPSULE_STROKE, density, dp(26)));
+        } else {
+            bottomDeck.setBackgroundColor(seamlessHomeDeck ? AikoTheme.BG : AikoTheme.SURFACE);
+        }
         if (deckDivider != null) {
-            int divVis = seamlessHomeDeck ? View.INVISIBLE : View.VISIBLE;
+            int divVis = (seamlessHomeDeck || capsuleStyle) ? View.INVISIBLE : View.VISIBLE;
             if (deckDivider.getVisibility() != divVis) deckDivider.setVisibility(divVis);
         }
-        float targetElev = (layout.deckVisible && !barHidden && !seamlessHomeDeck) ? dp(6) : 0f;
+        float targetElev = (targetDeckVis == View.VISIBLE && !barHidden && !seamlessHomeDeck) ? dp(capsuleStyle ? 10 : 6) : 0f;
         if (bottomDeck.getElevation() != targetElev) bottomDeck.setElevation(targetElev);
+
+        if (pwaTogglePill != null && pwaStandaloneMode) {
+            FrameLayout.LayoutParams plp = (FrameLayout.LayoutParams) pwaTogglePill.getLayoutParams();
+            int pwaBottom = pwaControlsRevealed ? (deckContentHeight + insetBottom + dp(14)) : (insetBottom + dp(14));
+            if (plp != null && plp.bottomMargin != pwaBottom) {
+                plp.bottomMargin = pwaBottom;
+                pwaTogglePill.setLayoutParams(plp);
+            }
+        }
 
         boolean allowSnapTranslation = stateOverridesAutoHide || gestures == null || !gestures.isBarAnimating();
         if (allowSnapTranslation && bottomDeck.getTranslationY() != layout.deckTranslationY) {
@@ -957,7 +1288,10 @@ public final class MainActivity extends Activity {
             for (int i = 0; i < stored.length() && tabs.size() < MAX_TABS; i++) {
                 JSONObject item = stored.getJSONObject(i);
                 String url = item.optString("url");
-                Tab tab = new Tab(HttpUrlUtil.isHttp(url) ? url : null, item.optString("title"));
+                String validUrl = isNavigableUrl(url) ? url : null;
+                Tab tab = new Tab(validUrl, item.optString("title"));
+                tab.pinned = item.optBoolean("pinned", false);
+                tab.groupName = item.optString("group", "");
                 tab.positions.remember(ScrollPositions.URL_ONLY, tab.url,
                         item.optInt("scrollX"), item.optInt("scrollY"));
                 tabs.add(tab);
@@ -968,8 +1302,17 @@ public final class MainActivity extends Activity {
             tabs.add(new Tab(incoming, incoming));
             index = tabs.size() - 1;
         }
-        if (tabs.isEmpty()) tabs.add(new Tab(null, "新标签"));
+        if (tabs.isEmpty()) {
+            String customHome = startPageConfig != null ? startPageConfig.resolveHomeUrl() : null;
+            tabs.add(new Tab(customHome, customHome == null ? "新标签" : customHome));
+        }
         showTab(tabs.get(Math.min(Math.max(index, 0), tabs.size() - 1)), false);
+    }
+
+    private static boolean isNavigableUrl(String url) {
+        if (url == null || url.isEmpty()) return false;
+        return HttpUrlUtil.isHttp(url) || "about:blank".equalsIgnoreCase(url)
+                || url.regionMatches(true, 0, "file://", 0, 7);
     }
 
     /** Serializes tab snapshot on background I/O thread so UI thread never stalls at 185Hz. */
@@ -983,7 +1326,9 @@ public final class MainActivity extends Activity {
                     t.title == null ? "" : t.title,
                     pos != null,
                     pos == null ? 0 : pos.x,
-                    pos == null ? 0 : pos.y));
+                    pos == null ? 0 : pos.y,
+                    t.pinned,
+                    t.groupName == null ? "" : t.groupName));
         }
         ioExecutor.execute(() -> {
             JSONArray list = new JSONArray();
@@ -992,6 +1337,8 @@ public final class MainActivity extends Activity {
                 try {
                     item.put("url", s.url);
                     item.put("title", s.title);
+                    if (s.pinned) item.put("pinned", true);
+                    if (!s.groupName.isEmpty()) item.put("group", s.groupName);
                     if (s.hasScroll) {
                         item.put("scrollX", s.scrollX);
                         item.put("scrollY", s.scrollY);
@@ -1004,22 +1351,187 @@ public final class MainActivity extends Activity {
     }
 
     private static final class TabSnapshot {
-        final String url, title;
-        final boolean hasScroll;
+        final String url, title, groupName;
+        final boolean hasScroll, pinned;
         final int scrollX, scrollY;
 
-        TabSnapshot(String url, String title, boolean hasScroll, int scrollX, int scrollY) {
+        TabSnapshot(String url, String title, boolean hasScroll, int scrollX, int scrollY,
+                    boolean pinned, String groupName) {
             this.url = url;
             this.title = title;
             this.hasScroll = hasScroll;
             this.scrollX = scrollX;
             this.scrollY = scrollY;
+            this.pinned = pinned;
+            this.groupName = groupName;
         }
     }
 
     private void scheduleSave() {
         handler.removeCallbacks(saveTask);
         handler.postDelayed(saveTask, 600);
+    }
+
+    private void openNewTabDefault(boolean focusBox) {
+        String target = startPageConfig != null ? startPageConfig.resolveNewTabUrl() : null;
+        if (target == null) {
+            addTab(null, focusBox);
+            return;
+        }
+        if (tabs.size() >= MAX_TABS) {
+            toast("最多保留 " + MAX_TABS + " 个标签");
+            return;
+        }
+        // Zero-white-flash instant swap when preloaded hidden WebView matches custom new-tab URL!
+        if (preloadedNewTabView != null && target.equals(preloadedNewTabUrl)) {
+            ScrollWebView warm = preloadedNewTabView;
+            preloadedNewTabView = null;
+            preloadedNewTabUrl = null;
+            Tab tab = new Tab(target, warm.getTitle() == null || warm.getTitle().isEmpty() ? target : warm.getTitle());
+            tab.view = warm;
+            warm.setOwner(tab);
+            tabs.add(tab);
+            showTab(tab, false);
+            scheduleNewTabPreload(800L);
+            return;
+        }
+        addTab(target, false);
+        scheduleNewTabPreload(800L);
+    }
+
+    private void goHomeAction() {
+        String customHome = startPageConfig != null ? startPageConfig.resolveHomeUrl() : null;
+        if (customHome != null) {
+            navigate(customHome);
+            return;
+        }
+        if (current == null) return;
+        closeFind();
+        hideOmniboxOverlay();
+        hideKeyboardIfNeeded();
+        if (current.view != null) {
+            rememberScroll(current);
+            captureFormDraft(current);
+            destroyWeb(current);
+        }
+        current.setUrl(null);
+        current.title = "新标签";
+        showTab(current, false);
+    }
+
+    private void scheduleNewTabPreload(long delayMs) {
+        handler.removeCallbacks(preloadNewTabTask);
+        if (startPageConfig == null || !startPageConfig.shouldPreloadNewTab()
+                || PerfProfiles.ID_ECO.equals(activeProfile.id) || isLowRam) {
+            releasePreloadedNewTab();
+            return;
+        }
+        handler.postDelayed(preloadNewTabTask, delayMs);
+    }
+
+    private void ensurePreloadedNewTab() {
+        if (isDestroyed() || isFinishing() || !visible || !engineReady || isLowRam) return;
+        if (startPageConfig == null || !startPageConfig.shouldPreloadNewTab()
+                || PerfProfiles.ID_ECO.equals(activeProfile.id)) {
+            releasePreloadedNewTab();
+            return;
+        }
+        String target = startPageConfig.resolveNewTabUrl();
+        if (target == null || "about:blank".equalsIgnoreCase(target)) {
+            releasePreloadedNewTab();
+            return;
+        }
+        if (preloadedNewTabView != null && target.equals(preloadedNewTabUrl)) return;
+        releasePreloadedNewTab();
+        try {
+            Tab warmTab = new Tab(target, target);
+            ScrollWebView warm = createWebView(warmTab);
+            warmTab.view = warm;
+            preloadedNewTabView = warm;
+            preloadedNewTabUrl = target;
+            attachWarmWebView(warm);
+            warm.setVisibility(View.GONE);
+            WebViewPerf.setActivePreRaster(warm, false);
+            WebViewPerf.setActiveRenderer(warm, false);
+            prepareTopLoad(warmTab, target, true, false);
+            warm.loadUrl(target);
+        } catch (RuntimeException ignored) {
+            releasePreloadedNewTab();
+        }
+    }
+
+    private void releasePreloadedNewTab() {
+        handler.removeCallbacks(preloadNewTabTask);
+        ScrollWebView old = preloadedNewTabView;
+        preloadedNewTabView = null;
+        preloadedNewTabUrl = null;
+        if (old != null) {
+            try {
+                if (babelUi != null) babelUi.unbindWebView(old);
+                userScripts.detach(old);
+                if (old.getParent() instanceof ViewGroup) ((ViewGroup) old.getParent()).removeView(old);
+                old.destroy();
+            } catch (RuntimeException ignored) { }
+        }
+    }
+
+    private void applyPwaStandaloneChrome() {
+        if (pwaTogglePill != null) {
+            pwaTogglePill.setVisibility(pwaStandaloneMode ? View.VISIBLE : View.GONE);
+            pwaTogglePill.setText(pwaControlsRevealed ? "隐栏" : "Aiko");
+        }
+        applyInsetsLayout();
+    }
+
+    private void applyNightComfortOverlay() {
+        if (nightComfortOverlay == null || startPageConfig == null) return;
+        int color = startPageConfig.computeOverlayColor();
+        if (color == 0) {
+            nightComfortOverlay.setVisibility(View.GONE);
+        } else {
+            nightComfortOverlay.setBackgroundColor(color);
+            nightComfortOverlay.setVisibility(View.VISIBLE);
+        }
+    }
+
+    private void applyAutoNightSchedule() {
+        if (startPageConfig == null || !startPageConfig.isAutoThemeByTime()) return;
+        int hour = Calendar.getInstance().get(Calendar.HOUR_OF_DAY);
+        boolean inNight = startPageConfig.isInNightWindow(hour);
+        boolean lastAppliedNight = mainPrefs.getBoolean("auto_night_applied", false);
+        if (inNight && !lastAppliedNight) {
+            mainPrefs.edit()
+                    .putBoolean("auto_night_prev_dark", siteExtras.isGlobalDarkWeb())
+                    .putBoolean("auto_night_applied", true)
+                    .apply();
+            if (!siteExtras.isGlobalDarkWeb()) {
+                siteExtras.setGlobalDarkWeb(true);
+                refreshAllTabsDarkMode();
+            }
+            if (!startPageConfig.isNightFilterEnabled()
+                    && (startPageConfig.getNightDimPercent() > 0 || startPageConfig.getNightWarmthPercent() > 0)) {
+                startPageConfig.setNightFilterEnabled(true);
+            }
+        } else if (!inNight && lastAppliedNight) {
+            boolean prevDark = mainPrefs.getBoolean("auto_night_prev_dark", false);
+            mainPrefs.edit().putBoolean("auto_night_applied", false).apply();
+            if (siteExtras.isGlobalDarkWeb() != prevDark) {
+                siteExtras.setGlobalDarkWeb(prevDark);
+                refreshAllTabsDarkMode();
+            }
+            if (startPageConfig.isNightFilterEnabled()) {
+                startPageConfig.setNightFilterEnabled(false);
+            }
+        }
+    }
+
+    private void refreshAllTabsDarkMode() {
+        for (Tab t : tabs) {
+            if (t.view != null) {
+                applySiteExtras(t, t.cachedHost, false);
+                t.view.setBackgroundColor(effectiveDarkWeb(t.cachedHost) ? AikoTheme.BG : Color.WHITE);
+            }
+        }
     }
 
     private void addTab(String url, boolean focusBox) {
@@ -1138,10 +1650,12 @@ public final class MainActivity extends Activity {
             for (Tab t : tabs) {
                 if (t.view == null) continue;
                 count++;
-                if (t != current && (oldest == null || t.used < oldest.used)) oldest = t;
+                boolean protectedTab = (t == current) || t.pinned || (bgAudioEnabled && t == bgAudioTab);
+                if (!protectedTab && (oldest == null || t.used < oldest.used)) oldest = t;
             }
             if (count <= cap || oldest == null) return;
             rememberScroll(oldest);
+            captureFormDraft(oldest);
             oldest.navigation = new Bundle();
             WebViewPerf.saveStateBounded(oldest.view, oldest.navigation, STATE_SAVE_MAX_BYTES);
             destroyWeb(oldest);
@@ -1151,11 +1665,15 @@ public final class MainActivity extends Activity {
     private void destroyWeb(Tab tab) {
         WebView web = tab.view;
         if (web == null) return;
+        if (tab == bgAudioTab && bgAudioEnabled) {
+            setBackgroundAudioEnabled(tab, false, false);
+        }
         tab.view = null;
         tab.desktopApplied = false;
         tab.filterPagePrepared = false;
         tab.canGoBack = false;
         tab.canGoForward = false;
+        if (babelUi != null) babelUi.unbindWebView(web);
         userScripts.detach(web);
         setScrollTarget(tab, null);
         if (web.getParent() instanceof ViewGroup) ((ViewGroup) web.getParent()).removeView(web);
@@ -1168,10 +1686,12 @@ public final class MainActivity extends Activity {
             if (t.view != null) WebViewPerf.setActivePreRaster(t.view, false);
         }
         if (level == TRIM_MEMORY_RUNNING_CRITICAL || level >= TRIM_MEMORY_MODERATE) {
+            releasePreloadedNewTab();
             trimTabs(1);
             for (Tab t : tabs) if (t != current) t.favicon = null;
         } else if (level == TRIM_MEMORY_RUNNING_LOW || level == TRIM_MEMORY_UI_HIDDEN
                 || level == TRIM_MEMORY_BACKGROUND) {
+            releasePreloadedNewTab();
             trimTabs(Math.min(2, maxHotTabs));
         }
     }
@@ -1213,6 +1733,7 @@ public final class MainActivity extends Activity {
         brand.setTextSize(28);
         brand.setTextColor(AikoTheme.TEXT);
         brand.setTypeface(AikoTheme.BOLD);
+        brand.setGravity(Gravity.CENTER_HORIZONTAL);
         brand.setLetterSpacing(-0.015f);
         LinearLayout.LayoutParams blp = new LinearLayout.LayoutParams(-2, -2);
         blp.topMargin = dp(14);
@@ -1272,6 +1793,11 @@ public final class MainActivity extends Activity {
         homeSearch.setOnFocusChangeListener((v, hasFocus) -> {
             if (hasFocus) focusAddress();
         });
+
+        homeQrButton = icon(QR, "扫码或识别二维码", () -> QrSheet.showScannerHintOrImageDecode(this, qrScanCallback));
+        homeQrButton.tint(AikoTheme.TEXT_MUTED);
+        AikoTheme.attachPressFeedback(homeQrButton, 0.92f);
+        homeBoxRow.addView(homeQrButton, new LinearLayout.LayoutParams(dp(40), dp(44)));
 
         homeGoButton = icon(GO, "搜索或前往", this::focusAddress);
         homeGoButton.tint(AikoTheme.ACCENT);
@@ -1413,6 +1939,7 @@ public final class MainActivity extends Activity {
         GestureChrome.attachPressScale(tile, 0.95f, () -> {
             if (activeProfile.preloadLevel > PerfProfiles.PRELOAD_OFF) {
                 WebViewPerf.preconnect(entry.url, siteFilter);
+                WebViewPerf.preconnectHost(entry.url);
             }
         });
         tile.setOnClickListener(v -> navigate(entry.url));
@@ -1655,9 +2182,43 @@ public final class MainActivity extends Activity {
 
         int rows = 0;
 
-        // 0. Active webpage quick-action card (1-tap Copy Link / Share / Clear)
+        // 0a. Slash /command instant shortcuts
+        if (query.startsWith("/")) {
+            List<BangCatalog.SlashCmd> cmds = BangCatalog.suggestSlashCommands(query);
+            for (BangCatalog.SlashCmd cmd : cmds) {
+                addSuggestionRow(FLASH_CMD, BangCatalog.slashLabel(cmd), "快捷指令 · 点按立即执行",
+                        AikoTheme.ACCENT_CYAN, null, () -> executeSlashCommand(cmd));
+                rows++;
+                if (rows >= 8) break;
+            }
+        }
+
+        // 0b. !Bang quick search suggestions
+        if (query.startsWith("!") && bangCatalog != null) {
+            int sp = query.indexOf(' ');
+            String trailingArg = sp > 0 ? query.substring(sp + 1).trim() : "";
+            List<BangCatalog.Entry> bangs = bangCatalog.suggestBangs(query, 8);
+            for (BangCatalog.Entry b : bangs) {
+                String sub = trailingArg.isEmpty()
+                        ? ("点击补全 !" + b.bang + " 或直接打开 " + b.label)
+                        : ("使用 " + b.label + " 搜索 “" + trailingArg + "”");
+                addSuggestionRow(FLASH_CMD, "!" + b.bang + "  ·  " + b.label, sub,
+                        AikoTheme.ACCENT, b.homeUrl, () -> {
+                            if (trailingArg.isEmpty()) {
+                                address.setText("!" + b.bang + " ");
+                                address.setSelection(address.getText().length());
+                            } else {
+                                submitRawInput("!" + b.bang + " " + trailingArg);
+                            }
+                        });
+                rows++;
+                if (rows >= 8) break;
+            }
+        }
+
+        // 0. Active webpage quick-action card (1-tap Copy Link / QR / Share)
         boolean showedCurrentCard = false;
-        if (current != null && !onHome && HttpUrlUtil.isHttp(current.url)
+        if (rows == 0 && current != null && !onHome && HttpUrlUtil.isHttp(current.url)
                 && (query.isEmpty() || query.equals(current.url))) {
             addCurrentPageOmniboxCard(current.title, current.url);
             showedCurrentCard = true;
@@ -1666,7 +2227,8 @@ public final class MainActivity extends Activity {
 
         // 1. Clipboard Quick-Paste Chip (only when query empty or matches active URL)
         String clip = readClipboardSnippet();
-        if (clip != null && !clip.equals(query) && (current == null || !clip.equals(current.url))) {
+        if (!query.startsWith("/") && !query.startsWith("!")
+                && clip != null && !clip.equals(query) && (current == null || !clip.equals(current.url))) {
             boolean isUrl = HttpUrlUtil.isHttp(clip);
             addSuggestionRow(COPY, isUrl ? "粘贴并前往" : "搜索剪贴板", clip, AikoTheme.CYAN,
                     isUrl ? clip : null, () -> submitRawInput(clip));
@@ -1674,7 +2236,7 @@ public final class MainActivity extends Activity {
         }
 
         // 2. Matching open tabs (instant switch without duplicate tab!)
-        if (!query.isEmpty()) {
+        if (!query.isEmpty() && !query.startsWith("/") && !query.startsWith("!")) {
             String low = query.toLowerCase(Locale.ROOT);
             for (Tab t : tabs) {
                 if (t == current || t.url == null) continue;
@@ -1687,20 +2249,27 @@ public final class MainActivity extends Activity {
             }
         }
 
-        // 3. Instant local Bookmark + History matches
-        String searchKey = (current != null && query.equals(current.url)) ? "" : query;
-        List<BrowserLibrary.Entry> matches = library.search(searchKey, Math.max(3, 7 - rows));
-        for (BrowserLibrary.Entry item : matches) {
-            if (showedCurrentCard && current != null && item.url.equals(current.url)) continue;
-            boolean saved = library.isBookmarked(item.url);
-            addSuggestionRow(saved ? STAR : HISTORY, item.title, item.url,
-                    saved ? AikoTheme.ACCENT : AikoTheme.TEXT_MUTED, item.url, () -> navigate(item.url));
-            rows++;
-            if (rows >= 6) break;
+        // 3. Instant local Bookmark + History matches (+ speculative DNS/TCP preconnect for top hit)
+        if (!query.startsWith("/") && !query.startsWith("!")) {
+            String searchKey = (current != null && query.equals(current.url)) ? "" : query;
+            List<BrowserLibrary.Entry> matches = library.search(searchKey, Math.max(3, 7 - rows));
+            boolean preconnectedTop = false;
+            for (BrowserLibrary.Entry item : matches) {
+                if (showedCurrentCard && current != null && item.url.equals(current.url)) continue;
+                if (!preconnectedTop && !searchKey.isEmpty() && activeProfile.preloadLevel > PerfProfiles.PRELOAD_OFF) {
+                    WebViewPerf.preconnectHost(item.url);
+                    preconnectedTop = true;
+                }
+                boolean saved = library.isBookmarked(item.url);
+                addSuggestionRow(saved ? STAR : HISTORY, item.title, item.url,
+                        saved ? AikoTheme.ACCENT : AikoTheme.TEXT_MUTED, item.url, () -> navigate(item.url));
+                rows++;
+                if (rows >= 6) break;
+            }
         }
 
         // 4. Direct Search Engine option when user typed non-empty query
-        if (!query.isEmpty() && !HttpUrlUtil.isHttp(query)) {
+        if (!query.isEmpty() && !query.startsWith("/") && !query.startsWith("!") && !HttpUrlUtil.isHttp(query)) {
             String eng = SearchEngines.engineName(SearchEngines.currentId(this));
             addSuggestionRow(SEARCH, "使用 " + eng + " 搜索 “" + query + "”", null,
                     AikoTheme.ACCENT, SearchEngines.searchOrigin(SearchEngines.currentId(this), SearchEngines.customTemplate(this)),
@@ -1783,6 +2352,16 @@ public final class MainActivity extends Activity {
         cplp.leftMargin = dp(8);
         card.addView(copyPill, cplp);
 
+        BrowserIcon qrBtn = icon(QR, "生成二维码", () -> {
+            dismissOmnibox();
+            QrSheet.showGenerator(this, title, url, () -> copyUrl("网址", url), qrScanCallback);
+        });
+        qrBtn.tint(AikoTheme.TEXT_MUTED);
+        AikoTheme.attachPressFeedback(qrBtn, 0.90f);
+        LinearLayout.LayoutParams qlp = new LinearLayout.LayoutParams(dp(34), dp(34));
+        qlp.leftMargin = dp(2);
+        card.addView(qrBtn, qlp);
+
         BrowserIcon shareBtn = icon(SHARE, "分享链接", () -> {
             dismissOmnibox();
             shareLink(url);
@@ -1829,6 +2408,7 @@ public final class MainActivity extends Activity {
                 if (ev.getActionMasked() == MotionEvent.ACTION_DOWN
                         && activeProfile.preloadLevel > PerfProfiles.PRELOAD_OFF) {
                     WebViewPerf.preconnect(preconnectUrl, siteFilter);
+                    WebViewPerf.preconnectHost(preconnectUrl);
                 }
                 return false;
             });
@@ -1868,20 +2448,20 @@ public final class MainActivity extends Activity {
     // ==================== WEBVIEW CREATION & LIFECYCLE ====================
 
     @SuppressWarnings("SetJavaScriptEnabled")
-    private WebView createWebView(Tab tab) {
-        ScrollWebView web = new ScrollWebView(this, tab);
+    private ScrollWebView createWebView(Tab initialTab) {
+        ScrollWebView web = new ScrollWebView(this, initialTab);
         SiteFilter filter = filter();
 
         // Start with dark obsidian bg to eliminate blinding white flash during load!
         web.setBackgroundColor(AikoTheme.BG);
         WebViewPerf.configureWebView(web, false, isLowRam);
-        WebViewPerf.applyProfile(web, activeProfile, false, isLowRam, tab == current);
-        WebViewPerf.setActiveRenderer(web, tab == current);
-        if (tab.muted) WebViewPerf.setAudioMuted(web, true);
+        WebViewPerf.applyProfile(web, activeProfile, false, isLowRam, initialTab == current);
+        WebViewPerf.setActiveRenderer(web, initialTab == current);
+        if (initialTab.muted) WebViewPerf.setAudioMuted(web, true);
         if (displayMode != null) displayMode.attachView(web);
 
         WebSettings s = web.getSettings();
-        tab.baseTextZoom = s.getTextZoom();
+        initialTab.baseTextZoom = s.getTextZoom();
         s.setJavaScriptEnabled(true);
         s.setDomStorageEnabled(true);
         s.setAllowFileAccess(false);
@@ -1898,18 +2478,21 @@ public final class MainActivity extends Activity {
 
         web.setWebViewClient(new WebViewClient() {
             @Override public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
+                Tab tab = web.owner;
                 Uri uri = request.getUrl();
                 String raw = uri == null ? "" : uri.toString();
-                boolean allowed = HttpUrlUtil.isHttp(raw);
+                boolean allowed = HttpUrlUtil.isHttp(raw) || "about:blank".equalsIgnoreCase(raw);
                 if (allowed) {
-                    if (tab.view == view && request.isForMainFrame() && UserScripts.isUserScriptUrl(raw)) {
+                    if (tab != null && tab.view == view && request.isForMainFrame() && UserScripts.isUserScriptUrl(raw)) {
                         String ua = view.getSettings().getUserAgentString();
                         closeTransientPopupTabAsync(tab);
                         handleRemoteUserScript(raw, URLUtil.guessFileName(raw, null, "application/javascript"), ua);
                         return true;
                     }
-                    if (tab.view == view && request.isForMainFrame() && !request.isRedirect()) {
+                    if (tab != null && tab.view == view && request.isForMainFrame() && !request.isRedirect()
+                            && HttpUrlUtil.isHttp(raw)) {
                         if (tab == current) {
+                            captureFormDraft(tab);
                             if (!raw.equals(tab.historyTarget)) prepareFreshNavigation(tab);
                             beginNavigation(tab);
                         }
@@ -1917,14 +2500,17 @@ public final class MainActivity extends Activity {
                     }
                     return false;
                 }
-                if (tab == current && request.isForMainFrame() && request.hasGesture()) {
-                    confirmExternalAppIntent(raw);
+                if (tab == current && request.isForMainFrame()) {
+                    handleExternalAppIntent(tab, raw, request.hasGesture());
                 }
                 return true;
             }
 
             @Override public void onPageStarted(WebView view, String url, Bitmap favicon) {
-                if (tab.view != view) return;
+                Tab tab = web.owner;
+                if (tab == null || tab.view != view) return;
+                userScripts.clearMenuCommands(view);
+                if (tab == current) cachedSniffedCount = 0;
                 if (findTarget == view) closeFind();
                 if (elementPicker != null && elementPicker.isActive()) elementPicker.stop();
                 if (tab.started == 0) beginNavigation(tab);
@@ -1941,6 +2527,9 @@ public final class MainActivity extends Activity {
                     tab.filterPagePrepared = false;
                     applySiteProfile(tab, siteProfile(tab.cachedHost), false, false);
                     applySiteExtras(tab, tab.cachedHost, false);
+                    if (startPageConfig != null && startPageConfig.isBlockWebRtcLeak()) {
+                        view.evaluateJavascript(WEBRTC_BLOCK_JS, null);
+                    }
                 }
                 if (tab == current) {
                     if (gestures != null && fullscreen == null && findTarget == null
@@ -1952,11 +2541,18 @@ public final class MainActivity extends Activity {
             }
 
             @Override public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
-                return filter.blocks(tab.filterPage, request) ? SiteFilter.blocked() : null;
+                Uri reqUri = request == null ? null : request.getUrl();
+                String reqStr = reqUri == null ? null : reqUri.toString();
+                if (reqStr != null && reqStr.startsWith(CUSTOM_FONT_URL_PREFIX)) {
+                    return interceptCustomFontRequest(reqStr);
+                }
+                Tab tab = web.owner;
+                return tab != null && filter.blocks(tab.filterPage, request) ? SiteFilter.blocked() : null;
             }
 
             @Override public void onPageCommitVisible(WebView view, String url) {
-                if (tab.view != view) return;
+                Tab tab = web.owner;
+                if (tab == null || tab.view != view) return;
                 boolean wasHistoryNav = tab.historyTarget != null && tab.historyTarget.equals(url);
                 tab.historyTarget = null;
                 if (HttpUrlUtil.isHttp(url) && url.equals(view.getUrl())) {
@@ -1969,6 +2565,14 @@ public final class MainActivity extends Activity {
                     applySiteExtras(tab, tab.cachedHost, true);
                     // Switch canvas to white ONLY when algorithmic dark web is off, avoiding white flash before paint
                     view.setBackgroundColor(effectiveDarkWeb(tab.cachedHost) ? AikoTheme.BG : Color.WHITE);
+                    if (startPageConfig != null && startPageConfig.isAntiAdblockScriptlets()
+                            && filter.enabled(tab.cachedHost)) {
+                        view.evaluateJavascript(PageToolkit.antiAdblockScriptlets(tab.cachedHost), null);
+                    }
+                    if (startPageConfig != null && startPageConfig.isBlockWebRtcLeak()) {
+                        view.evaluateJavascript(WEBRTC_BLOCK_JS, null);
+                    }
+                    applyPageToolkitStyles(tab, view);
                 }
                 syncNavigationFlags(tab, view, url, true);
                 restoreScroll(tab, view, url);
@@ -1982,7 +2586,7 @@ public final class MainActivity extends Activity {
                     tab.lastCommitMs = elapsed;
                     tab.lastNavBfCache = wasHistoryNav && elapsed <= 60;
                 }
-                if (HttpUrlUtil.isHttp(url)) {
+                if (HttpUrlUtil.isHttp(url) && tab == current) {
                     library.visit(url, view.getTitle());
                     scheduleHistory();
                 }
@@ -1990,7 +2594,8 @@ public final class MainActivity extends Activity {
             }
 
             @Override public void onPageFinished(WebView view, String url) {
-                if (tab.view != view) return;
+                Tab tab = web.owner;
+                if (tab == null || tab.view != view) return;
                 if (tab.started > 0) {
                     tab.lastFinishMs = SystemClock.elapsedRealtime() - tab.started;
                 } else if (tab.lastCommitMs > 0 && tab.lastFinishMs < tab.lastCommitMs) {
@@ -1999,22 +2604,42 @@ public final class MainActivity extends Activity {
                 syncNavigationFlags(tab, view, url, false);
                 restoreScroll(tab, view, url);
                 filter.applyCss(view, tab.cachedHost, url);
-                if (isEffectiveUltraScroll(tab.cachedHost)) {
-                    view.evaluateJavascript(SiteExtras.ultraScrollJs(true), null);
+                if (HttpUrlUtil.isHttp(url)) {
+                    if (isEffectiveUltraScroll(tab.cachedHost)) {
+                        view.evaluateJavascript(SiteExtras.ultraScrollJs(true), null);
+                    }
+                    applyPageToolkitStyles(tab, view);
+                    view.evaluateJavascript(VideoBooster.fullscreenGestureScript(), null);
+                    view.evaluateJavascript(PageToolkit.sniffMediaScript(), null);
+                    if (startPageConfig != null && startPageConfig.isFormDraftProtection()) {
+                        view.evaluateJavascript(PageToolkit.formDraftHookScript(), r -> {
+                            if (isDestroyed() || tab.view != view) return;
+                            String draft = tab.pendingDraftJson != null ? tab.pendingDraftJson : savedFormDrafts.get(url);
+                            tab.pendingDraftJson = null;
+                            if (draft != null && !draft.isEmpty()) {
+                                view.evaluateJavascript(
+                                        "window.__aikoRestoreDraft && window.__aikoRestoreDraft("
+                                                + JSONObject.quote(draft) + ");", null);
+                            }
+                        });
+                    }
+                    if (babelUi != null) babelUi.onPageFinished(view, url);
                 }
                 userScripts.pageFinished(view, url);
                 if (tab == current) updateChrome();
             }
 
             @Override public void onReceivedError(WebView view, WebResourceRequest request, WebResourceError error) {
-                if (tab.view == view && request.isForMainFrame()) {
+                Tab tab = web.owner;
+                if (tab != null && tab.view == view && request.isForMainFrame()) {
                     tab.historyTarget = null;
                     finishNavigation(tab, request.getUrl().toString(), "加载失败 " + error.getErrorCode());
                 }
             }
 
             @Override public void doUpdateVisitedHistory(WebView view, String url, boolean reload) {
-                if (tab.view != view) return;
+                Tab tab = web.owner;
+                if (tab == null || tab.view != view) return;
                 boolean urlChanged = !TextUtils.equals(tab.url, url);
                 if (HttpUrlUtil.isHttp(url)) tab.setUrl(url);
                 if (view.getProgress() >= 100) {
@@ -2033,15 +2658,33 @@ public final class MainActivity extends Activity {
             }
 
             @Override public boolean onRenderProcessGone(WebView view, RenderProcessGoneDetail detail) {
-                if (tab.view != view) return true;
+                if (view == preloadedNewTabView) {
+                    releasePreloadedNewTab();
+                    return true;
+                }
+                Tab tab = web.owner;
+                if (tab == null || tab.view != view) return true;
                 if (findTarget == view) resetFindBar();
                 finishNavigation(tab, tab.url, "渲染进程退出");
+                String recoverUrl = tab.url;
+                String savedDraft = recoverUrl != null ? savedFormDrafts.get(recoverUrl) : null;
                 destroyWeb(tab);
                 tab.navigation = null;
+                long now = SystemClock.elapsedRealtime();
+                boolean canAutoRecover = HttpUrlUtil.isHttp(recoverUrl) && (now - tab.lastCrashRecoveryMs) > 8000L;
                 if (tab == current) {
-                    showCrashRecovery(tab);
-                    tab.progress = 100;
-                    updateChrome();
+                    if (canAutoRecover) {
+                        tab.lastCrashRecoveryMs = now;
+                        tab.pendingDraftJson = savedDraft;
+                        ensureWebViewAndLoad(tab);
+                        toast("渲染进程已自动恢复，已保留阅读位置与表单草稿");
+                    } else {
+                        showCrashRecovery(tab);
+                        tab.progress = 100;
+                        updateChrome();
+                    }
+                } else if (canAutoRecover) {
+                    tab.pendingDraftJson = savedDraft;
                 }
                 return true;
             }
@@ -2049,7 +2692,8 @@ public final class MainActivity extends Activity {
 
         web.setWebChromeClient(new WebChromeClient() {
             @Override public void onProgressChanged(WebView view, int progress) {
-                if (tab.view != view) return;
+                Tab tab = web.owner;
+                if (tab == null || tab.view != view) return;
                 tab.progress = progress;
                 if (tab == current) {
                     updateLoadingBar(progress, true);
@@ -2059,15 +2703,19 @@ public final class MainActivity extends Activity {
             }
 
             @Override public void onReceivedTitle(WebView view, String title) {
-                if (tab.view != view) return;
+                Tab tab = web.owner;
+                if (tab == null || tab.view != view) return;
                 tab.title = title;
-                library.updateVisitTitle(view.getUrl(), title);
-                scheduleHistory();
+                if (tab == current) {
+                    library.updateVisitTitle(view.getUrl(), title);
+                    scheduleHistory();
+                }
                 scheduleSave();
             }
 
             @Override public void onReceivedIcon(WebView view, Bitmap image) {
-                if (tab.view == view && image != null && image.getWidth() <= 128 && image.getHeight() <= 128) {
+                Tab tab = web.owner;
+                if (tab != null && tab.view == view && image != null && image.getWidth() <= 128 && image.getHeight() <= 128) {
                     tab.favicon = image;
                     tab.faviconHost = normalizeHostFast(view.getUrl());
                 }
@@ -2140,7 +2788,7 @@ public final class MainActivity extends Activity {
             }
             String guessed = URLUtil.guessFileName(url, disposition, mime);
             if (isUserScriptDownload(url, disposition, guessed)) {
-                closeTransientPopupTabAsync(tab);
+                closeTransientPopupTabAsync(web.owner);
                 handleRemoteUserScript(url, guessed, ua);
             } else {
                 showNewDownload(url, guessed, ua);
@@ -2150,7 +2798,8 @@ public final class MainActivity extends Activity {
         web.setOnTouchListener((v, event) -> {
             int act = event.getActionMasked();
             if (act == MotionEvent.ACTION_DOWN) {
-                if (tab.pendingScroll != null) setScrollTarget(tab, null);
+                Tab tab = web.owner;
+                if (tab != null && tab.pendingScroll != null) setScrollTarget(tab, null);
                 if (isAnyOmniboxFocused()) hideKeyboardIfNeeded();
                 triggerAdpfBoost(900L);
             } else if (act == MotionEvent.ACTION_UP) {
@@ -2161,7 +2810,77 @@ public final class MainActivity extends Activity {
 
         web.setOnLongClickListener(v -> handleWebLongPress(web));
         userScripts.attach(web);
+        if (babelUi != null) babelUi.bindWebView(web);
         return web;
+    }
+
+    private void applyPageToolkitStyles(Tab tab, WebView view) {
+        if (tab == null || view == null || !HttpUrlUtil.isHttp(tab.url)) return;
+        String host = tab.cachedHost;
+        SiteProfile sp = siteProfile(host);
+        String siteCss = (host != null && siteExtras != null) ? siteExtras.customCss(host) : "";
+        String fontCss = buildCustomFontCss();
+        int minFont = startPageConfig != null ? startPageConfig.getMinFontSizePx() : 0;
+        boolean forceZoom = sp.forceZoom || (startPageConfig != null && startPageConfig.isForcePinchZoom());
+        if (!siteCss.isEmpty() || !fontCss.isEmpty() || minFont > 0 || forceZoom) {
+            view.evaluateJavascript(PageToolkit.customCssAndFontScript(siteCss, fontCss, minFont, forceZoom), null);
+        }
+        if (sp.unlockCopy) {
+            view.evaluateJavascript(PageToolkit.unlockCopyScript(), null);
+        }
+    }
+
+    private String buildCustomFontCss() {
+        if (startPageConfig == null) return "";
+        File fontFile = startPageConfig.resolveCustomFontFile(this);
+        if (fontFile == null || !fontFile.isFile()) return "";
+        String fileName = fontFile.getName();
+        String lower = fileName.toLowerCase(Locale.ROOT);
+        String fmt = lower.endsWith(".otf") ? "opentype" : (lower.endsWith(".woff2") ? "woff2" : "truetype");
+        return "@font-face{font-family:'AikoUserFont';src:url('" + CUSTOM_FONT_URL_PREFIX + fileName
+                + "') format('" + fmt + "');font-display:swap;}\n"
+                + "body,p,div,span,li,article,a,h1,h2,h3,h4,h5,h6,td,th,blockquote{font-family:'AikoUserFont',sans-serif!important;}";
+    }
+
+    private WebResourceResponse interceptCustomFontRequest(String url) {
+        if (startPageConfig == null) return null;
+        File fontFile = startPageConfig.resolveCustomFontFile(this);
+        if (fontFile == null || !fontFile.isFile()) return null;
+        String expected = CUSTOM_FONT_URL_PREFIX + fontFile.getName();
+        if (!expected.equals(url)) return null;
+        try {
+            String lower = fontFile.getName().toLowerCase(Locale.ROOT);
+            String mime = lower.endsWith(".otf") ? "font/otf"
+                    : (lower.endsWith(".woff2") ? "font/woff2" : "font/ttf");
+            Map<String, String> headers = new HashMap<>(4);
+            headers.put("Access-Control-Allow-Origin", "*");
+            headers.put("Cache-Control", "public, max-age=31536000");
+            return new WebResourceResponse(mime, null, 200, "OK", headers, new FileInputStream(fontFile));
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
+    private void captureFormDraft(Tab tab) {
+        if (tab == null || tab.view == null || !HttpUrlUtil.isHttp(tab.url)) return;
+        if (startPageConfig == null || !startPageConfig.isFormDraftProtection()) return;
+        final String targetUrl = tab.url;
+        try {
+            tab.view.evaluateJavascript(
+                    "(function(){if(window.__aikoDraftDirty&&window.__aikoDraftDirty()&&window.__aikoCollectDraft)return window.__aikoCollectDraft();return '';})();",
+                    raw -> {
+                        try {
+                            if (raw == null || "null".equals(raw)) return;
+                            Object tok = new JSONTokener(raw).nextValue();
+                            if (tok instanceof String) {
+                                String json = ((String) tok).trim();
+                                if (!json.isEmpty() && json.contains("\"fields\":[{")) {
+                                    savedFormDrafts.put(targetUrl, json);
+                                }
+                            }
+                        } catch (Exception ignored) { }
+                    });
+        } catch (RuntimeException ignored) { }
     }
 
     private void clearCrashOverlay() {
@@ -2180,8 +2899,8 @@ public final class MainActivity extends Activity {
         box.setBackgroundColor(AikoTheme.BG);
         TextView msg = label("网页渲染进程已停止", 16, AikoTheme.TEXT);
         msg.setTypeface(AikoTheme.MEDIUM);
-        msg.setGravity(Gravity.CENTER);
-        box.addView(msg);
+        msg.setGravity(Gravity.CENTER_HORIZONTAL);
+        box.addView(msg, new LinearLayout.LayoutParams(-1, -2));
         TextView retry = AikoTheme.badge(this, density, "点此恢复页面", AikoTheme.ACCENT, AikoTheme.CARD, AikoTheme.STROKE_ACCENT);
         LinearLayout.LayoutParams rlp = new LinearLayout.LayoutParams(-2, dp(42));
         rlp.topMargin = dp(14);
@@ -2194,7 +2913,7 @@ public final class MainActivity extends Activity {
         page.addView(box, new FrameLayout.LayoutParams(-1, -1));
     }
 
-    /** Complete link & image long-press context menu with background prefetch support. */
+    /** Super Link & Image Material Context Menu with Arc Peek, Private Open, QR, Reverse Search & Babel. */
     private boolean handleWebLongPress(WebView web) {
         if (elementPicker != null && elementPicker.isActive()) return false;
         WebView.HitTestResult hit = web.getHitTestResult();
@@ -2203,11 +2922,22 @@ public final class MainActivity extends Activity {
         String extra = hit.getExtra();
 
         if (type == WebView.HitTestResult.SRC_ANCHOR_TYPE && HttpUrlUtil.isHttp(extra)) {
-            showLinkImageMenu(extra, null);
+            Message msg = handler.obtainMessage();
+            msg.setTarget(new Handler(Looper.getMainLooper()) {
+                @Override public void handleMessage(Message reply) {
+                    if (isDestroyed() || isFinishing()) return;
+                    Bundle data = reply.getData();
+                    String title = data == null ? "" : data.getString("title", "");
+                    String href = data == null ? extra : data.getString("url", extra);
+                    showSuperLongPressSheet(HttpUrlUtil.isHttp(href) ? href : extra, null, title, type);
+                }
+            });
+            web.requestFocusNodeHref(msg);
             return true;
         }
-        if (type == WebView.HitTestResult.IMAGE_TYPE && HttpUrlUtil.isHttp(extra)) {
-            showLinkImageMenu(null, extra);
+        if (type == WebView.HitTestResult.IMAGE_TYPE && (HttpUrlUtil.isHttp(extra)
+                || (extra != null && extra.startsWith("data:image/")))) {
+            showSuperLongPressSheet(null, extra, "", type);
             return true;
         }
         if (type == WebView.HitTestResult.SRC_IMAGE_ANCHOR_TYPE) {
@@ -2219,10 +2949,11 @@ public final class MainActivity extends Activity {
                     Bundle data = reply.getData();
                     String href = data == null ? null : data.getString("url");
                     String src = data == null ? imgUrl : data.getString("src", imgUrl);
+                    String title = data == null ? "" : data.getString("title", "");
                     String validHref = HttpUrlUtil.isHttp(href) ? href : null;
                     String validSrc = HttpUrlUtil.isHttp(src) ? src : imgUrl;
                     if (validHref != null || validSrc != null) {
-                        showLinkImageMenu(validHref, validSrc);
+                        showSuperLongPressSheet(validHref, validSrc, title, type);
                     }
                 }
             });
@@ -2232,43 +2963,75 @@ public final class MainActivity extends Activity {
         return false;
     }
 
-    private void showLinkImageMenu(String linkUrl, String imageUrl) {
-        ArrayList<String> labels = new ArrayList<>();
-        ArrayList<Runnable> actions = new ArrayList<>();
-        if (linkUrl != null) {
-            labels.add("在后台标签打开");
-            actions.add(() -> queueTab(linkUrl));
-            labels.add("在新标签打开");
-            actions.add(() -> addTab(linkUrl, false));
-            labels.add("复制链接");
-            actions.add(() -> copyUrl("链接", linkUrl));
-            labels.add("分享链接");
-            actions.add(() -> shareLink(linkUrl));
-        }
-        if (imageUrl != null) {
-            labels.add("保存图片");
-            actions.add(() -> showNewDownload(imageUrl, URLUtil.guessFileName(imageUrl, null, "image/*"), null));
-            labels.add("新标签查看图片");
-            actions.add(() -> addTab(imageUrl, false));
-            labels.add("复制图片链接");
-            actions.add(() -> copyText("图片链接", imageUrl, "已复制图片链接"));
-        }
-        if (labels.isEmpty()) return;
-        String header = linkUrl != null ? linkUrl : imageUrl;
-        new AlertDialog.Builder(this)
-                .setTitle(header.length() > 64 ? header.substring(0, 64) + "…" : header)
-                .setItems(labels.toArray(new String[0]), (d, which) -> actions.get(which).run())
-                .show();
+    private void showSuperLongPressSheet(String linkUrl, String imageUrl, String extraText, int hitType) {
+        LongPressMenuSheet.Target target = new LongPressMenuSheet.Target(linkUrl, imageUrl, extraText, hitType);
+        LongPressMenuSheet.show(this, target, displayMode, new LongPressMenuSheet.Callbacks() {
+            @Override public void openInBackgroundTab(String url) { queueTab(url); }
+            @Override public void openInPeekSheet(String url) { AikoV040Ui.showPeekSheet(v040Host, url); }
+            @Override public void openInPrivate(String url) {
+                Intent i = new Intent(MainActivity.this, PrivateActivity.class);
+                if (HttpUrlUtil.isHttp(url)) i.putExtra(PrivateActivity.EXTRA_INITIAL_URL, url);
+                startActivity(i);
+            }
+            @Override public void copyText(String labelText, String text) {
+                if (HttpUrlUtil.isHttp(text)) copyUrl(labelText, text);
+                else MainActivity.this.copyText(labelText, text, "已复制" + labelText);
+            }
+            @Override public void shareUrl(String url) { shareLink(url); }
+            @Override public void showQr(String title, String url) {
+                QrSheet.showGenerator(MainActivity.this, title, url, () -> copyUrl("链接", url), qrScanCallback);
+            }
+            @Override public void saveImage(String imgUrl) {
+                showNewDownload(imgUrl, URLUtil.guessFileName(imgUrl, null, "image/*"), null);
+            }
+            @Override public void reverseImageSearch(String engineName, String searchUrl) {
+                toast("正在使用 " + engineName + " 以图搜图…");
+                addTab(searchUrl, false);
+            }
+            @Override public void downloadLink(String url) {
+                showNewDownload(url, URLUtil.guessFileName(url, null, null), null);
+            }
+            @Override public void translateLinkText(String text) {
+                if (text == null || text.trim().isEmpty() || babelEngine == null || babelUi == null) return;
+                toast("巴别塔翻译中…");
+                babelEngine.translateSingleAsync("longpress", 0L, text.trim(), babelConfig.getTargetLang(), res ->
+                        handler.post(() -> {
+                            if (isDestroyed()) return;
+                            if (res.isSuccess()) {
+                                babelUi.showQuickSelectionResult(current != null ? current.view : null,
+                                        text.trim(), res.translated);
+                            } else {
+                                toast("翻译失败：" + (res.error == null ? "请检查网络" : res.error));
+                            }
+                        }));
+            }
+        });
     }
 
-    /** Safe confirmation dialog for intent://, mailto:, tel:, and custom app schemes. */
-    private void confirmExternalAppIntent(String rawUrl) {
+    /** App-Jump Deep-Link Guard honoring global policy + per-host allow/block rules with Material sheet. */
+    private void handleExternalAppIntent(Tab tab, String rawUrl, boolean hasUserGesture) {
         if (rawUrl == null || rawUrl.isEmpty()) return;
         String lower = rawUrl.toLowerCase(Locale.ROOT);
         if (lower.startsWith("javascript:") || lower.startsWith("about:") || lower.startsWith("data:")
                 || lower.startsWith("file:") || lower.startsWith("content:")) {
             return;
         }
+        String pageHost = tab != null ? tab.cachedHost : null;
+        boolean isAppJump = StartPageConfig.isExternalAppScheme(rawUrl);
+        if (isAppJump && startPageConfig != null) {
+            int decision = startPageConfig.effectiveAppJumpDecision(pageHost);
+            if (decision == StartPageConfig.HOST_POLICY_BLOCK) {
+                if (hasUserGesture) toast("已拦截跳转：" + StartPageConfig.friendlyAppName(rawUrl));
+                return;
+            }
+            if (!hasUserGesture && decision != StartPageConfig.HOST_POLICY_ALLOW) {
+                // Silently block background script-initiated app-jump popups!
+                return;
+            }
+        } else if (!hasUserGesture) {
+            return;
+        }
+
         Intent parsed;
         String fallbackUrl = null;
         try {
@@ -2291,21 +3054,38 @@ public final class MainActivity extends Activity {
             if (fallback != null) navigate(fallback);
             return;
         }
-        String scheme = Uri.parse(rawUrl).getScheme();
-        String msg = "网页请求打开外部应用" + (scheme != null ? "（" + scheme + "://）" : "") + "，是否允许？";
-        new AlertDialog.Builder(this)
-                .setTitle("打开外部应用")
-                .setMessage(msg)
-                .setNegativeButton("取消", null)
-                .setPositiveButton("允许打开", (d, w) -> {
-                    try {
-                        startActivity(safeIntent);
-                    } catch (RuntimeException err) {
-                        if (fallback != null) navigate(fallback);
-                        else toast("未找到可处理此链接的应用");
+
+        Runnable launchAction = () -> {
+            try {
+                startActivity(safeIntent);
+            } catch (RuntimeException err) {
+                if (fallback != null) navigate(fallback);
+                else toast("未找到可处理此链接的应用");
+            }
+        };
+
+        if (isAppJump && startPageConfig != null
+                && startPageConfig.effectiveAppJumpDecision(pageHost) == StartPageConfig.HOST_POLICY_ALLOW) {
+            launchAction.run();
+            return;
+        }
+
+        String scheme = StartPageConfig.extractScheme(rawUrl);
+        String appName = StartPageConfig.friendlyAppName(rawUrl);
+        AikoV040Ui.showAppJumpSheet(this, displayMode, density, pageHost, appName, scheme, rawUrl,
+                launchAction,
+                () -> {
+                    if (startPageConfig != null && pageHost != null) {
+                        startPageConfig.setHostAppJumpPolicy(pageHost, StartPageConfig.HOST_POLICY_ALLOW);
                     }
-                })
-                .show();
+                    launchAction.run();
+                },
+                () -> {
+                    if (startPageConfig != null && pageHost != null) {
+                        startPageConfig.setHostAppJumpPolicy(pageHost, StartPageConfig.HOST_POLICY_BLOCK);
+                    }
+                    toast("已记住拦截此站点的外部应用跳转");
+                });
     }
 
     // ==================== NAVIGATION & INPUT ====================
@@ -2329,7 +3109,26 @@ public final class MainActivity extends Activity {
 
     private void submitRawInput(String raw) {
         if (raw == null || raw.trim().isEmpty()) return;
-        String url = SearchEngines.resolveInput(this, raw.trim());
+        String trimmed = raw.trim();
+        BangCatalog.SlashCmd cmd = BangCatalog.resolveSlashCommand(trimmed);
+        if (cmd != null) {
+            dismissOmnibox();
+            executeSlashCommand(cmd);
+            return;
+        }
+        if (bangCatalog != null) {
+            BangCatalog.Match bang = bangCatalog.resolveBang(trimmed);
+            if (bang != null && HttpUrlUtil.isHttp(bang.url)) {
+                toast("⚡ " + bang.label);
+                navigate(bang.url);
+                return;
+            }
+        }
+        if ("about:blank".equalsIgnoreCase(trimmed)) {
+            navigate("about:blank");
+            return;
+        }
+        String url = SearchEngines.resolveInput(this, trimmed);
         if (HttpUrlUtil.isHttp(url) && UserScripts.isUserScriptUrl(url)) {
             hideOmniboxOverlay();
             hideKeyboardIfNeeded();
@@ -2339,14 +3138,71 @@ public final class MainActivity extends Activity {
         navigate(url);
     }
 
+    private void executeSlashCommand(BangCatalog.SlashCmd cmd) {
+        if (cmd == null) return;
+        Tab tab = current;
+        boolean pageOpen = tab != null && tab.view != null && HttpUrlUtil.isHttp(tab.url);
+        switch (cmd) {
+            case BABEL:
+                babelUi.showSheet(pageOpen ? tab.view : null, pageOpen ? tab.url : null);
+                break;
+            case DEVTOOLS:
+                if (pageOpen) {
+                    WebDevTools.toggle(tab.view);
+                    toast("已切换网页开发者调试台");
+                } else {
+                    toast("请先打开网页后再启动调试台");
+                }
+                break;
+            case GALLERY:
+                openGalleryForCurrent();
+                break;
+            case LONGSHOT:
+                captureLongShotForCurrent();
+                break;
+            case QR:
+                if (pageOpen) QrSheet.showGenerator(this, tab.title, tab.url, () -> copyUrl("网址", tab.url), qrScanCallback);
+                else QrSheet.showScannerHintOrImageDecode(this, qrScanCallback);
+                break;
+            case BACKUP:
+                AikoV040Ui.showBackupSheet(v040Host);
+                break;
+            case UNLOCK:
+                if (pageOpen) {
+                    tab.view.evaluateJavascript(PageToolkit.unlockCopyScript(), null);
+                    toast("已解锁当前页面复制与选择限制");
+                } else {
+                    toast("请先打开网页");
+                }
+                break;
+            case DARK: {
+                boolean next = !siteExtras.isGlobalDarkWeb();
+                siteExtras.setGlobalDarkWeb(next);
+                refreshAllTabsDarkMode();
+                toast(next ? "已开启全局网页暗黑模式" : "已关闭全局网页暗黑模式");
+                break;
+            }
+            case CLEAN:
+                library.clearHistory();
+                toast("已清理本应用浏览历史");
+                break;
+            case SETTINGS:
+                AikoV040Ui.showCustomizationSheet(v040Host);
+                break;
+            default:
+                break;
+        }
+    }
+
     private void navigate(String url) {
-        if (!HttpUrlUtil.isHttp(url)) return;
+        if (!isNavigableUrl(url)) return;
         clearCrashOverlay();
         if (elementPicker != null && elementPicker.isActive()) elementPicker.stop();
         closeFind();
         hideOmniboxOverlay();
         hideKeyboardIfNeeded();
         if (gestures != null) gestures.showBar(false);
+        captureFormDraft(current);
         prepareFreshNavigation(current);
         beginNavigation(current);
         current.setUrl(url);
@@ -2364,7 +3220,9 @@ public final class MainActivity extends Activity {
             displayMode.attachView(current.view);
             displayMode.setSiteForceMaxHz(siteExtras.isForceMaxHz(current.cachedHost));
         }
-        prepareTopLoad(current, url, true, true);
+        if (HttpUrlUtil.isHttp(url)) {
+            prepareTopLoad(current, url, true, true);
+        }
         current.view.loadUrl(url);
         applyInsetsLayout();
         updateChrome();
@@ -2543,11 +3401,15 @@ public final class MainActivity extends Activity {
     }
 
     private final class ScrollWebView extends WebView {
-        private final Tab owner;
+        Tab owner;
 
         ScrollWebView(android.content.Context context, Tab owner) {
             super(context);
             this.owner = owner;
+        }
+
+        void setOwner(Tab next) {
+            this.owner = next;
         }
 
         int maxScrollY() {
@@ -2566,10 +3428,28 @@ public final class MainActivity extends Activity {
     }
 
     private final class BottomDeckLayout extends FrameLayout {
+        private float downX, downY;
+
         BottomDeckLayout() { super(MainActivity.this); }
 
         @Override public boolean onInterceptTouchEvent(MotionEvent ev) {
-            if (gestures != null && gestures.onBottomBarIntercept(ev)) return true;
+            if (gestures == null) return super.onInterceptTouchEvent(ev);
+            boolean allowHoriz = startPageConfig == null || startPageConfig.isSwipeBarSwitchTabs();
+            boolean allowUp = startPageConfig == null || startPageConfig.isSwipeUpForTabs();
+            if (!allowHoriz && !allowUp) return super.onInterceptTouchEvent(ev);
+            int act = ev.getActionMasked();
+            if (act == MotionEvent.ACTION_DOWN) {
+                downX = ev.getRawX();
+                downY = ev.getRawY();
+                return gestures.onBottomBarIntercept(ev);
+            }
+            if (act == MotionEvent.ACTION_MOVE) {
+                float adx = Math.abs(ev.getRawX() - downX);
+                float ady = Math.abs(ev.getRawY() - downY);
+                if (!allowHoriz && adx > ady) return false;
+                if (!allowUp && (ev.getRawY() - downY) < 0 && ady > adx) return false;
+            }
+            if (gestures.onBottomBarIntercept(ev)) return true;
             return super.onInterceptTouchEvent(ev);
         }
 
@@ -2667,6 +3547,21 @@ public final class MainActivity extends Activity {
         addressRow.setVisibility(onHome && !editing ? View.GONE : View.VISIBLE);
         homeSpacer.setVisibility(onHome && !editing ? View.VISIBLE : View.GONE);
         backButton.setVisibility(onHome || editing ? View.GONE : View.VISIBLE);
+        if (homeButton != null) {
+            homeButton.setVisibility(!editing && startPageConfig != null && startPageConfig.isShowHomeButton()
+                    ? View.VISIBLE : View.GONE);
+        }
+        if (babelButton != null) {
+            boolean showBabel = !editing && !onHome && startPageConfig != null && startPageConfig.isShowBabelButton();
+            babelButton.setVisibility(showBabel ? View.VISIBLE : View.GONE);
+            boolean translating = babelUi != null && babelUi.isTranslating(current.view);
+            babelButton.tint(translating ? AikoTheme.ACCENT : AikoTheme.TEXT_MUTED);
+        }
+        if (menuButton != null) {
+            boolean hasMenuCmds = current.view != null && userScripts != null
+                    && !userScripts.menuCommandsFor(current.view).isEmpty();
+            menuButton.tint(hasMenuCmds ? AikoTheme.ACCENT_CYAN : AikoTheme.TEXT);
+        }
         updateAddress();
         tabButton.count(tabs.size());
         tabButton.setContentDescription("标签页，" + tabs.size() + " 个，长按新建");
@@ -2678,6 +3573,32 @@ public final class MainActivity extends Activity {
         if (gestures != null) {
             gestures.updateExclusionRects(page, current.canGoBack, current.canGoForward);
         }
+        scheduleAutoRefreshForCurrent();
+    }
+
+    private void scheduleAutoRefreshForCurrent() {
+        handler.removeCallbacks(autoRefreshTask);
+        activeAutoRefreshSec = 0;
+        if (!visible || isDestroyed() || onHome || current == null || current.view == null
+                || current.cachedHost == null || siteExtras == null) {
+            return;
+        }
+        int sec = siteExtras.autoRefreshSec(current.cachedHost);
+        if (sec > 0) {
+            activeAutoRefreshSec = sec;
+            handler.postDelayed(autoRefreshTask, sec * 1000L);
+        }
+    }
+
+    private void runAutoRefreshTick() {
+        if (!visible || isDestroyed() || onHome || current == null || current.view == null
+                || activeAutoRefreshSec <= 0) {
+            return;
+        }
+        if (!isAnyOmniboxFocused() && fullscreen == null && current.progress >= 100) {
+            reloadPreservingScroll();
+        }
+        scheduleAutoRefreshForCurrent();
     }
 
     private void updateLoadingBar(int progress, boolean animateFade) {
@@ -2767,50 +3688,267 @@ public final class MainActivity extends Activity {
         return editingOmnibox || (address != null && address.hasFocus());
     }
 
-    // ==================== TABS SHEET (ZERO-ALLOC TABROW) ====================
+    // ==================== TABS SHEET (LIST / GRID + SEARCH + PIN + GROUPS) ====================
 
     private void showTabs() {
+        final boolean[] gridMode = {startPageConfig != null && startPageConfig.isTabGridView()};
         Dialog dialog = new Dialog(this);
         dialog.requestWindowFeature(Window.FEATURE_NO_TITLE);
         LinearLayout panel = AikoTheme.sheetContainer(this, density, "标签页 · " + tabs.size(), dialog::dismiss);
 
         LinearLayout quick = sheetRow(panel);
-        sheetAction(dialog, quick, ADD, "新建标签", true, () -> addTab(null, false));
+        sheetAction(dialog, quick, ADD, "新建标签", true, () -> openNewTabDefault(false));
         View recent = sheetAction(dialog, quick, HISTORY, "最近关闭", !closedTabs.isEmpty(), this::showClosedTabs);
         sheetAction(dialog, quick, PRIVATE, "无痕窗口", true, () -> startActivity(new Intent(this, PrivateActivity.class)));
+        TextView viewToggle = AikoTheme.badge(this, density, gridMode[0] ? "列表" : "网格",
+                AikoTheme.ACCENT_CYAN, AikoTheme.CARD, AikoTheme.STROKE_ACCENT);
+        viewToggle.setForeground(AikoTheme.ripple(AikoTheme.RIPPLE_ACCENT, dp(14)));
+        AikoTheme.attachPressFeedback(viewToggle, 0.94f);
+        LinearLayout.LayoutParams vtlp = new LinearLayout.LayoutParams(dp(56), dp(64));
+        vtlp.leftMargin = dp(4);
+        quick.addView(viewToggle, vtlp);
+
+        // Tab Search bar when >= 4 tabs
+        final String[] searchQuery = {""};
+        EditText tabSearch = input("搜索标签标题、域名或分组…");
+        tabSearch.setBackground(AikoTheme.card(AikoTheme.PILL, AikoTheme.STROKE, density, dp(14)));
+        tabSearch.setPadding(dp(12), 0, dp(12), 0);
+        tabSearch.setVisibility(tabs.size() >= 4 ? View.VISIBLE : View.GONE);
+        LinearLayout.LayoutParams tslp = new LinearLayout.LayoutParams(-1, dp(40));
+        tslp.topMargin = dp(6);
+        panel.addView(tabSearch, tslp);
+
+        final ArrayList<Tab> filteredTabs = new ArrayList<>();
+        Runnable rebuildFiltered = () -> {
+            filteredTabs.clear();
+            String q = searchQuery[0].toLowerCase(Locale.ROOT);
+            // Pinned tabs first, then regular tabs
+            for (int pass = 0; pass < 2; pass++) {
+                boolean wantPinned = (pass == 0);
+                for (Tab t : tabs) {
+                    if (t.pinned != wantPinned) continue;
+                    if (!q.isEmpty()) {
+                        String ttl = t.title == null ? "" : t.title.toLowerCase(Locale.ROOT);
+                        String u = t.url == null ? "" : t.url.toLowerCase(Locale.ROOT);
+                        String grp = t.groupName == null ? "" : t.groupName.toLowerCase(Locale.ROOT);
+                        if (!ttl.contains(q) && !u.contains(q) && !grp.contains(q)) continue;
+                    }
+                    filteredTabs.add(t);
+                }
+            }
+        };
+        rebuildFiltered.run();
+
+        FrameLayout contentHolder = new FrameLayout(this);
+        int maxH = Math.min(430, Math.max(180, getResources().getConfiguration().screenHeightDp - 230));
+        LinearLayout.LayoutParams chlp = new LinearLayout.LayoutParams(-1, dp(maxH));
+        chlp.topMargin = dp(6);
+        panel.addView(contentHolder, chlp);
 
         ListView list = new ListView(this);
         list.setDivider(null);
         list.setItemsCanFocus(false);
-        list.setPadding(0, dp(8), 0, 0);
-        int visibleRows = Math.max(2, (getResources().getConfiguration().screenHeightDp - 190) / 68);
-        int height = Math.min(Math.min(tabs.size(), visibleRows), 6) * 68 + 8;
-        panel.addView(list, new LinearLayout.LayoutParams(-1, dp(height)));
+        contentHolder.addView(list, new FrameLayout.LayoutParams(-1, -1));
 
-        final BaseAdapter[] adapterRef = new BaseAdapter[1];
-        final Runnable onCloseCallback = () -> {
-            if (adapterRef[0] != null) adapterRef[0].notifyDataSetChanged();
+        GridView grid = new GridView(this);
+        grid.setNumColumns(2);
+        grid.setHorizontalSpacing(dp(8));
+        grid.setVerticalSpacing(dp(8));
+        grid.setStretchMode(GridView.STRETCH_COLUMN_WIDTH);
+        contentHolder.addView(grid, new FrameLayout.LayoutParams(-1, -1));
+
+        final BaseAdapter[] listAdapterRef = new BaseAdapter[1];
+        final BaseAdapter[] gridAdapterRef = new BaseAdapter[1];
+        final Runnable refreshTabsUi = () -> {
+            rebuildFiltered.run();
+            if (listAdapterRef[0] != null) listAdapterRef[0].notifyDataSetChanged();
+            if (gridAdapterRef[0] != null) gridAdapterRef[0].notifyDataSetChanged();
             boolean hasClosed = !closedTabs.isEmpty();
             recent.setEnabled(hasClosed);
             recent.setFocusable(hasClosed);
             recent.setAlpha(hasClosed ? 1f : 0.38f);
-            list.getLayoutParams().height = dp(Math.min(Math.min(tabs.size(), visibleRows), 6) * 68 + 8);
-            list.requestLayout();
+            tabSearch.setVisibility(tabs.size() >= 4 ? View.VISIBLE : View.GONE);
         };
 
-        adapterRef[0] = new BaseAdapter() {
-            @Override public int getCount() { return tabs.size(); }
-            @Override public Object getItem(int index) { return tabs.get(index); }
+        listAdapterRef[0] = new BaseAdapter() {
+            @Override public int getCount() { return filteredTabs.size(); }
+            @Override public Object getItem(int index) { return filteredTabs.get(index); }
             @Override public long getItemId(int index) { return index; }
             @Override public View getView(int index, View recycled, ViewGroup parent) {
-                TabRow row = recycled instanceof TabRow ? (TabRow) recycled : new TabRow(dialog, onCloseCallback);
-                row.bind(tabs.get(index));
+                TabRow row = recycled instanceof TabRow ? (TabRow) recycled : new TabRow(dialog, refreshTabsUi);
+                row.bind(filteredTabs.get(index));
                 return row;
             }
         };
-        list.setAdapter(adapterRef[0]);
+        list.setAdapter(listAdapterRef[0]);
+
+        gridAdapterRef[0] = new BaseAdapter() {
+            @Override public int getCount() { return filteredTabs.size(); }
+            @Override public Object getItem(int index) { return filteredTabs.get(index); }
+            @Override public long getItemId(int index) { return index; }
+            @Override public View getView(int index, View recycled, ViewGroup parent) {
+                return buildTabGridCard(filteredTabs.get(index), dialog, refreshTabsUi);
+            }
+        };
+        grid.setAdapter(gridAdapterRef[0]);
+
+        Runnable syncViewMode = () -> {
+            list.setVisibility(gridMode[0] ? View.GONE : View.VISIBLE);
+            grid.setVisibility(gridMode[0] ? View.VISIBLE : View.GONE);
+            viewToggle.setText(gridMode[0] ? "列表" : "网格");
+        };
+        syncViewMode.run();
+
+        viewToggle.setOnClickListener(v -> {
+            gridMode[0] = !gridMode[0];
+            if (startPageConfig != null) startPageConfig.setTabGridView(gridMode[0]);
+            syncViewMode.run();
+        });
+
+        tabSearch.addTextChangedListener(new TextWatcher() {
+            @Override public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
+            @Override public void onTextChanged(CharSequence s, int start, int before, int count) {
+                searchQuery[0] = s == null ? "" : s.toString().trim();
+                refreshTabsUi.run();
+            }
+            @Override public void afterTextChanged(Editable s) {}
+        });
+
         showSheet(dialog, panel);
-        list.setSelection(Math.max(0, tabs.indexOf(current)));
+        int curIdx = filteredTabs.indexOf(current);
+        if (curIdx >= 0) {
+            list.setSelection(curIdx);
+            grid.setSelection(curIdx);
+        }
+    }
+
+    private View buildTabGridCard(Tab tab, Dialog parentDialog, Runnable onRefresh) {
+        boolean isCurrent = (tab == current);
+        LinearLayout card = stack();
+        card.setPadding(dp(11), dp(10), dp(8), dp(10));
+        card.setBackground(AikoTheme.card(
+                isCurrent ? AikoTheme.HIGHLIGHT : AikoTheme.CARD,
+                isCurrent ? AikoTheme.STROKE_ACCENT : AikoTheme.STROKE,
+                density, dp(15)));
+        card.setForeground(AikoTheme.ripple(AikoTheme.RIPPLE_ACCENT, dp(15)));
+        card.setLayoutParams(new AbsListView.LayoutParams(-1, dp(104)));
+
+        LinearLayout top = new LinearLayout(this);
+        top.setGravity(Gravity.CENTER_VERTICAL);
+        card.addView(top, new LinearLayout.LayoutParams(-1, -2));
+
+        String host = tab.cachedHost;
+        String cleanHost = stripSubdomainPrefix(host);
+        String letter = cleanHost.isEmpty() ? "A" : cleanHost.substring(0, 1).toUpperCase(Locale.ROOT);
+        TextView badge = AikoTheme.badge(this, density, tab.pinned ? "📌" : letter,
+                AikoTheme.ACCENT, AikoTheme.CAPSULE, AikoTheme.DIVIDER);
+        badge.setPadding(dp(6), dp(2), dp(6), dp(2));
+        top.addView(badge, new LinearLayout.LayoutParams(dp(26), dp(26)));
+
+        if (tab.groupName != null && !tab.groupName.isEmpty()) {
+            TextView grp = AikoTheme.badge(this, density, tab.groupName,
+                    AikoTheme.ACCENT_CYAN, AikoTheme.BG, AikoTheme.STROKE);
+            grp.setTextSize(9);
+            grp.setPadding(dp(6), dp(1), dp(6), dp(1));
+            LinearLayout.LayoutParams glp = new LinearLayout.LayoutParams(-2, -2);
+            glp.leftMargin = dp(5);
+            top.addView(grp, glp);
+        }
+
+        top.addView(new View(this), new LinearLayout.LayoutParams(0, 1, 1));
+
+        BrowserIcon close = icon(CLOSE, "关闭标签", () -> {
+            closeTab(tab);
+            onRefresh.run();
+        });
+        close.tint(AikoTheme.TEXT_DIM);
+        top.addView(close, new LinearLayout.LayoutParams(dp(28), dp(28)));
+
+        String caption = tab.title;
+        if (caption == null || caption.isEmpty() || caption.equals(tab.url)) caption = host == null ? "新标签" : host;
+        TextView ttl = label(caption, 13, AikoTheme.TEXT);
+        ttl.setTypeface(AikoTheme.MEDIUM);
+        ttl.setMaxLines(2);
+        ttl.setEllipsize(TextUtils.TruncateAt.END);
+        LinearLayout.LayoutParams tlp = new LinearLayout.LayoutParams(-1, 0, 1);
+        tlp.topMargin = dp(6);
+        card.addView(ttl, tlp);
+
+        String sub = host == null ? "起始页" : host;
+        if (tab.muted) sub += " · 静音";
+        TextView dom = label(sub, 10, isCurrent ? AikoTheme.ACCENT_CYAN : AikoTheme.TEXT_DIM);
+        dom.setSingleLine(true);
+        dom.setEllipsize(TextUtils.TruncateAt.END);
+        card.addView(dom);
+
+        card.setOnClickListener(v -> {
+            parentDialog.dismiss();
+            showTab(tab, false);
+        });
+        card.setOnLongClickListener(v -> {
+            showTabOptionsSheet(tab, parentDialog, onRefresh);
+            return true;
+        });
+        return card;
+    }
+
+    private void showTabOptionsSheet(Tab tab, Dialog tabsDialog, Runnable onRefresh) {
+        if (tab == null) return;
+        Dialog d = new Dialog(this);
+        d.requestWindowFeature(Window.FEATURE_NO_TITLE);
+        String name = (tab.title == null || tab.title.isEmpty()) ? (tab.cachedHost == null ? "新标签" : tab.cachedHost) : tab.title;
+        LinearLayout panel = AikoTheme.sheetContainer(this, density,
+                name.length() > 22 ? name.substring(0, 22) + "…" : name, d::dismiss);
+
+        addTwoColRow(panel,
+                AikoTheme.toggleTile(this, density, PIN, tab.pinned ? "取消置顶" : "置顶标签",
+                        tab.pinned ? "常驻内存防休眠" : "固定在顶部且不休眠",
+                        tab.pinned, true, AikoTheme.ACCENT, () -> {
+                            tab.pinned = !tab.pinned;
+                            scheduleSave();
+                            d.dismiss();
+                            if (onRefresh != null) onRefresh.run();
+                            toast(tab.pinned ? "已置顶此标签（受保护不休眠）" : "已取消标签置顶");
+                        }),
+                AikoTheme.toggleTile(this, density, COPY, "复制网址",
+                        HttpUrlUtil.isHttp(tab.url) ? tab.cachedHost : "无网页链接",
+                        false, HttpUrlUtil.isHttp(tab.url), AikoTheme.ACCENT_CYAN, () -> {
+                            d.dismiss();
+                            copyUrl("网址", tab.url);
+                        }));
+
+        panel.addView(AikoTheme.sectionHeader(this, density, "标签分组徽章"));
+        String[] presets = {"无分组", "工作", "阅读", "技术", "影音", "购物"};
+        FlowTagLayout grpFlow = new FlowTagLayout(this, dp(6), dp(6));
+        for (String g : presets) {
+            String targetVal = "无分组".equals(g) ? "" : g;
+            boolean sel = targetVal.equals(tab.groupName == null ? "" : tab.groupName);
+            TextView pill = AikoTheme.badge(this, density, g,
+                    sel ? AikoTheme.ACCENT : AikoTheme.TEXT_MUTED,
+                    sel ? AikoTheme.HIGHLIGHT : AikoTheme.CARD,
+                    sel ? AikoTheme.STROKE_ACCENT : AikoTheme.STROKE);
+            pill.setForeground(AikoTheme.ripple(AikoTheme.RIPPLE_ACCENT, dp(12)));
+            pill.setOnClickListener(v -> {
+                tab.groupName = targetVal;
+                scheduleSave();
+                d.dismiss();
+                if (onRefresh != null) onRefresh.run();
+                toast(targetVal.isEmpty() ? "已移除标签分组" : "已归入分组：" + targetVal);
+            });
+            grpFlow.addView(pill);
+        }
+        LinearLayout.LayoutParams glp = new LinearLayout.LayoutParams(-1, -2);
+        glp.bottomMargin = dp(10);
+        panel.addView(grpFlow, glp);
+
+        TextView closeBtn = AikoTheme.badge(this, density, "关闭此标签", AikoTheme.CORAL, AikoTheme.CARD, AikoTheme.STROKE);
+        closeBtn.setOnClickListener(v -> {
+            d.dismiss();
+            closeTab(tab);
+            if (onRefresh != null) onRefresh.run();
+        });
+        panel.addView(closeBtn, new LinearLayout.LayoutParams(-1, dp(40)));
+        showSheet(d, panel);
     }
 
     private void closeTab(Tab tab) {
@@ -2878,6 +4016,10 @@ public final class MainActivity extends Activity {
                     showTab(bound, false);
                 }
             });
+            link.setOnLongClickListener(v -> {
+                if (bound != null) showTabOptionsSheet(bound, dialog, onClose);
+                return true;
+            });
             card.addView(link, new LinearLayout.LayoutParams(0, -1, 1));
 
             FrameLayout tile = new FrameLayout(MainActivity.this);
@@ -2929,7 +4071,10 @@ public final class MainActivity extends Activity {
                 caption = host == null ? "新标签" : host;
             }
             boolean isCurrent = tab == current;
-            if (!TextUtils.equals(title.getText(), caption)) title.setText(caption);
+            String prefix = tab.pinned ? "📌 " : "";
+            String groupTag = (tab.groupName != null && !tab.groupName.isEmpty()) ? ("[" + tab.groupName + "] ") : "";
+            String finalCaption = prefix + groupTag + caption;
+            if (!TextUtils.equals(title.getText(), finalCaption)) title.setText(finalCaption);
 
             String sub = isCurrent
                     ? (host == null ? "起始页 · 当前" : host + (tab.muted ? "  ·  已静音  ·  当前" : "  ·  当前"))
@@ -3116,7 +4261,7 @@ public final class MainActivity extends Activity {
                                 toast("此 WebView 未提供可识别的 Chromium 版本");
                                 return;
                             }
-                            saveSiteProfile(host, new SiteProfile(!profile.desktop, profile.blockImages, profile.zoom));
+                            saveSiteProfile(host, profile.withDesktop(!profile.desktop));
                             if (sameOpenSite(tab, host)) reloadPreservingScroll();
                         }));
 
@@ -3124,7 +4269,7 @@ public final class MainActivity extends Activity {
                 AikoTheme.toggleTile(this, density, IMAGE, "网络图片", profile.blockImages ? "已停载" : "正常加载",
                         profile.blockImages, tab.view != null, AikoTheme.AMBER, () -> {
                             dialog.dismiss();
-                            SiteProfile chosen = new SiteProfile(profile.desktop, !profile.blockImages, profile.zoom);
+                            SiteProfile chosen = profile.withBlockImages(!profile.blockImages);
                             saveSiteProfile(host, chosen);
                             if (sameOpenSite(tab, host)) applySiteProfile(tab, chosen, false, false);
                             toast(chosen.blockImages ? "此站已暂停加载网络图片" : "此站已恢复加载网络图片");
@@ -3137,9 +4282,121 @@ public final class MainActivity extends Activity {
                             }
                         }));
 
+        addTwoColRow(body,
+                AikoTheme.toggleTile(this, density, UNLOCK, "解除禁止复制", profile.unlockCopy ? "已解锁选择/复制" : "默认",
+                        profile.unlockCopy, tab.view != null, AikoTheme.EMERALD, () -> {
+                            dialog.dismiss();
+                            boolean next = !profile.unlockCopy;
+                            saveSiteProfile(host, profile.withFlag(SiteProfile.UNLOCK_COPY, next));
+                            if (sameOpenSite(tab, host) && tab.view != null) {
+                                if (next) tab.view.evaluateJavascript(PageToolkit.unlockCopyScript(), null);
+                                else reloadPreservingScroll();
+                            }
+                            toast(next ? "已解除本站复制/选字限制" : "已恢复本站默认复制策略");
+                        }),
+                AikoTheme.toggleTile(this, density, FONT, "强制双指缩放", profile.forceZoom ? "已强制允许缩放" : "跟随网页",
+                        profile.forceZoom, tab.view != null, AikoTheme.ACCENT_CYAN, () -> {
+                            dialog.dismiss();
+                            boolean next = !profile.forceZoom;
+                            saveSiteProfile(host, profile.withFlag(SiteProfile.FORCE_ZOOM, next));
+                            if (sameOpenSite(tab, host) && tab.view != null) {
+                                if (next) applyPageToolkitStyles(tab, tab.view);
+                                else reloadPreservingScroll();
+                            }
+                            toast(next ? "本站已强制允许双指缩放" : "已恢复本站默认缩放限制");
+                        }));
+
+        String curSiteCss = siteExtras.customCss(host);
+        addTwoColRow(body,
+                AikoTheme.toggleTile(this, density, CODE, "站点自定义 CSS",
+                        curSiteCss.isEmpty() ? "注入专属样式" : "已配置 (" + curSiteCss.length() + " 字)",
+                        !curSiteCss.isEmpty(), true, AikoTheme.ACCENT, () -> {
+                            dialog.dismiss();
+                            AikoV040Ui.showSiteCssSheet(v040Host, host, () -> {
+                                if (sameOpenSite(tab, host) && tab.view != null) applyPageToolkitStyles(tab, tab.view);
+                            });
+                        }),
+                AikoTheme.toggleTile(this, density, CLOSE, "重置站内数据", "清除 Cookie / 存储",
+                        false, true, AikoTheme.CORAL, () -> {
+                            dialog.dismiss();
+                            resetSiteDataAndCookies(tab, host, url);
+                        }));
+
+        // Per-site Auto-Refresh pill strip (0 / 15s / 30s / 60s / 5m)
+        int curRefresh = siteExtras.autoRefreshSec(host);
+        body.addView(AikoTheme.sectionHeader(this, density,
+                "定时自动刷新" + (curRefresh > 0 ? " · 每 " + (curRefresh >= 60 ? (curRefresh / 60) + " 分钟" : curRefresh + " 秒") : " · 关闭")));
+        FlowTagLayout refreshFlow = new FlowTagLayout(this, dp(6), dp(6));
+        for (int sec : SiteExtras.AUTO_REFRESH_PRESETS) {
+            boolean sel = sec == curRefresh;
+            String lbl = sec == 0 ? "关闭" : (sec >= 60 ? (sec / 60) + " 分钟" : sec + " 秒");
+            TextView pill = AikoTheme.badge(this, density, lbl,
+                    sel ? AikoTheme.ACCENT : AikoTheme.TEXT_MUTED,
+                    sel ? AikoTheme.HIGHLIGHT : AikoTheme.CARD,
+                    sel ? AikoTheme.STROKE_ACCENT : AikoTheme.STROKE);
+            pill.setForeground(AikoTheme.ripple(AikoTheme.RIPPLE_ACCENT, dp(12)));
+            pill.setOnClickListener(v -> {
+                siteExtras.setAutoRefreshSec(host, sec);
+                scheduleAutoRefreshForCurrent();
+                dialog.dismiss();
+                toast(sec == 0 ? "已关闭此站定时刷新" : "已开启此站每 " + lbl + " 自动刷新");
+            });
+            refreshFlow.addView(pill);
+        }
+        body.addView(refreshFlow, new LinearLayout.LayoutParams(-1, -2));
+
         // Inline Text Zoom pill selector
         body.addView(AikoTheme.sectionHeader(this, density, "站点字号 · " + profile.zoom + "%"));
         HorizontalZoomStrip(body, dialog, tab, host, profile);
+
+        // Per-host user element-picker / custom block rules with 1-tap Undo
+        LinearLayout hostRulesSection = stack();
+        hostRulesSection.setVisibility(View.GONE);
+        body.addView(hostRulesSection, new LinearLayout.LayoutParams(-1, -2));
+        ioExecutor.execute(() -> {
+            List<String> hostRules = filters.userRulesForHost(host);
+            if (hostRules == null || hostRules.isEmpty()) return;
+            handler.post(() -> {
+                if (isDestroyed() || !dialog.isShowing()) return;
+                hostRulesSection.removeAllViews();
+                hostRulesSection.setVisibility(View.VISIBLE);
+                hostRulesSection.addView(AikoTheme.sectionHeader(this, density,
+                        "本站点点选/自定义屏蔽规则（" + hostRules.size() + " · 点击撤销）"));
+                for (String rule : hostRules) {
+                    LinearLayout rRow = new LinearLayout(this);
+                    rRow.setOrientation(LinearLayout.HORIZONTAL);
+                    rRow.setGravity(Gravity.CENTER_VERTICAL);
+                    rRow.setPadding(dp(10), dp(7), dp(8), dp(7));
+                    rRow.setBackground(AikoTheme.card(AikoTheme.CARD, AikoTheme.STROKE, density, dp(12)));
+                    TextView rText = label(rule, 11, AikoTheme.TEXT_MUTED);
+                    rText.setTypeface(AikoTheme.MONO);
+                    rText.setSingleLine(true);
+                    rText.setEllipsize(TextUtils.TruncateAt.MIDDLE);
+                    rRow.addView(rText, new LinearLayout.LayoutParams(0, -2, 1));
+                    TextView undoBtn = AikoTheme.badge(this, density, "撤销", AikoTheme.AMBER, AikoTheme.PILL, AikoTheme.STROKE);
+                    undoBtn.setOnClickListener(v -> {
+                        undoBtn.setEnabled(false);
+                        filters.removeUserRule(rule, removed -> {
+                            if (isDestroyed()) return;
+                            if (removed) {
+                                rRow.setVisibility(View.GONE);
+                                toast("已撤销规则，正在刷新页面");
+                                if (sameOpenSite(tab, host)) reloadPreservingScroll();
+                            } else {
+                                undoBtn.setEnabled(true);
+                                toast("撤销规则失败");
+                            }
+                        });
+                    });
+                    LinearLayout.LayoutParams ulp = new LinearLayout.LayoutParams(-2, dp(28));
+                    ulp.leftMargin = dp(8);
+                    rRow.addView(undoBtn, ulp);
+                    LinearLayout.LayoutParams rlp = new LinearLayout.LayoutParams(-1, -2);
+                    rlp.bottomMargin = dp(6);
+                    hostRulesSection.addView(rRow, rlp);
+                }
+            });
+        });
 
         // Built-in Filter List Quick Toggles (dynamic CN + Global lists)
         body.addView(AikoTheme.sectionHeader(this, density, "内置过滤规则开关"));
@@ -3182,7 +4439,8 @@ public final class MainActivity extends Activity {
         });
         sheetAction(dialog, actions, COPY, "复制网址", true, () -> copyUrl("网址", url));
         sheetAction(dialog, actions, HISTORY, "拦截详情", true, () -> showFilterTrace(tab, host));
-        boolean modified = !filtered || profile.encode() != 0 || ultraScroll || forceMaxHz || jsDisabled || darkOv != 0;
+        boolean modified = !filtered || profile.encode() != 0 || ultraScroll || forceMaxHz || jsDisabled || darkOv != 0
+                || !curSiteCss.isEmpty() || curRefresh > 0;
         sheetAction(dialog, actions, CLOSE, "恢复默认", modified, () -> {
             saveSiteProfile(host, SiteProfile.DEFAULT);
             siteExtras.resetHost(host);
@@ -3210,7 +4468,7 @@ public final class MainActivity extends Activity {
                     sel ? AikoTheme.STROKE_ACCENT : AikoTheme.STROKE);
             pill.setForeground(AikoTheme.ripple(AikoTheme.RIPPLE_ACCENT, dp(14)));
             pill.setOnClickListener(v -> {
-                SiteProfile next = new SiteProfile(old.desktop, old.blockImages, z);
+                SiteProfile next = old.withZoom(z);
                 saveSiteProfile(host, next);
                 if (sameOpenSite(tab, host)) applySiteProfile(tab, next, false, false);
                 dialog.dismiss();
@@ -3244,10 +4502,29 @@ public final class MainActivity extends Activity {
 
         // 1. Quick Row
         LinearLayout quick = sheetRow(body);
-        sheetAction(dialog, quick, ADD, "新建标签", true, () -> addTab(null, false));
+        sheetAction(dialog, quick, ADD, "新建标签", true, () -> openNewTabDefault(false));
         sheetAction(dialog, quick, PRIVATE, "无痕", true, () -> startActivity(new Intent(this, PrivateActivity.class)));
         sheetAction(dialog, quick, DOWNLOAD, "下载", true, this::showDownloads);
         sheetAction(dialog, quick, CODE, "油猴脚本", true, this::showUserScriptsSheet);
+
+        // 1b. Flagship v0.4.0 Spotlight: Babel Immersive Translation + Homepage & Pro Customization
+        body.addView(AikoTheme.sectionHeader(this, density, "巴别塔与旗舰定制"));
+        boolean babelOn = pageOpen && babelUi != null && babelUi.isTranslating(tab.view);
+        String babelSub = babelOn ? "翻译中 · " + babelConfig.activeEngineDisplayName()
+                : babelConfig.activeEngineDisplayName();
+        String customHomeSub = startPageConfig.resolveHomeUrl() == null ? "原生极速 · 护眼/字体/防跳" : "自定义主页 · 高级定制";
+        addTwoColRow(body,
+                AikoTheme.toggleTile(this, density, TRANSLATE, "巴别塔翻译", babelSub,
+                        babelOn, true, AikoTheme.ACCENT, () -> {
+                            dialog.dismiss();
+                            babelUi.showSheet(pageOpen ? tab.view : null, pageOpen ? url : null);
+                        }),
+                AikoTheme.toggleTile(this, density, SUN_MOON, "主页与定制", customHomeSub,
+                        startPageConfig.isNightFilterEnabled() || startPageConfig.resolveHomeUrl() != null,
+                        true, AikoTheme.ACCENT_CYAN, () -> {
+                            dialog.dismiss();
+                            AikoV040Ui.showCustomizationSheet(v040Host);
+                        }));
 
         // 2. Current Page (2-column sleek grid)
         body.addView(AikoTheme.sectionHeader(this, density, "当前页面"));
@@ -3268,24 +4545,67 @@ public final class MainActivity extends Activity {
                                 });
                             }
                         }),
+                AikoTheme.toggleTile(this, density, SPEAKER, "网页朗读", "TTS 语音听书 0.8–2x",
+                        false, pageOpen, AikoTheme.EMERALD, () -> {
+                            dialog.dismiss();
+                            if (tab != null && tab.view != null && readAloud != null) {
+                                readAloud.showReadAloudSheet(this, tab.view, displayMode, density);
+                            }
+                        }));
+
+        addTwoColRow(body,
+                AikoTheme.toggleTile(this, density, GALLERY, "沉浸看图", "高清原图画廊/批量保存",
+                        false, pageOpen, AikoTheme.ACCENT, () -> {
+                            dialog.dismiss();
+                            openGalleryForCurrent();
+                        }),
+                AikoTheme.toggleTile(this, density, IMAGE, "网页长截图", "全页拼接含分享码",
+                        false, pageOpen, AikoTheme.ACCENT_CYAN, () -> {
+                            dialog.dismiss();
+                            captureLongShotForCurrent();
+                        }));
+
+        addTwoColRow(body,
+                AikoTheme.toggleTile(this, density, VIDEO, "视频倍速/后台",
+                        bgAudioEnabled && tab == bgAudioTab ? "后台音频播放中" : (pageOpen ? "倍速 / 后台锁屏 / PiP" : "仅网页可用"),
+                        bgAudioEnabled && tab == bgAudioTab, pageOpen, AikoTheme.ACCENT_CYAN, () -> {
+                            dialog.dismiss();
+                            if (tab != null && tab.view != null && pageOpen) showVideoBoosterSheet(tab);
+                        }),
+                AikoTheme.toggleTile(this, density, SNIFF, "媒体嗅探",
+                        cachedSniffedCount > 0 ? ("发现 " + cachedSniffedCount + " 条流媒体") : "嗅探 MP4 / M3U8 / 音频",
+                        cachedSniffedCount > 0, pageOpen, AikoTheme.EMERALD, () -> {
+                            dialog.dismiss();
+                            openMediaSnifferForCurrent();
+                        }));
+
+        addTwoColRow(body,
+                AikoTheme.toggleTile(this, density, DEVTOOLS, "网页调试台", "离线 Console / Network",
+                        false, pageOpen, AikoTheme.AMBER, () -> {
+                            dialog.dismiss();
+                            if (tab != null && tab.view != null) {
+                                WebDevTools.toggle(tab.view);
+                                toast("已切换网页开发者调试台");
+                            }
+                        }),
+                AikoTheme.toggleTile(this, density, PWA, "添加到桌面", "独立全屏 PWA 应用",
+                        false, pageOpen, AikoTheme.ACCENT, () -> {
+                            dialog.dismiss();
+                            pinCurrentPagePwa();
+                        }));
+
+        addTwoColRow(body,
                 AikoTheme.toggleTile(this, density, PIN, onShelf ? "已在稍后读" : "稍后读 · 0MB",
                         onShelf ? "点按移除" : "保存位置/离线",
                         onShelf, pageOpen, AikoTheme.EMERALD, () -> {
                             dialog.dismiss();
                             if (tab != null && pageOpen) handleReadingShelfAction(tab, onShelf);
-                        }));
-
-        addTwoColRow(body,
+                        }),
                 AikoTheme.toggleTile(this, density, STAR, bookmarked ? "取消收藏" : "收藏书签",
                         pinnedHome ? "已固定首页" : "点按收藏",
                         bookmarked, pageOpen, AikoTheme.ACCENT, () -> {
                             dialog.dismiss();
                             if (tab != null && pageOpen) toggleBookmark(tab, url);
-                        }),
-                AikoTheme.toggleTile(this, density, VIDEO, "视频倍速", pageOpen ? "倍速 / 静音 / 画中画" : "仅网页可用",
-                        false, pageOpen, AikoTheme.ACCENT_CYAN, () -> {
-                            dialog.dismiss();
-                            if (tab != null && tab.view != null && pageOpen) showVideoBoosterSheet(tab);
                         }));
 
         addTwoColRow(body,
@@ -3310,6 +4630,10 @@ public final class MainActivity extends Activity {
 
         LinearLayout pageRow = sheetRow(body);
         sheetAction(dialog, pageRow, FIND, "页内查找", pageOpen, () -> { if (tab != null && tab.view != null) openFind(tab.view); });
+        sheetAction(dialog, pageRow, QR, pageOpen ? "二维码" : "扫码", true, () -> {
+            if (pageOpen) QrSheet.showGenerator(this, tab.title, url, () -> copyUrl("网址", url), qrScanCallback);
+            else QrSheet.showScannerHintOrImageDecode(this, qrScanCallback);
+        });
         sheetAction(dialog, pageRow, HOME, pinnedHome ? "取消固定" : "固定首页", pageOpen, () -> {
             if (tab != null && pageOpen) {
                 library.togglePin(url, tab.title);
@@ -3352,12 +4676,7 @@ public final class MainActivity extends Activity {
                             dialog.dismiss();
                             boolean next = !globalDark;
                             siteExtras.setGlobalDarkWeb(next);
-                            for (Tab t : tabs) {
-                                if (t.view != null) {
-                                    applySiteExtras(t, t.cachedHost, false);
-                                    t.view.setBackgroundColor(effectiveDarkWeb(t.cachedHost) ? AikoTheme.BG : Color.WHITE);
-                                }
-                            }
+                            refreshAllTabsDarkMode();
                             toast(next ? "已开启全局网页深色模式" : "已关闭全局网页深色模式");
                         }));
 
@@ -3374,12 +4693,13 @@ public final class MainActivity extends Activity {
                         }));
 
         // 4. Library & Diagnostics
-        body.addView(AikoTheme.sectionHeader(this, density, "记录与规则"));
+        body.addView(AikoTheme.sectionHeader(this, density, "记录、备份与规则"));
         LinearLayout saved = sheetRow(body);
         sheetAction(dialog, saved, STAR, "书签", true, () -> showLibrary(true));
         sheetAction(dialog, saved, HISTORY, "历史", true, () -> showLibrary(false));
         sheetAction(dialog, saved, SHIELD, "广告过滤", true, this::showFilterRules);
-        sheetAction(dialog, saved, SPEED, "性能诊断", true, this::showPerformance);
+        sheetAction(dialog, saved, BACKUP, "备份恢复", true, () -> AikoV040Ui.showBackupSheet(v040Host));
+        sheetAction(dialog, saved, SPEED, "诊断", true, this::showPerformance);
 
         showSheet(dialog, panel);
     }
@@ -5070,19 +6390,16 @@ public final class MainActivity extends Activity {
             matchBox.addView(moreTv);
         }
 
-        // Permissions (@grant badges)
+        // Permissions (@grant badges) — FlowTagLayout wraps long grants cleanly without right-edge clipping!
         body.addView(AikoTheme.sectionHeader(this, density, "脚本权限 (@grant)"));
-        HorizontalScrollView grantScroll = new HorizontalScrollView(this);
-        grantScroll.setHorizontalScrollBarEnabled(false);
-        LinearLayout grantRow = new LinearLayout(this);
-        grantRow.setOrientation(LinearLayout.HORIZONTAL);
-        grantScroll.addView(grantRow);
+        FlowTagLayout grantFlow = new FlowTagLayout(this, dp(6), dp(6));
+        boolean hasHighRisk = false;
         if (script.grants.isEmpty()) {
             TextView safeBadge = AikoTheme.badge(this, density, "✓ 无特殊 GM 权限（隔离/安全运行）",
                     AikoTheme.EMERALD, AikoTheme.CARD, AikoTheme.STROKE);
-            grantRow.addView(safeBadge);
+            safeBadge.setEllipsize(TextUtils.TruncateAt.END);
+            grantFlow.addView(safeBadge);
         } else {
-            boolean hasHighRisk = false;
             for (String g : script.grants) {
                 boolean highRisk = g.toLowerCase(Locale.ROOT).contains("xmlhttprequest")
                         || "unsafeWindow".equals(g) || g.toLowerCase(Locale.ROOT).contains("cookie");
@@ -5090,21 +6407,47 @@ public final class MainActivity extends Activity {
                 TextView gBadge = AikoTheme.badge(this, density, (highRisk ? "⚠ " : "") + g,
                         highRisk ? AikoTheme.CORAL : AikoTheme.ACCENT_CYAN,
                         AikoTheme.CARD, highRisk ? AikoTheme.CORAL : AikoTheme.STROKE);
-                LinearLayout.LayoutParams glp = new LinearLayout.LayoutParams(-2, -2);
-                glp.rightMargin = dp(6);
-                grantRow.addView(gBadge, glp);
-            }
-            if (hasHighRisk) {
-                TextView warnTv = label("⚠ 注意：此脚本申请了跨域网络/高权限接口，仅安装你信任的来源。",
-                        11, AikoTheme.AMBER);
-                warnTv.setPadding(dp(4), dp(6), dp(4), 0);
-                body.addView(grantScroll, new LinearLayout.LayoutParams(-1, -2));
-                body.addView(warnTv);
-                grantScroll = null;
+                gBadge.setEllipsize(TextUtils.TruncateAt.END);
+                grantFlow.addView(gBadge);
             }
         }
-        if (grantScroll != null) {
-            body.addView(grantScroll, new LinearLayout.LayoutParams(-1, -2));
+        body.addView(grantFlow, new LinearLayout.LayoutParams(-1, -2));
+        if (hasHighRisk) {
+            TextView warnTv = label("⚠ 注意：此脚本申请了跨域网络/高权限接口，仅安装你信任的来源。",
+                    11, AikoTheme.AMBER);
+            warnTv.setPadding(dp(4), dp(6), dp(4), 0);
+            body.addView(warnTv);
+        }
+
+        // Declared @connect hosts (wrapped cleanly via FlowTagLayout)
+        if (!script.connects.isEmpty()) {
+            body.addView(AikoTheme.sectionHeader(this, density, "网络白名单 (@connect · " + script.connects.size() + ")"));
+            FlowTagLayout connectFlow = new FlowTagLayout(this, dp(6), dp(6));
+            for (String hostRule : script.connects) {
+                boolean wildcard = "*".equals(hostRule);
+                TextView cBadge = AikoTheme.badge(this, density, (wildcard ? "⚠ * (任意域)" : hostRule),
+                        wildcard ? AikoTheme.AMBER : AikoTheme.TEXT_MUTED,
+                        AikoTheme.CARD, wildcard ? AikoTheme.AMBER : AikoTheme.STROKE);
+                cBadge.setEllipsize(TextUtils.TruncateAt.END);
+                connectFlow.addView(cBadge);
+            }
+            body.addView(connectFlow, new LinearLayout.LayoutParams(-1, -2));
+        }
+
+        // Declared @require / @resource dependencies count
+        if (!script.requires.isEmpty() || !script.resources.isEmpty()) {
+            body.addView(AikoTheme.sectionHeader(this, density, "外部依赖与资源缓存"));
+            StringBuilder depLine = new StringBuilder();
+            if (!script.requires.isEmpty()) depLine.append("@require 依赖库：").append(script.requires.size()).append(" 项");
+            if (!script.resources.isEmpty()) {
+                if (depLine.length() > 0) depLine.append("  ·  ");
+                depLine.append("@resource 资源：").append(script.resources.size()).append(" 项");
+            }
+            depLine.append("\n安装后将自动异步下载并持久化缓存到本地，离线可直接运行。");
+            TextView depTv = label(depLine.toString(), 11, AikoTheme.TEXT_MUTED);
+            depTv.setPadding(dp(12), dp(9), dp(12), dp(9));
+            depTv.setBackground(AikoTheme.card(AikoTheme.CARD, AikoTheme.STROKE, density, dp(13)));
+            body.addView(depTv, new LinearLayout.LayoutParams(-1, -2));
         }
 
         // Expandable Source Preview
@@ -5146,7 +6489,8 @@ public final class MainActivity extends Activity {
         AikoTheme.attachPressFeedback(installBtn, 0.96f);
         installBtn.setOnClickListener(v -> {
             installBtn.setEnabled(false);
-            installBtn.setText("正在安装…");
+            boolean hasDeps = !script.requires.isEmpty() || !script.resources.isEmpty();
+            installBtn.setText(hasDeps ? "正在缓存依赖并安装…" : "正在安装…");
             userScripts.installRemote(remote, err -> {
                 if (isDestroyed()) return;
                 if (err != null && !err.isEmpty()) {
@@ -5154,6 +6498,10 @@ public final class MainActivity extends Activity {
                     installBtn.setText(remote.isUpdate ? "立即覆盖更新（保留脚本数据）" : "一键安装并启用");
                     toast("安装失败：" + err);
                     return;
+                }
+                UserScripts.Entry installed = userScripts.duplicate(script);
+                if (installed != null && hasDeps) {
+                    userScripts.prepareDependenciesAsync(installed, null);
                 }
                 dialog.dismiss();
                 if (onInstalled != null) onInstalled.run();
@@ -5279,9 +6627,38 @@ public final class MainActivity extends Activity {
             dialog.dismiss();
             showInstallScriptUrlDialog();
         });
-        importRow.addView(urlImportBtn, new LinearLayout.LayoutParams(0, dp(38), 1));
+        LinearLayout.LayoutParams uimlp = new LinearLayout.LayoutParams(0, dp(38), 1);
+        uimlp.rightMargin = dp(6);
+        importRow.addView(urlImportBtn, uimlp);
 
-        // Active scripts on current page
+        TextView checkUpdBtn = AikoTheme.badge(this, density, "检查更新",
+                AikoTheme.EMERALD, AikoTheme.CARD, AikoTheme.STROKE);
+        checkUpdBtn.setForeground(AikoTheme.ripple(AikoTheme.RIPPLE_ACCENT, dp(12)));
+        AikoTheme.attachPressFeedback(checkUpdBtn, 0.95f);
+        checkUpdBtn.setOnClickListener(v -> {
+            checkUpdBtn.setEnabled(false);
+            checkUpdBtn.setText("检查中…");
+            userScripts.checkUpdates(this, (updates, checked, failed) -> {
+                if (isDestroyed()) return;
+                checkUpdBtn.setEnabled(true);
+                checkUpdBtn.setText("检查更新");
+                if (checked == 0) {
+                    toast("已安装脚本均未配置远程更新地址");
+                    return;
+                }
+                if (updates.isEmpty()) {
+                    toast(failed > 0
+                            ? "已检查 " + checked + " 个脚本，暂无更新（" + failed + " 个请求失败）"
+                            : "全部 " + checked + " 个脚本均为最新版本");
+                    return;
+                }
+                dialog.dismiss();
+                AikoV040Ui.showScriptUpdatesSheet(v040Host, updates, this::showUserScriptsSheet);
+            });
+        });
+        importRow.addView(checkUpdBtn, new LinearLayout.LayoutParams(0, dp(38), 1));
+
+        // Active scripts & live GM_registerMenuCommand buttons on current page
         String curUrl = (current != null && !onHome && HttpUrlUtil.isHttp(current.url)) ? current.url : null;
         if (curUrl != null) {
             body.addView(AikoTheme.sectionHeader(this, density, "当前页面已生效的脚本"));
@@ -5316,6 +6693,27 @@ public final class MainActivity extends Activity {
                     runBadge.setTypeface(AikoTheme.MONO);
                     activeCard.addView(runBadge);
                 }
+            }
+
+            List<UserScripts.MenuCommand> liveCmds = current.view != null
+                    ? userScripts.menuCommandsFor(current.view) : Collections.emptyList();
+            if (!liveCmds.isEmpty()) {
+                body.addView(AikoTheme.sectionHeader(this, density, "脚本注册菜单命令（" + liveCmds.size() + "）"));
+                FlowTagLayout cmdFlow = new FlowTagLayout(this, dp(6), dp(6));
+                for (UserScripts.MenuCommand cmd : liveCmds) {
+                    TextView cmdBtn = AikoTheme.badge(this, density, "▸ " + cmd.caption,
+                            AikoTheme.ACCENT_CYAN, AikoTheme.CARD, AikoTheme.STROKE_ACCENT);
+                    cmdBtn.setForeground(AikoTheme.ripple(AikoTheme.RIPPLE_ACCENT, dp(12)));
+                    AikoTheme.attachPressFeedback(cmdBtn, 0.94f);
+                    cmdBtn.setOnClickListener(v -> {
+                        dialog.dismiss();
+                        if (current != null && current.view != null) {
+                            userScripts.invokeMenuCommand(current.view, cmd.cmdId);
+                        }
+                    });
+                    cmdFlow.addView(cmdBtn);
+                }
+                body.addView(cmdFlow, new LinearLayout.LayoutParams(-1, -2));
             }
         }
 
@@ -5611,6 +7009,34 @@ public final class MainActivity extends Activity {
         });
         ctrlRow.addView(resetBtn, new LinearLayout.LayoutParams(0, dp(40), 1));
 
+        // v0.4.0 Background Audio (Lockscreen MediaSession) + Media Sniffer row
+        boolean isBgHere = bgAudioEnabled && tab == bgAudioTab;
+        LinearLayout bgRow = new LinearLayout(this);
+        bgRow.setOrientation(LinearLayout.HORIZONTAL);
+        LinearLayout.LayoutParams brlp = new LinearLayout.LayoutParams(-1, -2);
+        brlp.topMargin = dp(10);
+        panel.addView(bgRow, brlp);
+
+        View bgTile = AikoTheme.toggleTile(this, density, SPEAKER,
+                isBgHere ? "后台播放中" : "后台播放",
+                isBgHere ? "锁屏媒控已开启" : "锁屏/切后台继续听",
+                isBgHere, true, AikoTheme.EMERALD, () -> {
+                    boolean next = !(bgAudioEnabled && tab == bgAudioTab);
+                    setBackgroundAudioEnabled(tab, next, true);
+                    dialog.dismiss();
+                });
+        LinearLayout.LayoutParams btlp = new LinearLayout.LayoutParams(0, -2, 1.2f);
+        btlp.rightMargin = dp(8);
+        bgRow.addView(bgTile, btlp);
+
+        View sniffTile = AikoTheme.toggleTile(this, density, SNIFF,
+                "媒体嗅探", "提取 MP4 / M3U8",
+                false, true, AikoTheme.ACCENT_CYAN, () -> {
+                    dialog.dismiss();
+                    openMediaSnifferForCurrent();
+                });
+        bgRow.addView(sniffTile, new LinearLayout.LayoutParams(0, -2, 1f));
+
         // Inspect live videos once sheet opens
         web.evaluateJavascript(VideoBooster.inspectVideoJs(), raw -> {
             if (isDestroyed() || !dialog.isShowing()) return;
@@ -5650,7 +7076,7 @@ public final class MainActivity extends Activity {
             PackageInfo pi = getPackageManager().getPackageInfo(getPackageName(), 0);
             if (pi != null && pi.versionName != null && !pi.versionName.isEmpty()) return pi.versionName;
         } catch (Exception ignored) { }
-        return "0.3.1";
+        return "0.4.0";
     }
 
     private void showAboutSheet() {
@@ -5666,7 +7092,7 @@ public final class MainActivity extends Activity {
         LinearLayout body = stack();
         scroll.addView(body, new ScrollView.LayoutParams(-1, -2));
 
-        // Hero identity card
+        // Hero identity card (every centered multi-line TextView explicitly sets Gravity.CENTER_HORIZONTAL)
         LinearLayout hero = stack();
         hero.setGravity(Gravity.CENTER_HORIZONTAL);
         hero.setPadding(dp(16), dp(18), dp(16), dp(16));
@@ -5685,16 +7111,19 @@ public final class MainActivity extends Activity {
 
         TextView appTitle = label("Aiko Browser v" + appVersionName(), 19, AikoTheme.TEXT);
         appTitle.setTypeface(AikoTheme.BOLD);
-        LinearLayout.LayoutParams atlp = new LinearLayout.LayoutParams(-2, -2);
+        appTitle.setGravity(Gravity.CENTER_HORIZONTAL);
+        LinearLayout.LayoutParams atlp = new LinearLayout.LayoutParams(-1, -2);
         atlp.topMargin = dp(10);
         hero.addView(appTitle, atlp);
 
-        TextView tagline = label("极致轻量 · 旗舰高刷浏览器", 12, AikoTheme.ACCENT_CYAN);
-        tagline.setPadding(0, dp(3), 0, dp(10));
-        hero.addView(tagline);
+        TextView tagline = label("极致轻量 · 巴别塔与旗舰高刷浏览器", 12, AikoTheme.ACCENT_CYAN);
+        tagline.setGravity(Gravity.CENTER_HORIZONTAL);
+        tagline.setPadding(dp(8), dp(4), dp(8), dp(10));
+        hero.addView(tagline, new LinearLayout.LayoutParams(-1, -2));
 
         TextView authorPill = AikoTheme.badge(this, density, "作者：Alzar",
                 AikoTheme.TEXT, AikoTheme.BG, AikoTheme.STROKE_ACCENT);
+        authorPill.setGravity(Gravity.CENTER);
         hero.addView(authorPill, new LinearLayout.LayoutParams(-2, -2));
 
         // Open-source GitHub repository card
@@ -6047,7 +7476,260 @@ public final class MainActivity extends Activity {
         });
     }
 
-    void showDownloads() { new DownloadPanel(this).show(); }
+    void showDownloads() {
+        new DownloadPanel(this, this::openMediaSnifferForCurrent, cachedSniffedCount).show();
+    }
+
+    // ==================== V0.4.0 FEATURE ACTIONS (GALLERY / LONGSHOT / SNIFF / PWA / BACKUP / TTS / CLIPBOARD) ====================
+
+    private void openGalleryForCurrent() {
+        Tab tab = current;
+        if (tab == null || tab.view == null || !HttpUrlUtil.isHttp(tab.url)) {
+            toast("请先打开包含图片的网页");
+            return;
+        }
+        toast("正在提取页面高清图片…");
+        String pageTitle = tab.title;
+        String pageUrl = tab.url;
+        tab.view.evaluateJavascript(PageToolkit.extractGalleryImagesScript(), raw -> {
+            if (isDestroyed() || isFinishing()) return;
+            ArrayList<GallerySheet.ImageItem> items = new ArrayList<>();
+            try {
+                if (raw != null && !"null".equals(raw)) {
+                    Object tok = new JSONTokener(raw).nextValue();
+                    JSONArray arr = tok instanceof String ? new JSONArray((String) tok)
+                            : (tok instanceof JSONArray ? (JSONArray) tok : null);
+                    if (arr != null) {
+                        for (int i = 0; i < arr.length(); i++) {
+                            JSONObject o = arr.optJSONObject(i);
+                            if (o == null) continue;
+                            String u = o.optString("url", "").trim();
+                            if (HttpUrlUtil.isHttp(u)) {
+                                items.add(new GallerySheet.ImageItem(
+                                        u, o.optString("alt", ""), o.optInt("width", 0), o.optInt("height", 0)));
+                            }
+                        }
+                    }
+                }
+            } catch (Exception ignored) { }
+            if (items.isEmpty()) {
+                toast("当前页面未检测到适合画廊预览的高清图片");
+                return;
+            }
+            GallerySheet.show(this, pageTitle, pageUrl, items, new GallerySheet.Actions() {
+                @Override public void toast(String msg) { MainActivity.this.toast(msg); }
+                @Override public void downloadUrl(String url, String filename) {
+                    showNewDownload(url, filename, null);
+                }
+                @Override public void openUrl(String url) { addTab(url, false); }
+            });
+        });
+    }
+
+    private void captureLongShotForCurrent() {
+        Tab tab = current;
+        if (tab == null || tab.view == null || !HttpUrlUtil.isHttp(tab.url)) {
+            toast("请先打开网页后再截取长图");
+            return;
+        }
+        toast("正在拼接全页长截图，请保持页面不动…");
+        LongShotCapture.capture(this, tab.view, tab.title, tab.url, true, new LongShotCapture.Callback() {
+            @Override public void onSaved(Uri imageUri, String displayName, int width, int height) {
+                if (!isDestroyed()) {
+                    toast("长截图已保存：" + displayName + " (" + width + "×" + height + ")");
+                }
+            }
+            @Override public void onError(String message) {
+                if (!isDestroyed()) toast(message == null ? "长截图失败" : message);
+            }
+        });
+    }
+
+    private void openMediaSnifferForCurrent() {
+        Tab tab = current;
+        if (tab == null || tab.view == null || !HttpUrlUtil.isHttp(tab.url)) {
+            toast("请先打开网页后再嗅探媒体流");
+            return;
+        }
+        AikoV040Ui.showMediaSnifferSheet(v040Host, tab.view, tab.title, count -> cachedSniffedCount = count);
+    }
+
+    private void pinCurrentPagePwa() {
+        Tab tab = current;
+        if (tab == null || !HttpUrlUtil.isHttp(tab.url)) {
+            toast("请先打开网页后再添加到桌面");
+            return;
+        }
+        if (!PwaHelper.isSupported(this)) {
+            toast("当前系统桌面暂不支持固定独立快捷方式");
+            return;
+        }
+        boolean ok = PwaHelper.pinStandaloneShortcut(this, tab.url, tab.title, tab.favicon, true);
+        toast(ok ? "已请求创建独立全屏桌面图标（PWA）" : "创建桌面快捷方式失败");
+    }
+
+    private void setBackgroundAudioEnabled(Tab tab, boolean enable, boolean showToast) {
+        if (enable && tab != null && tab.view != null) {
+            bgAudioEnabled = true;
+            bgAudioTab = tab;
+            tab.view.evaluateJavascript(VideoBooster.backgroundPlaybackScript(true), null);
+            String title = (tab.title == null || tab.title.isEmpty()) ? "网页媒体播放" : tab.title;
+            String host = tab.cachedHost == null ? "Aiko Browser" : tab.cachedHost;
+            MediaPlaybackService.start(this, title, host, true);
+            if (showToast) toast("已开启后台播放与锁屏媒体控制");
+        } else {
+            if (bgAudioTab != null && bgAudioTab.view != null) {
+                try { bgAudioTab.view.evaluateJavascript(VideoBooster.backgroundPlaybackScript(false), null); }
+                catch (RuntimeException ignored) { }
+            }
+            bgAudioEnabled = false;
+            bgAudioTab = null;
+            MediaPlaybackService.stop(this);
+            if (showToast) toast("已关闭后台音频播放");
+        }
+    }
+
+    private void resetSiteDataAndCookies(Tab tab, String host, String url) {
+        if (host == null || host.isEmpty()) return;
+        String origin = HttpUrlUtil.extractOrigin(url);
+        try {
+            if (!origin.isEmpty()) WebStorage.getInstance().deleteOrigin(origin);
+            CookieManager cm = CookieManager.getInstance();
+            String existing = cm.getCookie(url);
+            if (existing != null && !existing.isEmpty()) {
+                for (String pair : existing.split(";")) {
+                    int eq = pair.indexOf('=');
+                    String name = (eq > 0 ? pair.substring(0, eq) : pair).trim();
+                    if (!name.isEmpty()) {
+                        cm.setCookie(url, name + "=; Max-Age=0; Path=/");
+                        cm.setCookie(url, name + "=; Max-Age=0; Domain=" + host + "; Path=/");
+                    }
+                }
+                cm.flush();
+            }
+        } catch (RuntimeException ignored) { }
+        saveSiteProfile(host, SiteProfile.DEFAULT);
+        siteExtras.resetHost(host);
+        toast("已清除 " + host + " 的站内存储与 Cookie");
+        if (sameOpenSite(tab, host)) reloadPreservingScroll();
+    }
+
+    private void startBackupExport() {
+        Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT)
+                .addCategory(Intent.CATEGORY_OPENABLE)
+                .setType("application/octet-stream")
+                .putExtra(Intent.EXTRA_TITLE, BackupManager.suggestedFilename());
+        try { startActivityForResult(intent, BACKUP_EXPORT); }
+        catch (RuntimeException e) { toast("找不到可用的文件管理器"); }
+    }
+
+    private void startBackupImport() {
+        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT)
+                .addCategory(Intent.CATEGORY_OPENABLE)
+                .setType("*/*");
+        try { startActivityForResult(intent, BACKUP_IMPORT); }
+        catch (RuntimeException e) { toast("找不到可用的文件选择器"); }
+    }
+
+    private void startCustomFontPicker() {
+        Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT)
+                .addCategory(Intent.CATEGORY_OPENABLE)
+                .setType("*/*");
+        try { startActivityForResult(intent, PICK_CUSTOM_FONT); }
+        catch (RuntimeException e) { toast("找不到可用的文件选择器"); }
+    }
+
+    private void maybeShowClipboardCapsule() {
+        if (isDestroyed() || isFinishing() || startPageConfig == null || !startPageConfig.isClipboardAssist()) return;
+        if (isAnyOmniboxFocused() || fullscreen != null || root == null) return;
+        String clip = readClipboardSnippet();
+        if (clip == null || clip.equals(lastClipboardHintText)) return;
+        if (!HttpUrlUtil.isHttp(clip)) return;
+        if (current != null && clip.equals(current.url)) return;
+        lastClipboardHintText = clip;
+
+        boolean isScript = UserScripts.isUserScriptUrl(clip);
+        if (clipboardCapsule == null) {
+            clipboardCapsule = new LinearLayout(this);
+            clipboardCapsule.setOrientation(LinearLayout.HORIZONTAL);
+            clipboardCapsule.setGravity(Gravity.CENTER_VERTICAL);
+            clipboardCapsule.setPadding(dp(12), dp(8), dp(8), dp(8));
+            clipboardCapsule.setElevation(dp(14));
+            FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM);
+            lp.leftMargin = dp(12);
+            lp.rightMargin = dp(12);
+            lp.bottomMargin = deckContentHeight + insetBottom + dp(14);
+            root.addView(clipboardCapsule, lp);
+        }
+        clipboardCapsule.removeAllViews();
+        clipboardCapsule.setBackground(AikoTheme.card(AikoTheme.SURFACE, AikoTheme.STROKE_ACCENT, density, dp(18)));
+        FrameLayout.LayoutParams clp = (FrameLayout.LayoutParams) clipboardCapsule.getLayoutParams();
+        clp.bottomMargin = deckContentHeight + insetBottom + dp(14);
+        clipboardCapsule.setLayoutParams(clp);
+
+        LinearLayout info = stack();
+        TextView head = label(isScript ? "剪贴板发现油猴脚本 · 点击安装" : "剪贴板发现网址 · 点击前往",
+                12, isScript ? AikoTheme.EMERALD : AikoTheme.ACCENT_CYAN);
+        head.setTypeface(AikoTheme.BOLD);
+        info.addView(head);
+        TextView sub = label(clip, 11, AikoTheme.TEXT_MUTED);
+        sub.setSingleLine(true);
+        sub.setEllipsize(TextUtils.TruncateAt.MIDDLE);
+        info.addView(sub);
+        clipboardCapsule.addView(info, new LinearLayout.LayoutParams(0, -2, 1));
+
+        TextView goPill = AikoTheme.badge(this, density, isScript ? "安装" : "打开",
+                AikoTheme.onAccentColor(), AikoTheme.ACCENT, 0);
+        goPill.setOnClickListener(v -> {
+            hideClipboardCapsule();
+            if (isScript) {
+                handleRemoteUserScript(clip, URLUtil.guessFileName(clip, null, "application/javascript"), null);
+            } else {
+                navigate(clip);
+            }
+        });
+        LinearLayout.LayoutParams glp = new LinearLayout.LayoutParams(-2, dp(32));
+        glp.leftMargin = dp(8);
+        clipboardCapsule.addView(goPill, glp);
+
+        BrowserIcon closeBtn = icon(CLOSE, "关闭提示", this::hideClipboardCapsule);
+        closeBtn.tint(AikoTheme.TEXT_DIM);
+        clipboardCapsule.addView(closeBtn, new LinearLayout.LayoutParams(dp(34), dp(34)));
+
+        clipboardCapsule.setVisibility(View.VISIBLE);
+        handler.removeCallbacks(hideClipboardCapsuleTask);
+        handler.postDelayed(hideClipboardCapsuleTask, 7000L);
+    }
+
+    private void hideClipboardCapsule() {
+        handler.removeCallbacks(hideClipboardCapsuleTask);
+        if (clipboardCapsule != null) clipboardCapsule.setVisibility(View.GONE);
+    }
+
+    private void reloadAllConfigsAfterBackupRestore() {
+        AikoTheme.applyTheme(this);
+        applyLiveTheme();
+        if (startPageConfig != null) startPageConfig.reload();
+        if (bangCatalog != null) bangCatalog.reload();
+        babelConfig = new BabelConfig(this);
+        babelEngine = new BabelEngine(babelConfig);
+        babelUi = new BabelUi(this, babelConfig, babelEngine, new BabelUi.HostCallbacks() {
+            @Override public void toast(String msg) { MainActivity.this.toast(msg); }
+            @Override public void speakText(String text, String lang) {
+                if (readAloud != null) readAloud.speak(text, lang);
+            }
+            @Override public void onStateChanged() { updateChrome(); }
+        });
+        babelUi.setDisplayModeEngine(displayMode);
+        for (Tab t : tabs) {
+            if (t.view != null) babelUi.bindWebView(t.view);
+        }
+        applyAutoNightSchedule();
+        applyNightComfortOverlay();
+        applyInsetsLayout();
+        updateChrome();
+        if (onHome) refreshHomeContent();
+    }
 
     void toggleTransferPriority() {
         boolean next = !DownloadService.PACER.browserFirst();
@@ -6143,8 +7825,19 @@ public final class MainActivity extends Activity {
         }
     }
 
+    @Override public void onWindowFocusChanged(boolean hasFocus) {
+        super.onWindowFocusChanged(hasFocus);
+        if (hasFocus) {
+            if (displayMode != null) displayMode.apply();
+            handler.postDelayed(this::maybeShowClipboardCapsule, 240L);
+        }
+    }
+
     @Override protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
+        if (QrSheet.handleActivityResult(this, requestCode, resultCode, data, qrScanCallback)) {
+            return;
+        }
         if (requestCode == ScriptTools.PICK_FILE) {
             if (resultCode == RESULT_OK && data != null) scriptTools.importFile(data.getData());
             return;
@@ -6152,6 +7845,96 @@ public final class MainActivity extends Activity {
         if (requestCode == FILE_PICKER && picker != null) {
             picker.onReceiveValue(WebChromeClient.FileChooserParams.parseResult(resultCode, data));
             picker = null;
+            return;
+        }
+        if (requestCode == BACKUP_EXPORT && resultCode == RESULT_OK && data != null && data.getData() != null) {
+            Uri uri = data.getData();
+            toast("正在导出完整备份 (.aiko)…");
+            ioExecutor.execute(() -> {
+                try (OutputStream out = getContentResolver().openOutputStream(uri)) {
+                    if (out == null) throw new java.io.IOException("无法写入目标文件");
+                    BackupManager.ExportReport rep = BackupManager.exportToStream(this, out);
+                    handler.post(() -> toast(rep.summary));
+                } catch (Exception e) {
+                    String err = e.getMessage();
+                    handler.post(() -> toast("备份导出失败：" + (err == null ? "请重试" : err)));
+                }
+            });
+            return;
+        }
+        if (requestCode == BACKUP_IMPORT && resultCode == RESULT_OK && data != null && data.getData() != null) {
+            Uri uri = data.getData();
+            toast("正在验证并恢复备份 (.aiko)…");
+            ioExecutor.execute(() -> {
+                try (InputStream in = getContentResolver().openInputStream(uri)) {
+                    if (in == null) throw new java.io.IOException("无法读取备份文件");
+                    BackupManager.RestoreReport rep = BackupManager.importFromStream(this, in);
+                    handler.post(() -> {
+                        if (isDestroyed()) return;
+                        reloadAllConfigsAfterBackupRestore();
+                        toast(rep.summary + "（部分偏好重启后彻底同步）");
+                    });
+                } catch (Exception e) {
+                    String err = e.getMessage();
+                    handler.post(() -> toast("备份恢复失败：" + (err == null ? "无效的 .aiko 文件" : err)));
+                }
+            });
+            return;
+        }
+        if (requestCode == PICK_CUSTOM_FONT && resultCode == RESULT_OK && data != null && data.getData() != null) {
+            Uri uri = data.getData();
+            toast("正在导入自定义字体…");
+            ioExecutor.execute(() -> {
+                try (InputStream in = getContentResolver().openInputStream(uri)) {
+                    if (in == null) throw new java.io.IOException("无法读取字体文件");
+                    String rawName = queryDisplayName(uri);
+                    String lower = rawName.toLowerCase(Locale.ROOT);
+                    if (!lower.endsWith(".ttf") && !lower.endsWith(".otf") && !lower.endsWith(".woff2")) {
+                        rawName = rawName + ".ttf";
+                    }
+                    String safeFile = StartPageConfig.sanitizeFontFilename(rawName);
+                    if (safeFile.isEmpty()) safeFile = "user_font.ttf";
+                    File fontsDir = new File(getFilesDir(), "fonts");
+                    if (!fontsDir.isDirectory() && !fontsDir.mkdirs()) {
+                        throw new java.io.IOException("无法创建字体目录");
+                    }
+                    File target = new File(fontsDir, safeFile);
+                    File tmp = new File(fontsDir, safeFile + ".tmp");
+                    byte[] buf = new byte[16384];
+                    int total = 0;
+                    try (FileOutputStream fos = new FileOutputStream(tmp)) {
+                        for (int n; (n = in.read(buf)) >= 0; ) {
+                            total += n;
+                            if (total > MAX_CUSTOM_FONT_BYTES) {
+                                throw new java.io.IOException("字体文件超过 16 MiB 上限");
+                            }
+                            fos.write(buf, 0, n);
+                        }
+                    }
+                    if (total < 64) {
+                        //noinspection ResultOfMethodCallIgnored
+                        tmp.delete();
+                        throw new java.io.IOException("字体文件无效");
+                    }
+                    if (target.exists()) { //noinspection ResultOfMethodCallIgnored
+                        target.delete();
+                    }
+                    if (!tmp.renameTo(target)) {
+                        throw new java.io.IOException("保存字体文件失败");
+                    }
+                    final String displayName = rawName.replaceAll("\\.(ttf|otf|woff2)$", "");
+                    final String finalFile = safeFile;
+                    handler.post(() -> {
+                        if (isDestroyed()) return;
+                        startPageConfig.setCustomFont(displayName, finalFile);
+                        v040Host.onTypographyOrPrivacyChanged();
+                        toast("已导入并应用字体：" + displayName);
+                    });
+                } catch (Exception e) {
+                    String err = e.getMessage();
+                    handler.post(() -> toast("导入字体失败：" + (err == null ? "请检查文件格式" : err)));
+                }
+            });
             return;
         }
         if (requestCode == BOOKMARKS_EXPORT && resultCode == RESULT_OK && data != null && data.getData() != null) {
@@ -6193,10 +7976,24 @@ public final class MainActivity extends Activity {
         }
     }
 
+    private String queryDisplayName(Uri uri) {
+        try (android.database.Cursor c = getContentResolver().query(
+                uri, new String[]{android.provider.OpenableColumns.DISPLAY_NAME}, null, null, null)) {
+            if (c != null && c.moveToFirst()) {
+                String nm = c.getString(0);
+                if (nm != null && !nm.trim().isEmpty()) return nm.trim();
+            }
+        } catch (RuntimeException ignored) { }
+        String last = uri.getLastPathSegment();
+        return (last != null && !last.isEmpty()) ? last : "custom_font.ttf";
+    }
+
     @Override protected void onStart() {
         super.onStart();
         visible = true;
         if (displayMode != null) displayMode.start();
+        applyAutoNightSchedule();
+        applyNightComfortOverlay();
         if (current != null && current.view != null && !onHome) {
             current.view.onResume();
             WebViewPerf.setActiveRenderer(current.view, true);
@@ -6204,17 +8001,22 @@ public final class MainActivity extends Activity {
             if (current.started != 0) current.priorityTicket = DownloadService.PACER.protect(1350);
         }
         if (hudEnabled) attachHud();
+        scheduleAutoRefreshForCurrent();
+        scheduleNewTabPreload(600L);
     }
 
     @Override protected void onStop() {
         userScripts.flushValues();
         visible = false;
+        handler.removeCallbacks(autoRefreshTask);
         if (displayMode != null) displayMode.stop();
         if (current != null) {
             rememberScroll(current);
+            captureFormDraft(current);
             DownloadService.PACER.release(current.priorityTicket);
             current.priorityTicket = 0;
-            if (current.view != null) {
+            boolean keepPlayingAudio = bgAudioEnabled && current == bgAudioTab;
+            if (current.view != null && !keepPlayingAudio) {
                 current.view.onPause();
                 WebViewPerf.setActivePreRaster(current.view, false);
                 WebViewPerf.setActiveRenderer(current.view, false);
@@ -6230,6 +8032,11 @@ public final class MainActivity extends Activity {
     @Override protected void onDestroy() {
         if (root != null) root.removeCallbacks(reapplyInsetsTask);
         detachHud();
+        hideClipboardCapsule();
+        releasePreloadedNewTab();
+        if (readAloud != null) readAloud.shutdown();
+        MediaPlaybackService.clearPlaybackListener(mediaPlaybackListener);
+        if (bgAudioEnabled) MediaPlaybackService.stop(this);
         if (elementPicker != null) elementPicker.stop();
         userScripts.flushValues();
         if (siteFilter != null) siteFilter.close();

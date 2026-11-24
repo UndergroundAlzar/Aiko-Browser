@@ -39,8 +39,51 @@ final class ScriptTools {
                 names[i] = (entry.enabled ? "已启用 · " : "已停用 · ") + entry.script.name;
             }
             dialog.setItems(names, (d, index) -> details(entries.get(index)));
+            dialog.setNeutralButton("检查更新", (d, w) -> checkUpdatesInteractive());
         }
         dialog.show();
+    }
+
+    void checkUpdatesInteractive() {
+        activity.toast("正在检查脚本更新…");
+        scripts.checkUpdates(activity, (updates, checked, failed) -> {
+            if (activity.isDestroyed() || activity.isFinishing()) return;
+            if (checked == 0) {
+                activity.toast("当前脚本均未配置远程更新地址");
+                return;
+            }
+            if (updates.isEmpty()) {
+                activity.toast(failed > 0
+                        ? "已检查 " + checked + " 个脚本，暂无可用更新（" + failed + " 个请求失败）"
+                        : "全部 " + checked + " 个脚本均为最新版本");
+                return;
+            }
+            StringBuilder msg = new StringBuilder();
+            for (UserScripts.UpdateResult u : updates) {
+                msg.append("• ").append(u.name).append("：")
+                        .append(u.oldVersion.isEmpty() ? "?" : u.oldVersion)
+                        .append(" → ").append(u.newVersion).append('\n');
+            }
+            new AlertDialog.Builder(activity)
+                    .setTitle("发现 " + updates.size() + " 个脚本更新")
+                    .setMessage(msg.toString().trim())
+                    .setNegativeButton("暂不更新", null)
+                    .setPositiveButton("一键全部更新", (d, w) -> applyUpdatesBatch(updates, 0, 0))
+                    .show();
+        });
+    }
+
+    private void applyUpdatesBatch(List<UserScripts.UpdateResult> updates, int idx, int okCount) {
+        if (idx >= updates.size()) {
+            if (!activity.isDestroyed()) {
+                activity.toast("已更新 " + okCount + "/" + updates.size() + " 个脚本，刷新页面生效");
+            }
+            return;
+        }
+        scripts.applyUpdate(updates.get(idx), err -> {
+            int nextOk = (err == null || err.isEmpty()) ? okCount + 1 : okCount;
+            applyUpdatesBatch(updates, idx + 1, nextOk);
+        });
     }
 
     private void showImport() {
@@ -85,12 +128,12 @@ final class ScriptTools {
         dialog.show();
         dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(view -> {
             String url = address.getText().toString().trim();
-            if (!url.regionMatches(true, 0, "https://", 0, 8) || UserScript.address(url) == null) {
+            if (!url.regionMatches(true, 0, "https://", 0, 8) || UserScriptInput.safeRemoteAddress(url) == null) {
                 address.setError("请输入有效的 HTTPS 源码地址");
                 return;
             }
             dialog.dismiss();
-            importInBackground(() -> UserScriptInput.download(url));
+            importInBackground(() -> UserScriptInput.downloadRemote(url, UserScript.MAX_BYTES));
         });
     }
 
@@ -164,7 +207,7 @@ final class ScriptTools {
 
     private void details(UserScripts.Entry entry) {
         String status = scripts.compatibility(entry);
-        String[] actions = {entry.enabled ? "停用脚本" : "启用脚本", "编辑源码", "删除脚本"};
+        String[] actions = {entry.enabled ? "停用脚本" : "启用脚本", "编辑源码", "刷新依赖缓存", "删除脚本"};
         new AlertDialog.Builder(activity).setTitle(entry.script.name)
                 .setMessage((entry.enabled ? "已启用" : "已停用") + "\n\n" + summary(entry.script)
                         + (status.isEmpty() ? "" : "\n\n" + status))
@@ -173,7 +216,10 @@ final class ScriptTools {
                         .setItems(actions, (choice, index) -> {
                             if (index == 0) toggle(entry);
                             else if (index == 1) editor(entry);
-                            else delete(entry);
+                            else if (index == 2) {
+                                activity.toast("正在刷新 @require / @resource 缓存…");
+                                scripts.prepareDependenciesAsync(entry, () -> activity.toast("依赖缓存已更新"));
+                            } else delete(entry);
                         }).setNegativeButton("取消", (back, cancel) -> details(entry)).show())
                 .setPositiveButton(entry.enabled ? "停用" : "启用", (d, w) -> toggle(entry))
                 .show();
@@ -216,6 +262,18 @@ final class ScriptTools {
         if (!script.excludes.isEmpty()) {
             message.append("\n\n排除网址");
             for (UserScript.UrlPattern row : script.excludes) message.append('\n').append(row.original);
+        }
+        if (!script.requires.isEmpty()) {
+            message.append("\n\n外部依赖 (@require)  ").append(script.requires.size()).append(" 项");
+        }
+        if (!script.resources.isEmpty()) {
+            message.append("\n外部资源 (@resource)  ").append(script.resources.size()).append(" 项");
+        }
+        if (!script.connects.isEmpty()) {
+            message.append("\n网络白名单 (@connect)  ").append(String.join("、", script.connects));
+        }
+        if (!script.updateUrl.isEmpty()) {
+            message.append("\n更新地址  ").append(script.updateUrl);
         }
         message.append("\n\n授权  ").append(script.grants.isEmpty() ? "无 GM 授权" : String.join("、", script.grants));
         return message.toString();

@@ -6,7 +6,7 @@ param(
     [string] $BuildTools,
     [string] $SigningKey = (Join-Path $PSScriptRoot 'build/local-preview.p12'),
     [string] $SigningAlias = 'aiko-preview',
-    [string] $OutputFile = (Join-Path $PSScriptRoot 'build/Aiko-Browser-0.3.1.apk')
+    [string] $OutputFile = (Join-Path $PSScriptRoot 'build/Aiko-Browser-0.4.0.apk')
 )
 $ErrorActionPreference = 'Stop'
 if (-not $AndroidJar -and $SdkRoot) { $AndroidJar = Join-Path $SdkRoot 'platforms/android-36/android.jar' }
@@ -88,16 +88,17 @@ $res = Join-Path $build 'resources.zip'
 $unsigned = Join-Path $build 'unsigned.apk'
 $aligned = Join-Path $build 'aligned.apk'
 $classJar = Join-Path $build 'classes.jar'
+$aaptKeep = Join-Path $build 'aapt-keep.pro'
 Run-Native $aapt @('compile','--dir',"$primary/res",'-o',$res)
 Run-Native $aapt @('link','-I',$AndroidJar,'--manifest',"$primary/AndroidManifest.xml",'--java',$generated,
-    '-A',"$primary/assets",'-o',$unsigned,$res)
+    '--proguard',$aaptKeep,'-A',"$primary/assets",'-o',$unsigned,$res)
 $sources = @(Get-ChildItem -Path "$primary/java",$generated -Recurse -Filter '*.java' | ForEach-Object FullName)
 $classpath = @($AndroidJar,$webkitJar,$coreJar,$annotations,$experimentalJar,$jspecify,$kotlinAnnotations) -join [IO.Path]::PathSeparator
 Run-Native $javac (@('--release','11','-encoding','UTF-8','-classpath',$classpath,'-d',$classes) + $sources)
 Run-Native $jar @('cf',$classJar,'-C',$classes,'.')
 Run-Native $java @('-cp',"$BuildTools/lib/d8.jar",'com.android.tools.r8.R8','--release','--min-api','29',
     '--lib',$AndroidJar,'--classpath',$annotations,'--classpath',$experimentalJar,'--classpath',$jspecify,'--classpath',$kotlinAnnotations,
-    '--pg-conf',"$PSScriptRoot/androidx-keep.pro",'--pg-conf',$webkitKeep,'--output',$dex,$classJar,$webkitJar,$coreJar)
+    '--pg-conf',"$PSScriptRoot/androidx-keep.pro",'--pg-conf',$aaptKeep,'--pg-conf',$webkitKeep,'--output',$dex,$classJar,$webkitJar,$coreJar)
 Run-Native $jar @('uf',$unsigned,'-C',$dex,'classes.dex')
 
 # Fix Windows aapt2.exe bug that writes backslashes into subdirectory asset paths (e.g. assets/filters\psl.txt.gz),
@@ -232,11 +233,14 @@ try {
 }
 Run-Native $zipalign @('-c','4',$OutputFile)
 Run-Native $java @('-jar',"$BuildTools/lib/apksigner.jar",'verify','--verbose',$OutputFile)
-$requiredAssets = @(
+$requiredAssets = [System.Collections.Generic.List[string]]@(
     Get-ChildItem -Path "$primary/assets" -Recurse -File | ForEach-Object {
         $rel = [IO.Path]::GetRelativePath($primary, $_.FullName).Replace('\', '/')
         $rel
     }
 )
-Run-Native $java (@($normalizerSrc,'verify',$OutputFile) + $requiredAssets)
+if (-not $requiredAssets.Contains('assets/babel/babel.js')) {
+    $requiredAssets.Add('assets/babel/babel.js')
+}
+Run-Native $java (@($normalizerSrc,'verify',$OutputFile) + $requiredAssets.ToArray())
 Get-Item -LiteralPath $OutputFile | Select-Object FullName,Length

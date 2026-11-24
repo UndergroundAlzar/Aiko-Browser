@@ -27,9 +27,19 @@ import androidx.webkit.WebViewStartUpConfig;
 import androidx.webkit.WebViewStartUpResult;
 import androidx.webkit.WebViewStartupException;
 
+import java.io.IOException;
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
+import java.net.Socket;
 import java.util.ArrayList;
+import java.util.Iterator;
+import java.util.LinkedHashMap;
+import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 
 /**
  * AndroidX WebKit 1.18.0 flagship performance pipeline:
@@ -38,14 +48,29 @@ import java.util.concurrent.Executors;
  */
 public final class WebViewPerf {
     private static final long PRECONNECT_TTL_NS = 10_000_000_000L;
+    private static final long PRECONNECT_HOST_TTL_NS = 45_000_000_000L;
     private static final long PREFETCH_TTL_NS = 15_000_000_000L;
     private static final long STARTUP_WATCHDOG_MS = 1500L;
     private static final long HUNG_RENDERER_GRACE_MS = 8000L;
     private static final int RECENT_ORIGINS_CAP = 24;
     private static final int RECENT_PREFETCH_CAP = 16;
+    private static final int HOST_PRECONNECT_CAP = 64;
+    private static final int HOST_PRECONNECT_TIMEOUT_MS = 1500;
 
-    private static final Handler MAIN = new Handler(Looper.getMainLooper());
+    private static final Handler MAIN;
+
+    static {
+        Handler mainHandler = null;
+        try {
+            mainHandler = new Handler(Looper.getMainLooper());
+        } catch (RuntimeException ignored) {
+            // Host JVM unit tests running against android.jar stubs
+        }
+        MAIN = mainHandler;
+    }
     private static final Object START_LOCK = new Object();
+    private static final Object HOST_PRECONNECT_LOCK = new Object();
+    private static final LinkedHashMap<String, Long> RECENT_HOST_PRECONNECT = new LinkedHashMap<>(32, 0.75f, true);
     private static final ArrayList<Runnable> PENDING_READY = new ArrayList<>(4);
     private static final ExecutorService STARTUP_EXEC = Executors.newSingleThreadExecutor(r -> {
         Thread t = new Thread(r, "aiko-wv-startup");
@@ -57,6 +82,21 @@ public final class WebViewPerf {
         t.setDaemon(true);
         return t;
     });
+    private static final ThreadPoolExecutor HOST_PRECONNECT_EXEC = createHostPreconnectPool();
+
+    private static ThreadPoolExecutor createHostPreconnectPool() {
+        ThreadPoolExecutor exec = new ThreadPoolExecutor(
+                2, 2, 30L, TimeUnit.SECONDS,
+                new LinkedBlockingQueue<>(32),
+                r -> {
+                    Thread t = new Thread(r, "aiko-host-preconnect");
+                    t.setDaemon(true);
+                    return t;
+                },
+                new ThreadPoolExecutor.DiscardOldestPolicy());
+        exec.allowCoreThreadTimeOut(true);
+        return exec;
+    }
 
     private static volatile boolean started;
     private static boolean starting;
@@ -442,6 +482,88 @@ public final class WebViewPerf {
                         @Override public void onError(PrefetchException error) { }
                     });
         } catch (Throwable ignored) { }
+    }
+
+    /**
+     * Non-blocking background DNS + lightweight TCP/TLS route warm-up for a target URL's host.
+     * Deduplicated per host:port with a 45-second cooldown on a bounded 2-thread daemon pool.
+     */
+    public static void preconnectHost(String url) {
+        if (!HttpUrlUtil.isHttp(url)) return;
+        String host = HttpUrlUtil.extractHost(url);
+        if (host.isEmpty()) return;
+        boolean https = url.length() >= 8 && url.regionMatches(true, 0, "https://", 0, 8);
+        int port = parseExplicitPort(url, https ? 443 : 80);
+        String key = host + ":" + port;
+        long now = System.nanoTime();
+        synchronized (HOST_PRECONNECT_LOCK) {
+            Long prev = RECENT_HOST_PRECONNECT.get(key);
+            if (prev != null && now - prev < PRECONNECT_HOST_TTL_NS) return;
+            RECENT_HOST_PRECONNECT.put(key, now);
+            if (RECENT_HOST_PRECONNECT.size() > HOST_PRECONNECT_CAP) {
+                Iterator<Map.Entry<String, Long>> it = RECENT_HOST_PRECONNECT.entrySet().iterator();
+                while (RECENT_HOST_PRECONNECT.size() > HOST_PRECONNECT_CAP && it.hasNext()) {
+                    it.next();
+                    it.remove();
+                }
+            }
+        }
+        final String targetHost = host.startsWith("[") && host.endsWith("]")
+                ? host.substring(1, host.length() - 1) : host;
+        final int targetPort = port;
+        try {
+            HOST_PRECONNECT_EXEC.execute(() -> {
+                try {
+                    InetAddress addr = InetAddress.getByName(targetHost);
+                    if (addr == null) return;
+                    try (Socket sock = new Socket()) {
+                        sock.connect(new InetSocketAddress(addr, targetPort), HOST_PRECONNECT_TIMEOUT_MS);
+                    }
+                } catch (IOException | RuntimeException ignored) { }
+            });
+        } catch (RuntimeException ignored) { }
+    }
+
+    private static int parseExplicitPort(String url, int defaultPort) {
+        int start = url.indexOf("://");
+        if (start < 0) return defaultPort;
+        start += 3;
+        int end = url.length();
+        for (int i = start; i < end; i++) {
+            char c = url.charAt(i);
+            if (c == '/' || c == '?' || c == '#') { end = i; break; }
+        }
+        if (start < end && url.charAt(start) == '[') {
+            int close = url.indexOf(']', start + 1);
+            if (close < 0 || close + 2 >= end || url.charAt(close + 1) != ':') return defaultPort;
+            return parsePortRange(url, close + 2, end, defaultPort);
+        }
+        int colon = url.indexOf(':', start);
+        if (colon < 0 || colon >= end) return defaultPort;
+        return parsePortRange(url, colon + 1, end, defaultPort);
+    }
+
+    private static int parsePortRange(String s, int from, int to, int fallback) {
+        if (from >= to || to - from > 5) return fallback;
+        int p = 0;
+        for (int i = from; i < to; i++) {
+            char c = s.charAt(i);
+            if (c < '0' || c > '9') return fallback;
+            p = p * 10 + (c - '0');
+        }
+        return (p > 0 && p <= 65535) ? p : fallback;
+    }
+
+    /**
+     * Returns the smart tab-dormancy active WebView cap for a PerfProfiles.Profile:
+     * Rampage -> 12, Balanced -> 6, Eco -> 3, custom profiles scaled cleanly in [3, 12].
+     */
+    public static int maxActiveTabsForProfile(PerfProfiles.Profile p) {
+        if (p == null) return 6;
+        if (PerfProfiles.ID_RAMPAGE.equals(p.id)) return 12;
+        if (PerfProfiles.ID_BALANCED.equals(p.id)) return 6;
+        if (PerfProfiles.ID_ECO.equals(p.id)) return 3;
+        return Math.max(3, Math.min(12, p.maxHotTabs));
     }
 
     public static int recommendedHotTabs(Context ctx) {

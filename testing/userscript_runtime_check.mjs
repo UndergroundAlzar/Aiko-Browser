@@ -154,4 +154,193 @@ for (const [url, frame] of [
     assert.equal(ctx.events[1].remote, true);
     assert.equal(ctx.events[1].newEnabled, false);
 }
-console.log('PASS script runtime timing, document deduplication, privileges, storage messages, value listeners and URL/frame scope');
+
+// Verify v0.4.0 Tampermonkey APIs: GM_xmlhttpRequest, GM.xmlHttpRequest, GM_getResourceText/URL,
+// bidirectional GM_registerMenuCommand / GM_unregisterMenuCommand, and GM_download!
+{
+    const remoteListeners = [];
+    const posted = [];
+    const document = {
+        readyState: 'complete',
+        addEventListener() {},
+        head: {appendChild() {}},
+        body: {appendChild() {}},
+        createElement(tag) { return {tag, attrs: {}, setAttribute(k, v) { this.attrs[k] = v; }, appendChild() {}}; }
+    };
+    const bridgeObj = {
+        postMessage(msg) { posted.push(JSON.parse(msg)); },
+        addEventListener(type, fn) { if (type === 'message') remoteListeners.push(fn); }
+    };
+    const sendNative = (obj) => {
+        const raw = JSON.stringify(obj);
+        for (const fn of remoteListeners) fn({data: raw});
+    };
+    const ctx = vm.createContext({
+        location: new URL('https://app.example.com/dashboard'),
+        URL, TextEncoder, TextDecoder, atob, btoa,
+        document,
+        console: {log() {}, warn() {}},
+        __aikoScriptValues: bridgeObj,
+        requestIdleCallback(fn) { fn(); },
+        setTimeout(fn) { fn(); }
+    });
+    ctx.window = ctx;
+    ctx.top = ctx;
+
+    const pngB64 = Buffer.from([0x89, 0x50, 0x4E, 0x47]).toString('base64');
+    const cfg = {
+        id: 'tm-v040', release: '0.4.0', runAt: 'document-start',
+        includes: [['https', 'app.example.com', false, -1, '/*']],
+        excludes: [],
+        grants: [
+            'GM_xmlhttpRequest', 'GM.xmlHttpRequest',
+            'GM_getResourceText', 'GM.getResourceText',
+            'GM_getResourceURL', 'GM.getResourceURL',
+            'GM_registerMenuCommand', 'GM_unregisterMenuCommand',
+            'GM_download'
+        ],
+        storage: false,
+        bridgeEnabled: true,
+        script: {name: 'TM Full', namespace: 'aiko.test', version: '2.0.0'},
+        resources: {
+            themeCss: {mime: 'text/css', text: 'body { color: #7C9BFF; } /* 中文 */'},
+            iconBin: {mime: 'image/png', b64: pngB64}
+        },
+        values: {}
+    };
+
+    vm.runInContext(`(${program})(${JSON.stringify(cfg)},${JSON.stringify(`
+        window.resText = GM_getResourceText('themeCss');
+        window.resUrl = GM_getResourceURL('themeCss');
+        window.resBinUrl = GM_getResourceURL('iconBin');
+        window.resMissing = GM_getResourceText('nope');
+        window.resAsyncText = GM.getResourceText('themeCss');
+        window.resAsyncUrl = GM.getResourceURL('iconBin');
+
+        window.menuClicks = 0;
+        window.cmd1 = GM_registerMenuCommand('Open Settings', () => { window.menuClicks++; });
+        window.cmd2 = GM_registerMenuCommand('Temp Action', () => { window.menuClicks += 100; });
+        GM_unregisterMenuCommand(window.cmd2);
+
+        window.xhrEvents = [];
+        window.xhrHandle1 = GM_xmlhttpRequest({
+            method: 'POST',
+            url: 'https://api.example.com/data',
+            headers: {'X-Test': '1'},
+            data: '{"ping":true}',
+            responseType: 'json',
+            context: 'ctx-1',
+            onreadystatechange(r) { window.xhrEvents.push('rs:' + r.readyState); },
+            onload(r) { window.xhrResult1 = r; window.xhrEvents.push('load'); },
+            onloadend(r) { window.xhrEvents.push('end:' + r.status); }
+        });
+
+        window.xhrAbortFired = false;
+        window.xhrHandle2 = GM_xmlhttpRequest({
+            method: 'GET',
+            url: '/relative-bin',
+            responseType: 'arraybuffer',
+            onabort() { window.xhrAbortFired = true; }
+        });
+        window.xhrHandle2.abort();
+
+        window.xhrBinPromise = GM.xmlHttpRequest({
+            method: 'GET',
+            url: 'https://api.example.com/bin',
+            responseType: 'arraybuffer'
+        });
+
+        window.xhrErrPromise = GM.xmlHttpRequest({
+            method: 'GET',
+            url: 'https://blocked.example.com/secret'
+        }).catch(err => ({caught: true, error: err.error}));
+
+        window.dlLoaded = false;
+        GM_download({url: 'https://cdn.example.com/file.zip', name: 'file.zip', onload() { window.dlLoaded = true; }});
+    `)});`, ctx);
+
+    // 1. Resources checks
+    assert.equal(ctx.resText, 'body { color: #7C9BFF; } /* 中文 */');
+    assert.ok(ctx.resUrl.startsWith('data:text/css;base64,'));
+    assert.equal(Buffer.from(ctx.resUrl.split(',')[1], 'base64').toString('utf8'), ctx.resText);
+    assert.equal(ctx.resBinUrl, 'data:image/png;base64,' + pngB64);
+    assert.equal(ctx.resMissing, null);
+    assert.equal(await ctx.resAsyncText, ctx.resText);
+    assert.equal(await ctx.resAsyncUrl, ctx.resBinUrl);
+
+    // 2. Menu commands bidirectional registration + invocation + unregister
+    const menuRegs = posted.filter(m => m[1] === 'menu_reg');
+    const menuUnregs = posted.filter(m => m[1] === 'menu_unreg');
+    assert.equal(menuRegs.length, 2);
+    assert.equal(menuRegs[0][2], ctx.cmd1);
+    assert.equal(menuRegs[0][3], 'Open Settings');
+    assert.equal(menuUnregs.length, 1);
+    assert.equal(menuUnregs[0][2], ctx.cmd2);
+
+    sendNative({type: 'menu_invoke', cmdId: ctx.cmd1});
+    sendNative({type: 'menu_invoke', cmdId: ctx.cmd2}); // unregistered -> must not run!
+    assert.equal(ctx.menuClicks, 1, 'invoking registered command calls handler, unregistered ignored');
+
+    // 3. GM_xmlhttpRequest POST JSON + callbacks + abort + binary arraybuffer + error rejection
+    const xhrPosts = posted.filter(m => m[1] === 'xhr').map(m => JSON.parse(m[2]));
+    const xhrAborts = posted.filter(m => m[1] === 'xhr_abort');
+    assert.equal(xhrPosts.length, 4);
+    assert.equal(xhrPosts[0].method, 'POST');
+    assert.equal(xhrPosts[0].url, 'https://api.example.com/data');
+    assert.equal(xhrPosts[1].url, 'https://app.example.com/relative-bin', 'relative URL resolved');
+    assert.equal(xhrAborts.length, 1);
+    assert.equal(xhrAborts[0][2], xhrPosts[1].id);
+    assert.equal(ctx.xhrAbortFired, true);
+
+    sendNative({
+        type: 'xhr_done',
+        id: xhrPosts[0].id,
+        status: 200,
+        statusText: 'OK',
+        finalUrl: 'https://api.example.com/data',
+        responseHeaders: 'Content-Type: application/json\r\n',
+        contentType: 'application/json',
+        binary: false,
+        body: '{"ok":true,"n":42}'
+    });
+    assert.equal(ctx.xhrResult1.status, 200);
+    assert.equal(ctx.xhrResult1.context, 'ctx-1');
+    assert.deepEqual({...ctx.xhrResult1.response}, {ok: true, n: 42});
+    assert.deepEqual(Array.from(ctx.xhrEvents), ['rs:4', 'load', 'end:200']);
+
+    const binPayload = Buffer.from([1, 2, 3, 255]).toString('base64');
+    sendNative({
+        type: 'xhr_done',
+        id: xhrPosts[2].id,
+        status: 200,
+        statusText: 'OK',
+        finalUrl: 'https://api.example.com/bin',
+        responseHeaders: 'Content-Type: application/octet-stream\r\n',
+        contentType: 'application/octet-stream',
+        binary: true,
+        body: binPayload
+    });
+    const binRes = await ctx.xhrBinPromise;
+    assert.deepEqual(Array.from(new Uint8Array(binRes.response)), [1, 2, 3, 255]);
+
+    sendNative({
+        type: 'xhr_error',
+        id: xhrPosts[3].id,
+        status: 0,
+        statusText: '',
+        finalUrl: 'https://blocked.example.com/secret',
+        error: '@connect denied for host: blocked.example.com'
+    });
+    const errRes = await ctx.xhrErrPromise;
+    assert.equal(errRes.caught, true);
+    assert.ok(errRes.error.includes('@connect denied'));
+
+    // 4. GM_download check
+    const downloads = posted.filter(m => m[1] === 'download');
+    assert.equal(downloads.length, 1);
+    assert.equal(downloads[0][2], 'https://cdn.example.com/file.zip');
+    assert.equal(downloads[0][3], 'file.zip');
+    assert.equal(ctx.dlLoaded, true);
+}
+
+console.log('PASS script runtime timing, document deduplication, privileges, storage messages, value listeners, XHR, resources, menu commands, downloads and URL/frame scope');
