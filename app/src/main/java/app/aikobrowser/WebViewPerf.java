@@ -2,6 +2,7 @@ package app.aikobrowser;
 
 import android.app.ActivityManager;
 import android.content.Context;
+import android.content.pm.PackageInfo;
 import android.net.ConnectivityManager;
 import android.os.Build;
 import android.os.Bundle;
@@ -231,6 +232,82 @@ public final class WebViewPerf {
                     active ? WebView.RENDERER_PRIORITY_IMPORTANT : WebView.RENDERER_PRIORITY_BOUND,
                     !active);
         } catch (RuntimeException ignored) { }
+    }
+
+    /**
+     * Applies a PerfProfiles.Profile to a WebView: BFCache depth/timeout, Speculative Loading
+     * (prerender), and foreground-only Offscreen Pre-Raster.
+     */
+    public static void applyProfile(WebView web, PerfProfiles.Profile profile,
+                                    boolean isPrivate, boolean isLowRam, boolean activeTab) {
+        if (web == null) return;
+        PerfProfiles.Profile p = profile != null ? profile : PerfProfiles.preset(PerfProfiles.ID_BALANCED);
+        WebSettings settings = web.getSettings();
+
+        try {
+            if (WebViewFeature.isFeatureSupported(WebViewFeature.BACK_FORWARD_CACHE)) {
+                int pages = isLowRam ? 0 : (isPrivate ? Math.min(2, p.bfCachePages) : p.bfCachePages);
+                boolean enableBf = pages > 0;
+                WebSettingsCompat.setBackForwardCacheEnabled(settings, enableBf);
+                if (enableBf && WebViewFeature.isFeatureSupported(WebViewFeature.BACK_FORWARD_CACHE_SETTINGS)) {
+                    BackForwardCacheSettings bfc = WebSettingsCompat.getBackForwardCacheSettings(settings);
+                    if (bfc != null) {
+                        bfc.setMaxPagesInCache(pages);
+                        bfc.setTimeoutSeconds(isPrivate ? 120L : (pages >= 4 ? 600L : 300L));
+                        bfc.setKeepForwardEntriesEnabled(true);
+                    }
+                }
+            }
+        } catch (Throwable ignored) { }
+
+        try {
+            if (WebViewFeature.isFeatureSupported(WebViewFeature.SPECULATIVE_LOADING)) {
+                boolean enablePrerender = p.preloadLevel == PerfProfiles.PRELOAD_AGGRESSIVE
+                        && !isLowRam && !isPrivate;
+                WebSettingsCompat.setSpeculativeLoadingStatus(settings,
+                        enablePrerender ? WebSettingsCompat.SPECULATIVE_LOADING_PRERENDER_ENABLED
+                                : WebSettingsCompat.SPECULATIVE_LOADING_DISABLED);
+            }
+        } catch (Throwable ignored) { }
+
+        setActivePreRaster(web, activeTab && p.activePreRaster && !isLowRam);
+    }
+
+    /**
+     * Toggles Offscreen Pre-Raster on a single WebView. Callers MUST enable this only on
+     * the single active foreground tab and disable it on inactive tabs and onTrimMemory().
+     */
+    public static void setActivePreRaster(WebView web, boolean enable) {
+        if (web == null) return;
+        try {
+            web.getSettings().setOffscreenPreRaster(enable);
+        } catch (RuntimeException ignored) { }
+    }
+
+    /** Human-readable Android System WebView / Chromium version summary for the About panel. */
+    public static String webViewVersionSummary(Context ctx) {
+        try {
+            PackageInfo pkg = ctx != null ? WebViewCompat.getCurrentWebViewPackage(ctx) : null;
+            if (pkg == null) pkg = WebViewCompat.getCurrentLoadedWebViewPackage();
+            if (pkg == null) return "系统 WebView (未知版本)";
+            String ver = (pkg.versionName != null && !pkg.versionName.isEmpty()) ? pkg.versionName : "未知";
+            String name;
+            String pkgName = pkg.packageName;
+            if ("com.google.android.webview".equals(pkgName) || "com.android.webview".equals(pkgName)) {
+                name = "Android System WebView";
+            } else if ("com.android.chrome".equals(pkgName)) {
+                name = "Chrome WebView";
+            } else if ("com.google.android.trichromelibrary".equals(pkgName)) {
+                name = "Trichrome WebView";
+            } else if (pkgName != null && !pkgName.isEmpty()) {
+                name = pkgName;
+            } else {
+                name = "Chromium WebView";
+            }
+            return name + " " + ver;
+        } catch (Throwable ignored) {
+            return "系统 WebView (未知版本)";
+        }
     }
 
     @SuppressWarnings("deprecation")

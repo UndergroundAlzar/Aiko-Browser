@@ -45,6 +45,8 @@ final class RangeDownload {
     final URL url;
     final File part;
     final int requested;
+    private final int originalRequested;
+    private final int maxConcurrency;
     final Control control = new Control();
     private final File checkpoint;
     private final String userAgent, cookie;
@@ -57,15 +59,27 @@ final class RangeDownload {
     private String etag, sourceId;
     private URL source;
 
+    static int clampLanes(int lanes) {
+        return Math.min(MAX_LANES, Math.max(1, lanes));
+    }
+
     RangeDownload(URL url, File part, int requested, String userAgent, String cookie) {
-        this(url, part, requested, userAgent, cookie, new TransferPacer(), () -> {});
+        this(url, part, requested, MAX_LANES, userAgent, cookie, new TransferPacer(), () -> {});
     }
 
     RangeDownload(URL url, File part, int requested, String userAgent, String cookie,
                   TransferPacer pacer, Runnable workerSetup) {
+        this(url, part, requested, MAX_LANES, userAgent, cookie, pacer, workerSetup);
+    }
+
+    RangeDownload(URL url, File part, int requested, int maxLanesLimit, String userAgent, String cookie,
+                  TransferPacer pacer, Runnable workerSetup) {
+        int cap = clampLanes(maxLanesLimit);
         this.url = url;
         this.part = part;
-        this.requested = Math.min(MAX_LANES, Math.max(1, requested));
+        this.originalRequested = clampLanes(requested);
+        this.maxConcurrency = cap;
+        this.requested = Math.min(cap, this.originalRequested);
         this.userAgent = userAgent;
         this.cookie = cookie;
         this.pacer = pacer;
@@ -133,9 +147,11 @@ final class RangeDownload {
             close(probe);
         }
         int count = (int) Math.min(requested, Math.max(1, total / MIN_SEGMENT_BYTES));
+        int origCount = (int) Math.min(originalRequested, Math.max(1, total / MIN_SEGMENT_BYTES));
         SavedRanges recovered = readSavedRanges();
         if (recovered != null && recovered.source.equals(sourceId) && recovered.etag.equals(etag)
-                && recovered.total == total && recovered.segments.size() == count) {
+                && recovered.total == total
+                && (recovered.segments.size() == count || recovered.segments.size() == origCount)) {
             segments = recovered.segments;
         } else {
             Files.deleteIfExists(checkpoint.toPath());
@@ -152,7 +168,8 @@ final class RangeDownload {
     }
 
     private void rangedTransfer() throws IOException {
-        ExecutorService workers = Executors.newFixedThreadPool(segments.size(), runnable ->
+        int poolSize = Math.max(1, Math.min(segments.size(), maxConcurrency));
+        ExecutorService workers = Executors.newFixedThreadPool(poolSize, runnable ->
                 new Thread(() -> {
                     workerSetup.run();
                     runnable.run();

@@ -25,17 +25,47 @@ import java.io.InputStream;
 import java.net.URI;
 import java.util.*;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
 
 /** Owns the normal profile's locally installed scripts and WebView registrations. */
-final class UserScripts {
+public final class UserScripts {
     private static final String BRIDGE = "__aikoScriptValues";
     private static final String PREFS_LIST = "userscripts";
     private static final String PREFS_VALUES = "userscript_values";
-    private static final String RELEASE = "0.2.0";
-    private static final int MAX_SCRIPTS = 24, MAX_SOURCES = 1024 * 1024, MAX_VALUE_CHARS = 32768;
+    private static final String RELEASE = "0.3.0";
+    private static final int MAX_SCRIPTS = 24, MAX_SOURCES = 2 * 1024 * 1024, MAX_VALUE_CHARS = 32768;
     private static final long FLUSH_DELAY_MS = 400L;
     private static final long REBIND_FALLBACK_MS = 600L;
+    private static final ExecutorService REMOTE_EXEC = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(() -> {
+            try { Process.setThreadPriority(Process.THREAD_PRIORITY_BACKGROUND); }
+            catch (RuntimeException ignored) { }
+            r.run();
+        }, "aiko-script-remote");
+        t.setDaemon(true);
+        return t;
+    });
+
+    /** Result of fetching and parsing a remote .user.js install URL. */
+    public static final class RemoteScript {
+        public final String url, source, error;
+        public final UserScript parsed;
+        public final boolean isUpdate;
+        public final String existingId;
+
+        RemoteScript(String url, String source, String error, UserScript parsed,
+                     boolean isUpdate, String existingId) {
+            this.url = url;
+            this.source = source;
+            this.error = error;
+            this.parsed = parsed;
+            this.isUpdate = isUpdate;
+            this.existingId = existingId;
+        }
+    }
 
     private final Context app;
     private final Handler handler = new Handler(Looper.getMainLooper());
@@ -74,10 +104,10 @@ final class UserScripts {
         }
     }
 
-    static final class Entry {
-        final String id;
-        final UserScript script;
-        boolean enabled;
+    public static final class Entry {
+        public final String id;
+        public final UserScript script;
+        public boolean enabled;
         String program;
         String quotedCode;
         String beforeValues, afterValues;
@@ -160,8 +190,144 @@ final class UserScripts {
         }
     }
 
-    UserScripts(Context context) {
+    public UserScripts(Context context) {
         app = context.getApplicationContext();
+    }
+
+    /** Detects HTTP(S) .user.js install URLs (Greasy Fork, Sleazy Fork, ScriptCat, OpenUserJS, GitHub raw, etc.). */
+    public static boolean isUserScriptUrl(String url) {
+        return UserScript.isUserScriptUrl(url);
+    }
+
+    /** Detects whether a Content-Disposition or download filename ends with .user.js. */
+    public static boolean isUserScriptFilename(String filename) {
+        return UserScript.isUserScriptFilename(filename);
+    }
+
+    /**
+     * Asynchronously downloads (15s timeout, 512 KiB max) and parses a remote .user.js script.
+     * Always invokes onDone on the main thread.
+     */
+    public void fetchRemoteScript(String url, Consumer<RemoteScript> onDone) {
+        if (onDone == null) return;
+        if (UserScriptInput.safeRemoteAddress(url) == null) {
+            handler.post(() -> onDone.accept(new RemoteScript(url, null, "无效的脚本链接", null, false, null)));
+            return;
+        }
+        REMOTE_EXEC.execute(() -> {
+            String downloadedSource = null;
+            try {
+                UserScriptInput.Downloaded downloaded = UserScriptInput.downloadRemote(url, UserScript.MAX_BYTES);
+                downloadedSource = downloaded.source;
+                UserScript parsed = UserScript.parse(downloadedSource);
+                final String finalSource = downloadedSource;
+                handler.post(() -> {
+                    Entry existing = findExisting(parsed);
+                    onDone.accept(new RemoteScript(
+                            url, finalSource, null, parsed,
+                            existing != null, existing != null ? existing.id : null));
+                });
+            } catch (IOException | RuntimeException error) {
+                final String src = downloadedSource;
+                String msg = error.getMessage();
+                final String reason = (msg == null || msg.trim().isEmpty()) ? "无法读取脚本，请检查网络连接" : msg;
+                handler.post(() -> onDone.accept(new RemoteScript(url, src, reason, null, false, null)));
+            }
+        });
+    }
+
+    /**
+     * Installs or updates a fetched remote script and enables it immediately.
+     * Updating preserves the existing script ID and all saved GM_setValue storage.
+     * Invokes onError on the main thread with null on success or a readable error message.
+     */
+    public void installRemote(RemoteScript remote, Consumer<String> onError) {
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            handler.post(() -> installRemote(remote, onError));
+            return;
+        }
+        if (remote == null || remote.parsed == null || remote.error != null) {
+            String msg = (remote != null && remote.error != null) ? remote.error : "无效的脚本数据";
+            postError(onError, msg);
+            return;
+        }
+        try {
+            load();
+            UserScript script = remote.parsed;
+            Entry previous = null;
+            if (remote.existingId != null) {
+                for (Entry item : entries) {
+                    if (item.id.equals(remote.existingId)) {
+                        previous = item;
+                        break;
+                    }
+                }
+            }
+            if (previous == null) previous = findExisting(script);
+
+            int totalChars = script.source.length();
+            for (Entry item : entries) if (item != previous) totalChars += item.script.source.length();
+            if (totalChars > MAX_SOURCES || (previous == null && entries.size() >= MAX_SCRIPTS)) {
+                postError(onError, "最多保存 24 个脚本，源码总量不能超过约 2 MiB。");
+                return;
+            }
+            Entry collision = duplicate(script);
+            if (collision != null && collision != previous) {
+                postError(onError, "已有同名、同命名空间的脚本。");
+                return;
+            }
+            Entry next = new Entry(previous == null ? UUID.randomUUID().toString() : previous.id, script, true);
+            String incompat = compatibility(next);
+            if (!incompat.isEmpty()) {
+                postError(onError, incompat);
+                return;
+            }
+            flushValues();
+            if (previous != null && script.needsStorage() && previous.serializedValues != null) {
+                next.serializedValues = previous.serializedValues;
+            }
+            if (previous == null) entries.add(next);
+            else entries.set(entries.indexOf(previous), next);
+            saveList();
+            refreshViews();
+            postError(onError, null);
+        } catch (RuntimeException error) {
+            String msg = error.getMessage();
+            postError(onError, (msg == null || msg.trim().isEmpty()) ? "安装脚本失败" : msg);
+        }
+    }
+
+    /** Returns all currently enabled scripts whose @match/@include rules match the given URL. */
+    public List<UserScript> matchingForUrl(String url) {
+        URI address = UserScript.address(url);
+        if (address == null) return Collections.emptyList();
+        load();
+        ArrayList<UserScript> matched = new ArrayList<>();
+        for (Entry entry : entries) {
+            if (entry.enabled && entry.script.matches(address)) {
+                matched.add(entry.script);
+            }
+        }
+        return matched;
+    }
+
+    private void postError(Consumer<String> onError, String message) {
+        if (onError != null) handler.post(() -> onError.accept(message));
+    }
+
+    private Entry findExisting(UserScript parsed) {
+        load();
+        for (Entry entry : entries) {
+            if (entry.script.name.equals(parsed.name) && entry.script.namespace.equals(parsed.namespace)) {
+                return entry;
+            }
+        }
+        if (parsed.namespace.isEmpty()) {
+            for (Entry entry : entries) {
+                if (entry.script.name.equals(parsed.name)) return entry;
+            }
+        }
+        return null;
     }
 
     /** Preload saved scripts, values, and runtime.js off the UI thread. */
@@ -263,7 +429,7 @@ final class UserScripts {
         int count = script.source.length();
         for (Entry item : entries) if (item != previous) count += item.script.source.length();
         if (count > MAX_SOURCES || (previous == null && entries.size() >= MAX_SCRIPTS))
-            throw new IllegalArgumentException("最多保存 24 个脚本，源码总量不能超过约 1 MiB。");
+            throw new IllegalArgumentException("最多保存 24 个脚本，源码总量不能超过约 2 MiB。");
         Entry collision = duplicate(script);
         if (collision != null && collision != previous)
             throw new IllegalArgumentException("已有同名、同命名空间的脚本。");

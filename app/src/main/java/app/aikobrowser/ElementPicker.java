@@ -1,5 +1,7 @@
 package app.aikobrowser;
 
+import android.animation.Animator;
+import android.animation.AnimatorListenerAdapter;
 import android.content.Context;
 import android.net.Uri;
 import android.text.TextUtils;
@@ -46,12 +48,30 @@ final class ElementPicker {
     private WebMessagePortCompat localPort;
     private String currentSelector = "";
     private boolean previewHidden;
+    private int safeLeft, safeRight, safeBottom;
 
     ElementPicker(Context ctx, FrameLayout hostOverlay, Callback callback) {
         this.ctx = ctx;
         this.hostOverlay = hostOverlay;
         this.density = ctx.getResources().getDisplayMetrics().density;
         this.callback = callback;
+        this.safeBottom = AikoTheme.dp(density, 68);
+    }
+
+    void setSafeInsets(int leftPx, int rightPx, int deckTotalHeightPx) {
+        safeLeft = Math.max(0, leftPx);
+        safeRight = Math.max(0, rightPx);
+        safeBottom = Math.max(AikoTheme.dp(density, 68), deckTotalHeightPx + AikoTheme.dp(density, 10));
+        if (bar != null) {
+            FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams) bar.getLayoutParams();
+            int m = AikoTheme.dp(density, 10);
+            int l = safeLeft + m;
+            int r = safeRight + m;
+            if (lp != null && (lp.leftMargin != l || lp.rightMargin != r || lp.bottomMargin != safeBottom)) {
+                lp.setMargins(l, 0, r, safeBottom);
+                bar.setLayoutParams(lp);
+            }
+        }
     }
 
     boolean isActive() {
@@ -70,13 +90,24 @@ final class ElementPicker {
         selectorView.setText("点按页面上的广告或悬浮栏");
         countView.setText(normalizedHost);
         updateButtons();
+        bar.animate().setListener(null).cancel();
+        bar.setLayerType(View.LAYER_TYPE_NONE, null);
         bar.setVisibility(View.VISIBLE);
         bar.setTranslationY(AikoTheme.dp(density, 20));
         bar.setAlpha(0f);
-        bar.animate().translationY(0f).alpha(1f).setDuration(140)
-                .setInterpolator(AikoTheme.EASE_OUT)
+        bar.animate().translationY(0f).alpha(1f).setDuration(150)
+                .setInterpolator(AikoTheme.EMPHASIZED_DECEL)
                 .withLayer()
-                .withEndAction(() -> bar.setLayerType(View.LAYER_TYPE_NONE, null))
+                .setListener(new AnimatorListenerAdapter() {
+                    @Override public void onAnimationEnd(Animator a) {
+                        bar.setLayerType(View.LAYER_TYPE_NONE, null);
+                        bar.animate().setListener(null);
+                    }
+                    @Override public void onAnimationCancel(Animator a) {
+                        bar.setLayerType(View.LAYER_TYPE_NONE, null);
+                        bar.animate().setListener(null);
+                    }
+                })
                 .start();
 
         final String nonce = "aiko-pick-" + Long.toHexString(System.nanoTime() ^ System.identityHashCode(this));
@@ -186,7 +217,7 @@ final class ElementPicker {
 
         FrameLayout.LayoutParams blp = new FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM);
         int m = AikoTheme.dp(density, 10);
-        blp.setMargins(m, 0, m, AikoTheme.dp(density, 68));
+        blp.setMargins(safeLeft + m, 0, safeRight + m, safeBottom);
         hostOverlay.addView(bar, blp);
     }
 
@@ -198,8 +229,9 @@ final class ElementPicker {
         btn.setTextColor(fg);
         btn.setGravity(Gravity.CENTER);
         btn.setSingleLine(true);
-        btn.setBackground(AikoTheme.rounded(bg, AikoTheme.dp(density, 12)));
+        btn.setBackground(AikoTheme.card(bg, bg == AikoTheme.ACCENT ? 0 : AikoTheme.STROKE, density, AikoTheme.dp(density, 12)));
         btn.setForeground(AikoTheme.ripple(AikoTheme.RIPPLE_LIGHT, AikoTheme.dp(density, 12)));
+        AikoTheme.attachPressFeedback(btn, 0.93f);
         btn.setOnClickListener(v -> onClick.run());
         return btn;
     }

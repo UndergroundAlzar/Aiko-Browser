@@ -14,8 +14,10 @@ final class FilterRules {
     private static final int BINARY_MAGIC = 0x41494B46; // "AIKF"
     private static final int BINARY_END = 0x464B4941;   // "FKIA"
     private static final int BINARY_VERSION = 1;
-    private static final int MAX_BINARY_ITEMS = 500_000;
-    private static final int MAX_EVIDENCE_BYTES = 16 * 1024 * 1024;
+    private static final int MAX_BINARY_ITEMS = 600_000;
+    private static final int MAX_EVIDENCE_BYTES = 24 * 1024 * 1024;
+    private static final int MAX_RULE_LINE_CHARS = 4096;
+    private static final int MAX_UNIQUE_LINES = 450_000;
 
     private static final int FLAG_ALLOW = 1 << 16;
     private static final int FLAG_COSMETIC_ONLY = 1 << 17;
@@ -466,7 +468,7 @@ final class FilterRules {
     }
 
     private static void registerSource(String source, List<String> list, Map<String, Integer> ids) {
-        if (source != null && !ids.containsKey(source)) {
+        if (source != null && !ids.containsKey(source) && list.size() < 255) {
             ids.put(source, list.size());
             list.add(source);
         }
@@ -553,7 +555,8 @@ final class FilterRules {
         out.writeInt(r.mask);
         writeVarInt(out, r.evidenceStart);
         writeVarInt(out, r.evidenceEnd - r.evidenceStart);
-        out.writeByte(r.source == null ? 0xFF : sourceIds.get(r.source));
+        Integer srcId = r.source == null ? null : sourceIds.get(r.source);
+        out.writeByte(srcId == null || srcId >= 255 ? 0xFF : srcId);
         if (r.pattern == null) {
             out.writeByte(0);
         } else if (r.pattern instanceof String) {
@@ -1313,7 +1316,7 @@ final class FilterRules {
                     if (len == 0) continue;
                     char first = line.charAt(0);
                     if (first == '!' || first == '[') continue;
-                    if (len > 1500 || uniqueLines >= 200000) { skipped++; continue; }
+                    if (len > MAX_RULE_LINE_CHARS || uniqueLines >= MAX_UNIQUE_LINES) { skipped++; continue; }
                     String target = disabledRule(line);
                     if (target != null) {
                         disabled.add(target);
@@ -1593,7 +1596,9 @@ final class FilterRules {
             Scope scope = Scope.parse(text, 0, index, ',');
             if (scope == null || scope.include.length == 0) return false;
             String selector = text.substring(selStart);
-            Cosmetic rule = new Cosmetic(scope, selector, allow);
+            // Indexed exclusively under each domain in scope.include; lookup already guarantees include matches.
+            Scope matchScope = scope.exclude.length == 0 ? Scope.ANY : new Scope(Scope.EMPTY, scope.exclude);
+            Cosmetic rule = new Cosmetic(matchScope, selector, allow);
             for (int i = 0; i < scope.include.length; i++) cosmetics.add(scope.include[i], rule);
             cosmeticCount++;
             return true;

@@ -10,6 +10,7 @@ import android.os.Build;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.Looper;
+import android.os.PerformanceHintManager;
 import android.os.Process;
 import android.os.SystemClock;
 import android.provider.Settings;
@@ -50,12 +51,18 @@ public final class DisplayModeEngine {
     private final ArrayList<WeakReference<View>> attachedViews = new ArrayList<>(4);
     private DisplayManager displayManager;
     private boolean listenerRegistered;
+    private boolean profileApplied;
     private int policy;
+    private boolean adpfEnabled;
     private boolean fullscreenVideo;
     private boolean siteForceMaxHz;
     private volatile float cachedActiveHz;
     private volatile float cachedMaxHz;
     private volatile HudListener hudListener;
+    private int uiTid;
+    // Holds AdpfHelper on API 31+ only; typed as Object so API 29-30 never loads PerformanceHintManager.
+    private Object adpfController;
+    private final Runnable adpfSettleTask = this::settleAdpfBurst;
 
     // Live frame-pacing telemetry state (allocated ONLY when HUD is enabled).
     private HandlerThread hudThread;
@@ -77,6 +84,9 @@ public final class DisplayModeEngine {
         this.activity = activity;
         this.appContext = activity.getApplicationContext();
         this.policy = loadPolicy(appContext);
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            this.uiTid = Process.myTid();
+        }
         this.displayManager = (DisplayManager) activity.getSystemService(Context.DISPLAY_SERVICE);
         updateCachedRates(currentDisplay());
     }
@@ -171,7 +181,10 @@ public final class DisplayModeEngine {
     }
 
     public void start() {
-        policy = loadPolicy(appContext);
+        if (!profileApplied) policy = loadPolicy(appContext);
+        if (uiTid <= 0 && Looper.myLooper() == Looper.getMainLooper()) {
+            uiTid = Process.myTid();
+        }
         if (!listenerRegistered && displayManager != null) {
             try {
                 if (Build.VERSION.SDK_INT >= 36) {
@@ -187,6 +200,7 @@ public final class DisplayModeEngine {
             } catch (RuntimeException ignored) { }
         }
         apply();
+        if (adpfEnabled) ensureAdpfSession();
         if (hudListener != null) startFrameMetrics();
     }
 
@@ -196,7 +210,73 @@ public final class DisplayModeEngine {
             catch (RuntimeException ignored) { }
             listenerRegistered = false;
         }
+        closeAdpfSession();
         stopFrameMetrics();
+    }
+
+    /**
+     * Applies a PerfProfiles.Profile: updates display refresh policy and manages
+     * the Android 12+ (API 31+) ADPF PerformanceHintManager session cleanly.
+     */
+    public void applyProfile(PerfProfiles.Profile p) {
+        if (p == null) return;
+        profileApplied = true;
+        policy = clampPolicy(p.refreshPolicy);
+        adpfEnabled = p.adpfBoost;
+        apply();
+        if (adpfEnabled) {
+            if (listenerRegistered) ensureAdpfSession();
+        } else {
+            closeAdpfSession();
+        }
+    }
+
+    /**
+     * Event-driven burst-only ADPF interaction boost (touch-down / fling start / page nav start).
+     * Never called per-frame; rate-limited against HAL preferred update rate and decays automatically.
+     */
+    public void boostInteraction(long durationMs) {
+        if (!adpfEnabled || fullscreenVideo || !listenerRegistered || Build.VERSION.SDK_INT < 31) return;
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            main.post(() -> boostInteraction(durationMs));
+            return;
+        }
+        if (uiTid <= 0) uiTid = Process.myTid();
+        long targetNs = targetWorkDurationNs();
+        long clampedMs = Math.max(40L, Math.min(durationMs, 1500L));
+        AdpfHelper helper = adpfHelper();
+        if (helper.boost(appContext, uiTid, targetNs, clampedMs)) {
+            main.removeCallbacks(adpfSettleTask);
+            main.postDelayed(adpfSettleTask, clampedMs);
+        }
+    }
+
+    /** Returns true when an API 31+ ADPF hint session is currently open. */
+    public boolean isAdpfActive() {
+        return Build.VERSION.SDK_INT >= 31
+                && adpfController != null
+                && ((AdpfHelper) adpfController).isActive();
+    }
+
+    /** Concise display panel + active refresh rate & resolution summary for About / Perf sheets. */
+    public String hardwareSummary() {
+        Display d = currentDisplay();
+        if (d != null) updateCachedRates(d);
+        int active = Math.round(cachedActiveHz > 0f ? cachedActiveHz : 60f);
+        int max = Math.round(cachedMaxHz > 0f ? cachedMaxHz : active);
+        if (max < active) max = active;
+        StringBuilder sb = new StringBuilder(40);
+        sb.append(max).append("Hz 面板 · 当前 ").append(active).append("Hz");
+        if (d != null) {
+            try {
+                Display.Mode mode = d.getMode();
+                if (mode != null && mode.getPhysicalWidth() > 0 && mode.getPhysicalHeight() > 0) {
+                    sb.append(" (").append(mode.getPhysicalWidth())
+                            .append('×').append(mode.getPhysicalHeight()).append(')');
+                }
+            } catch (RuntimeException ignored) { }
+        }
+        return sb.toString();
     }
 
     public void setPolicy(int newPolicy) {
@@ -251,6 +331,9 @@ public final class DisplayModeEngine {
                 if (v == null) it.remove();
                 else applyViewFrameRate(v);
             }
+        }
+        if (adpfEnabled && listenerRegistered && Build.VERSION.SDK_INT >= 31 && adpfController != null) {
+            ((AdpfHelper) adpfController).updateTargetIfOpen(targetWorkDurationNs());
         }
     }
 
@@ -596,5 +679,122 @@ public final class DisplayModeEngine {
 
     private static int clampPolicy(int p) {
         return (p == POLICY_AUTO || p == POLICY_POWER) ? p : POLICY_MAX;
+    }
+
+    private long targetWorkDurationNs() {
+        float hz = Math.max(60f, cachedActiveHz > 0f ? cachedActiveHz : 60f);
+        return (long) (1_000_000_000.0 / hz);
+    }
+
+    private AdpfHelper adpfHelper() {
+        if (adpfController == null) adpfController = new AdpfHelper();
+        return (AdpfHelper) adpfController;
+    }
+
+    private void ensureAdpfSession() {
+        if (!adpfEnabled || Build.VERSION.SDK_INT < 31) return;
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            main.post(this::ensureAdpfSession);
+            return;
+        }
+        if (uiTid <= 0) uiTid = Process.myTid();
+        adpfHelper().openOrUpdate(appContext, uiTid, targetWorkDurationNs());
+    }
+
+    private void settleAdpfBurst() {
+        if (Build.VERSION.SDK_INT < 31 || adpfController == null) return;
+        ((AdpfHelper) adpfController).settle(targetWorkDurationNs());
+    }
+
+    private void closeAdpfSession() {
+        main.removeCallbacks(adpfSettleTask);
+        if (Build.VERSION.SDK_INT < 31 || adpfController == null) return;
+        ((AdpfHelper) adpfController).close();
+    }
+
+    /** Isolated API 31+ ADPF wrapper so API 29-30 never loads PerformanceHintManager classes. */
+    private static final class AdpfHelper {
+        private static final long MIN_BURST_INTERVAL_NS = 80_000_000L;
+
+        private PerformanceHintManager.Session session;
+        private long lastTargetNs;
+        private long minUpdateRateNs = MIN_BURST_INTERVAL_NS;
+        private long lastBoostElapsedNs;
+        private boolean unsupported;
+
+        void openOrUpdate(Context appContext, int uiTid, long targetNs) {
+            if (unsupported || uiTid <= 0 || targetNs <= 0L) return;
+            if (session != null) {
+                updateTargetIfOpen(targetNs);
+                return;
+            }
+            try {
+                PerformanceHintManager phm = (PerformanceHintManager) appContext
+                        .getSystemService(Context.PERFORMANCE_HINT_SERVICE);
+                if (phm == null) {
+                    unsupported = true;
+                    return;
+                }
+                long preferred = phm.getPreferredUpdateRateNanos();
+                minUpdateRateNs = Math.max(MIN_BURST_INTERVAL_NS, preferred > 0L ? preferred : 16_000_000L);
+                PerformanceHintManager.Session created = phm.createHintSession(new int[]{uiTid}, targetNs);
+                if (created == null) {
+                    unsupported = true;
+                    return;
+                }
+                session = created;
+                lastTargetNs = targetNs;
+            } catch (Throwable ignored) {
+                unsupported = true;
+                session = null;
+            }
+        }
+
+        void updateTargetIfOpen(long targetNs) {
+            if (session == null || targetNs <= 0L) return;
+            if (Math.abs(targetNs - lastTargetNs) < 50_000L) return;
+            try {
+                session.updateTargetWorkDuration(targetNs);
+                lastTargetNs = targetNs;
+            } catch (RuntimeException ignored) { }
+        }
+
+        boolean boost(Context appContext, int uiTid, long targetNs, long durationMs) {
+            long now = SystemClock.elapsedRealtimeNanos();
+            if (lastBoostElapsedNs != 0L && now - lastBoostElapsedNs < minUpdateRateNs) return false;
+            openOrUpdate(appContext, uiTid, targetNs);
+            if (session == null) return false;
+            lastBoostElapsedNs = now;
+            long factor = durationMs >= 350L ? 140L : 125L;
+            long reportNs = Math.max(targetNs + 500_000L, (targetNs * factor) / 100L);
+            try {
+                session.reportActualWorkDuration(reportNs);
+                return true;
+            } catch (RuntimeException ignored) {
+                return false;
+            }
+        }
+
+        void settle(long targetNs) {
+            if (session == null || targetNs <= 0L) return;
+            long relaxedNs = Math.max(1_000_000L, (targetNs * 65L) / 100L);
+            try {
+                session.reportActualWorkDuration(relaxedNs);
+            } catch (RuntimeException ignored) { }
+        }
+
+        boolean isActive() {
+            return session != null;
+        }
+
+        void close() {
+            PerformanceHintManager.Session s = session;
+            session = null;
+            lastTargetNs = 0L;
+            lastBoostElapsedNs = 0L;
+            if (s != null) {
+                try { s.close(); } catch (RuntimeException ignored) { }
+            }
+        }
     }
 }

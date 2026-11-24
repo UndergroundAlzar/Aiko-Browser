@@ -25,21 +25,9 @@ import java.util.List;
 import java.util.Locale;
 
 final class DownloadPanel {
-    private static final int CANVAS = 0xFF0B0D12;
-    private static final int SURFACE = 0xFF131722;
-    private static final int ELEVATED = 0xFF1B2130;
-    private static final int PILL = 0xFF21283B;
-    private static final int STROKE = 0x24FFFFFF;
-    private static final int HANDLE = 0x38FFFFFF;
-    private static final int TEXT = 0xFFF3F6FC;
-    private static final int MUTED = 0xFF9AA5BD;
-    private static final int ACCENT = 0xFF7C9BFF;
-    private static final int SUCCESS = 0xFF4ADE80;
-    private static final int WARN = 0xFFFBBF24;
-    private static final int TRACK = 0xFF242D42;
-    private static final int DONE_SEGMENT = 0xFF4C63B6;
-    private static final int RIPPLE = 0x307C9BFF;
-    private static final Typeface MEDIUM = Typeface.create("sans-serif-medium", Typeface.NORMAL);
+    private static int doneSegmentColor() {
+        return (AikoTheme.ACCENT & 0x00FFFFFF) | 0x77000000;
+    }
 
     private final MainActivity activity;
     private final float density;
@@ -66,6 +54,7 @@ final class DownloadPanel {
     }
 
     void show() {
+        AikoTheme.applyTheme(activity);
         dialog = new Dialog(activity);
         dialog.requestWindowFeature(Window.FEATURE_NO_TITLE);
 
@@ -73,12 +62,14 @@ final class DownloadPanel {
         card.setPadding(dp(20), dp(10), dp(20), dp(18));
         card.setOrientation(LinearLayout.VERTICAL);
         card.setBackground(sheetBackground());
+        card.setElevation(dp(16));
 
         // Centered drag handle pill
         View handle = new View(activity);
-        handle.setBackground(pill(HANDLE, 2, 0));
-        LinearLayout.LayoutParams handleLp = new LinearLayout.LayoutParams(dp(38), dp(4));
+        handle.setBackground(pill(AikoTheme.HANDLE, 2, 0));
+        LinearLayout.LayoutParams handleLp = new LinearLayout.LayoutParams(dp(36), dp(4));
         handleLp.gravity = Gravity.CENTER_HORIZONTAL;
+        handleLp.topMargin = dp(2);
         handleLp.bottomMargin = dp(12);
         card.addView(handle, handleLp);
 
@@ -89,15 +80,17 @@ final class DownloadPanel {
         headerLp.bottomMargin = dp(14);
         card.addView(header, headerLp);
 
-        TextView title = label("下载", 20, TEXT);
-        title.setTypeface(MEDIUM, Typeface.BOLD);
+        TextView title = label("下载", 19, AikoTheme.TEXT);
+        title.setTypeface(AikoTheme.MEDIUM, Typeface.BOLD);
+        title.setLetterSpacing(-0.01f);
         header.addView(title, new LinearLayout.LayoutParams(0, -2, 1));
 
-        priority = label("", 12, SUCCESS);
-        priority.setTypeface(MEDIUM);
+        priority = label("", 12, AikoTheme.EMERALD);
+        priority.setTypeface(AikoTheme.MEDIUM);
         priority.setGravity(Gravity.CENTER);
         priority.setPadding(dp(12), dp(6), dp(12), dp(6));
-        priority.setBackground(ripplePill(PILL, 16, STROKE));
+        priority.setBackground(ripplePill(AikoTheme.PILL, 16, AikoTheme.STROKE));
+        AikoTheme.attachPressFeedback(priority, 0.94f);
         priority.setOnClickListener(v -> {
             activity.toggleTransferPriority();
             render();
@@ -108,18 +101,18 @@ final class DownloadPanel {
         LinearLayout infoCard = new LinearLayout(activity);
         infoCard.setOrientation(LinearLayout.VERTICAL);
         infoCard.setPadding(dp(16), dp(14), dp(16), dp(14));
-        infoCard.setBackground(pill(ELEVATED, 16, STROKE));
+        infoCard.setBackground(pill(AikoTheme.CARD, 16, AikoTheme.STROKE));
         LinearLayout.LayoutParams infoLp = new LinearLayout.LayoutParams(-1, -2);
         infoLp.bottomMargin = dp(12);
         card.addView(infoCard, infoLp);
 
-        file = label("", 15, TEXT);
-        file.setTypeface(MEDIUM);
+        file = label("", 15, AikoTheme.TEXT);
+        file.setTypeface(AikoTheme.MEDIUM);
         file.setSingleLine(true);
         file.setEllipsize(TextUtils.TruncateAt.MIDDLE);
         infoCard.addView(file, new LinearLayout.LayoutParams(-1, -2));
 
-        status = label("", 12, MUTED);
+        status = label("", 12, AikoTheme.TEXT_MUTED);
         status.setSingleLine(true);
         status.setEllipsize(TextUtils.TruncateAt.END);
         LinearLayout.LayoutParams statusLp = new LinearLayout.LayoutParams(-1, -2);
@@ -128,14 +121,14 @@ final class DownloadPanel {
 
         overall = new ProgressBar(activity, null, android.R.attr.progressBarStyleHorizontal);
         overall.setMax(1000);
-        overall.setProgressTintList(ColorStateList.valueOf(ACCENT));
-        overall.setProgressBackgroundTintList(ColorStateList.valueOf(TRACK));
+        overall.setProgressTintList(ColorStateList.valueOf(AikoTheme.ACCENT));
+        overall.setProgressBackgroundTintList(ColorStateList.valueOf(AikoTheme.PILL));
         LinearLayout.LayoutParams barLp = new LinearLayout.LayoutParams(-1, dp(8));
         barLp.topMargin = dp(12);
         barLp.bottomMargin = dp(10);
         infoCard.addView(overall, barLp);
 
-        metric = label("", 13, TEXT);
+        metric = label("", 13, AikoTheme.TEXT);
         metric.setSingleLine(true);
         metric.setEllipsize(TextUtils.TruncateAt.END);
         infoCard.addView(metric, new LinearLayout.LayoutParams(-1, -2));
@@ -145,16 +138,16 @@ final class DownloadPanel {
         LinearLayout.LayoutParams metricsLp = new LinearLayout.LayoutParams(-1, -2);
         metricsLp.topMargin = dp(6);
         infoCard.addView(metrics, metricsLp);
-        rate = metricLabel(metrics, ACCENT, Gravity.START);
-        rate.setTypeface(MEDIUM);
-        remaining = metricLabel(metrics, MUTED, Gravity.END);
+        rate = metricLabel(metrics, AikoTheme.ACCENT, Gravity.START);
+        rate.setTypeface(AikoTheme.MEDIUM);
+        remaining = metricLabel(metrics, AikoTheme.TEXT_MUTED, Gravity.END);
 
         // Segment overview + map + collapsible lane list
         LinearLayout segBox = new LinearLayout(activity);
         segmentCard = segBox;
         segBox.setOrientation(LinearLayout.VERTICAL);
         segBox.setPadding(dp(14), dp(12), dp(14), dp(10));
-        segBox.setBackground(pill(ELEVATED, 16, STROKE));
+        segBox.setBackground(pill(AikoTheme.CARD, 16, AikoTheme.STROKE));
         LinearLayout.LayoutParams segLp = new LinearLayout.LayoutParams(-1, -2);
         segLp.bottomMargin = dp(14);
         card.addView(segBox, segLp);
@@ -163,15 +156,16 @@ final class DownloadPanel {
         segHeader.setGravity(Gravity.CENTER_VERTICAL);
         segBox.addView(segHeader, new LinearLayout.LayoutParams(-1, -2));
 
-        section = label("", 12, MUTED);
+        section = label("", 12, AikoTheme.TEXT_MUTED);
         section.setSingleLine(true);
         section.setEllipsize(TextUtils.TruncateAt.END);
         segHeader.addView(section, new LinearLayout.LayoutParams(0, -2, 1));
 
-        details = label("分段详情 ▾", 12, ACCENT);
-        details.setTypeface(MEDIUM);
+        details = label("分段详情 ▾", 12, AikoTheme.ACCENT);
+        details.setTypeface(AikoTheme.MEDIUM);
         details.setPadding(dp(10), dp(4), dp(10), dp(4));
-        details.setBackground(ripplePill(PILL, 12, STROKE));
+        details.setBackground(ripplePill(AikoTheme.PILL, 12, AikoTheme.STROKE));
+        AikoTheme.attachPressFeedback(details, 0.94f);
         details.setOnClickListener(v -> toggleLanes());
         segHeader.addView(details, new LinearLayout.LayoutParams(-2, -2));
 
@@ -306,21 +300,21 @@ final class DownloadPanel {
                 + (d == null || !job.busy || job.saving ? "" : yielding ? " · 网页优先" : " · " + d.mode));
         if (job != null && job.finished) {
             if (!lastFinishedTint) {
-                status.setTextColor(SUCCESS);
-                overall.setProgressTintList(ColorStateList.valueOf(SUCCESS));
+                status.setTextColor(AikoTheme.EMERALD);
+                overall.setProgressTintList(ColorStateList.valueOf(AikoTheme.EMERALD));
                 lastFinishedTint = true;
                 lastYieldTint = false;
             }
         } else if (yielding) {
             if (!lastYieldTint || lastFinishedTint) {
-                status.setTextColor(WARN);
-                overall.setProgressTintList(ColorStateList.valueOf(WARN));
+                status.setTextColor(AikoTheme.AMBER);
+                overall.setProgressTintList(ColorStateList.valueOf(AikoTheme.AMBER));
                 lastYieldTint = true;
                 lastFinishedTint = false;
             }
         } else if (lastFinishedTint || lastYieldTint) {
-            status.setTextColor(MUTED);
-            overall.setProgressTintList(ColorStateList.valueOf(ACCENT));
+            status.setTextColor(AikoTheme.TEXT_MUTED);
+            overall.setProgressTintList(ColorStateList.valueOf(AikoTheme.ACCENT));
             lastFinishedTint = false;
             lastYieldTint = false;
         }
@@ -328,7 +322,7 @@ final class DownloadPanel {
         if (lastBrowserFirst == null || lastBrowserFirst != browserFirst) {
             lastBrowserFirst = browserFirst;
             setText(priority, browserFirst ? "浏览优先" : "下载全速");
-            priority.setTextColor(browserFirst ? SUCCESS : WARN);
+            priority.setTextColor(browserFirst ? AikoTheme.EMERALD : AikoTheme.AMBER);
         }
 
         String time = speed > 0 && total > bytes ? "剩余 " + eta((long) Math.ceil((total - bytes) / speed)) : "";
@@ -393,22 +387,23 @@ final class DownloadPanel {
 
         @Override protected void onDraw(Canvas c) {
             float width = getWidth(), top = padY, bottom = getHeight() - padY;
-            paint.setColor(TRACK);
+            paint.setColor(AikoTheme.PILL);
             c.drawRoundRect(0f, top, width, bottom, radius, radius, paint);
             if (total <= 0) return;
+            int doneColor = doneSegmentColor();
             for (int i = 0; i < segments.size(); i++) {
                 RangeDownload.Segment s = segments.get(i);
                 float x = (float) (width * ((double) s.start / total));
                 float full = (float) (width * ((double) (s.end < 0 ? total : s.end) / total));
                 float done = (float) (width * ((double) s.next / total));
-                paint.setColor(finished ? SUCCESS : s.active ? ACCENT : DONE_SEGMENT);
+                paint.setColor(finished ? AikoTheme.EMERALD : s.active ? AikoTheme.ACCENT : doneColor);
                 if (done > x) c.drawRect(x, top, Math.min(full, done), bottom, paint);
                 if (x > 0 && segments.size() < width) {
-                    paint.setColor(ELEVATED);
+                    paint.setColor(AikoTheme.CARD);
                     c.drawRect(x, top, x + 1f, bottom, paint);
                 }
                 if (i == selected) {
-                    paint.setColor(TEXT);
+                    paint.setColor(AikoTheme.TEXT);
                     c.drawRect(x, top - markHeight, full, top, paint);
                     c.drawRect(x, bottom, full, bottom + markHeight, paint);
                 }
@@ -450,7 +445,7 @@ final class DownloadPanel {
             TextView row;
             if (view instanceof TextView) row = (TextView) view;
             else {
-                row = label("", 12, TEXT);
+                row = label("", 12, AikoTheme.TEXT);
                 row.setTypeface(Typeface.MONOSPACE);
                 row.setGravity(Gravity.CENTER_VERTICAL);
                 row.setMinHeight(dp(34));
@@ -464,8 +459,8 @@ final class DownloadPanel {
                     : complete ? "完成" : s.retrying ? "正在重试" : "等待";
             setText(row, String.format(Locale.ROOT, "%03d   %s%s   %s", i + 1,
                     size(progress), span > 0 ? " / " + size(span) : "", state));
-            row.setTextColor(s.active ? ACCENT : complete ? SUCCESS : s.retrying ? WARN : MUTED);
-            row.setBackgroundColor(i == selected ? PILL : 0);
+            row.setTextColor(s.active ? AikoTheme.ACCENT : complete ? AikoTheme.EMERALD : s.retrying ? AikoTheme.AMBER : AikoTheme.TEXT_MUTED);
+            row.setBackgroundColor(i == selected ? AikoTheme.PILL : 0);
             return row;
         }
     }
@@ -502,10 +497,11 @@ final class DownloadPanel {
     }
 
     private TextView button(LinearLayout row, String title, boolean accent, Runnable action) {
-        TextView v = label(title, 13, accent ? CANVAS : TEXT);
-        v.setTypeface(MEDIUM);
+        TextView v = label(title, 13, accent ? AikoTheme.onAccentColor() : AikoTheme.TEXT);
+        v.setTypeface(AikoTheme.MEDIUM);
         v.setGravity(Gravity.CENTER);
-        v.setBackground(ripplePill(accent ? ACCENT : PILL, 12, accent ? 0 : STROKE));
+        v.setBackground(ripplePill(accent ? AikoTheme.ACCENT : AikoTheme.PILL, 13, accent ? 0 : AikoTheme.STROKE));
+        AikoTheme.attachPressFeedback(v, 0.94f);
         LinearLayout.LayoutParams size = new LinearLayout.LayoutParams(0, dp(42), 1);
         size.setMargins(dp(3), dp(2), dp(3), 0);
         row.addView(v, size);
@@ -514,13 +510,7 @@ final class DownloadPanel {
     }
 
     private Drawable sheetBackground() {
-        GradientDrawable bg = new GradientDrawable();
-        float top = dp(24);
-        float bottom = dp(20);
-        bg.setCornerRadii(new float[]{top, top, top, top, bottom, bottom, bottom, bottom});
-        bg.setColor(SURFACE);
-        bg.setStroke(Math.max(1, dp(1)), STROKE);
-        return bg;
+        return AikoTheme.topRounded(AikoTheme.SURFACE, AikoTheme.STROKE, density, dp(24));
     }
 
     private GradientDrawable pill(int color, int radiusDp, int strokeColor) {
@@ -532,7 +522,7 @@ final class DownloadPanel {
     }
 
     private Drawable ripplePill(int color, int radiusDp, int strokeColor) {
-        return new RippleDrawable(ColorStateList.valueOf(RIPPLE), pill(color, radiusDp, strokeColor), null);
+        return new RippleDrawable(ColorStateList.valueOf(AikoTheme.RIPPLE_ACCENT), pill(color, radiusDp, strokeColor), null);
     }
 
     private int dp(int v) { return Math.round(v * density); }

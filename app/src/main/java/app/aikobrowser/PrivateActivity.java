@@ -1,15 +1,20 @@
 package app.aikobrowser;
 
+import android.animation.Animator;
+import android.animation.AnimatorListenerAdapter;
 import android.app.Activity;
 import android.content.res.Configuration;
+import android.graphics.Color;
 import android.graphics.drawable.GradientDrawable;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.view.Gravity;
+import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.Window;
 import android.view.WindowInsets;
 import android.view.WindowInsetsController;
 import android.view.WindowManager;
@@ -41,20 +46,18 @@ import java.util.stream.Stream;
 /** Short-lived, single-tab browsing in its own Android process and WebView directory. */
 public final class PrivateActivity extends Activity {
     private static final String SUFFIX = "aiko_private";
-    private static final int CANVAS = 0xFF0B0D12;
-    private static final int SURFACE = 0xFF131722;
-    private static final int ELEVATED = 0xFF1B2130;
-    private static final int STROKE = 0x24FFFFFF;
-    private static final int TEXT = 0xFFF3F6FC;
-    private static final int MUTED = 0xFF9AA5BD;
-    private static final int ACCENT = 0xFF7C9BFF;
 
     private static boolean initialized, closing;
     private final Handler main = new Handler(Looper.getMainLooper());
+    private final Runnable reapplyInsetsTask = this::applyPrivateInsets;
+    private float density;
     private DisplayModeEngine displayMode;
     private SiteExtras siteExtras;
-    private FrameLayout root, frame;
+    private FrameLayout root, frame, privateDeck;
+    private LinearLayout content;
     private EditText address;
+    private GradientDrawable addressBg;
+    private BrowserIcon backBtn;
     private TextView status, subtitle;
     private ProgressBar progress;
     private View fullscreenView;
@@ -62,6 +65,8 @@ public final class PrivateActivity extends Activity {
     private SiteFilter filter;
     private WebView web;
     private volatile SiteFilter.Page page;
+    private int insetLeft, insetTop, insetRight, insetBottom, imeBottom;
+    private boolean legacyImeOpen;
     private boolean closed;
 
     @Override public void onCreate(Bundle state) {
@@ -70,9 +75,20 @@ public final class PrivateActivity extends Activity {
             finish();
             return;
         }
-        getWindow().addFlags(WindowManager.LayoutParams.FLAG_SECURE);
-        getWindow().setStatusBarColor(CANVAS);
-        getWindow().setNavigationBarColor(SURFACE);
+        AikoTheme.applyTheme(this);
+        density = getResources().getDisplayMetrics().density;
+        Window win = getWindow();
+        win.addFlags(WindowManager.LayoutParams.FLAG_SECURE);
+        win.setStatusBarColor(AikoTheme.BG);
+        win.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
+        if (Build.VERSION.SDK_INT >= 30) {
+            win.setDecorFitsSystemWindows(false);
+            win.setNavigationBarColor(Color.TRANSPARENT);
+            win.setNavigationBarContrastEnforced(false);
+        } else {
+            win.setNavigationBarColor(AikoTheme.SURFACE);
+        }
+
         displayMode = new DisplayModeEngine(this);
         siteExtras = new SiteExtras(this);
         siteExtras.preloadAsync();
@@ -104,27 +120,15 @@ public final class PrivateActivity extends Activity {
 
     private void buildUi() {
         root = new FrameLayout(this);
-        root.setBackgroundColor(CANVAS);
+        root.setBackgroundColor(AikoTheme.BG);
 
-        LinearLayout content = new LinearLayout(this);
+        content = new LinearLayout(this);
         content.setOrientation(LinearLayout.VERTICAL);
-        content.setBackgroundColor(CANVAS);
+        content.setBackgroundColor(AikoTheme.BG);
         content.setFocusableInTouchMode(true);
-        if (Build.VERSION.SDK_INT >= 30) {
-            getWindow().setDecorFitsSystemWindows(false);
-            content.setOnApplyWindowInsetsListener((view, insets) -> {
-                android.graphics.Insets bar = insets.getInsets(
-                        WindowInsets.Type.systemBars() | WindowInsets.Type.displayCutout());
-                android.graphics.Insets ime = insets.getInsets(WindowInsets.Type.ime());
-                view.setPadding(bar.left, bar.top, bar.right, Math.max(bar.bottom, ime.bottom));
-                return WindowInsets.CONSUMED;
-            });
-        } else {
-            content.setFitsSystemWindows(true);
-        }
 
         frame = new FrameLayout(this);
-        frame.setBackgroundColor(CANVAS);
+        frame.setBackgroundColor(AikoTheme.BG);
         content.addView(frame, new LinearLayout.LayoutParams(-1, 0, 1));
 
         LinearLayout empty = new LinearLayout(this);
@@ -132,52 +136,52 @@ public final class PrivateActivity extends Activity {
         empty.setGravity(Gravity.CENTER);
         empty.setPadding(dp(28), dp(24), dp(28), dp(24));
 
-        TextView badge = new TextView(this);
-        badge.setText("PRIVATE");
-        badge.setTextSize(11);
-        badge.setTextColor(ACCENT);
+        TextView badge = AikoTheme.badge(this, density, "PRIVATE",
+                AikoTheme.ACCENT, AikoTheme.CARD, AikoTheme.STROKE_ACCENT);
         badge.setLetterSpacing(0.14f);
-        badge.setPadding(dp(12), dp(4), dp(12), dp(4));
-        badge.setBackground(pillDrawable(ELEVATED, STROKE, dp(12)));
         LinearLayout.LayoutParams badgeLp = new LinearLayout.LayoutParams(-2, -2);
-        badgeLp.bottomMargin = dp(14);
+        badgeLp.bottomMargin = dp(16);
         empty.addView(badge, badgeLp);
 
         status = new TextView(this);
         status.setText("正在准备无痕窗口");
         status.setTextSize(20);
-        status.setTextColor(TEXT);
+        status.setTypeface(AikoTheme.MEDIUM);
+        status.setTextColor(AikoTheme.TEXT);
         status.setGravity(Gravity.CENTER);
         empty.addView(status, new LinearLayout.LayoutParams(-2, -2));
 
         subtitle = new TextView(this);
         subtitle.setText("正在清理独立数据目录…");
         subtitle.setTextSize(13);
-        subtitle.setTextColor(MUTED);
+        subtitle.setTextColor(AikoTheme.TEXT_MUTED);
         subtitle.setGravity(Gravity.CENTER);
         LinearLayout.LayoutParams subLp = new LinearLayout.LayoutParams(-2, -2);
         subLp.topMargin = dp(8);
         empty.addView(subtitle, subLp);
         frame.addView(empty, new FrameLayout.LayoutParams(-1, -1));
 
-        progress = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
-        progress.setMax(100);
-        progress.setProgressTintList(android.content.res.ColorStateList.valueOf(ACCENT));
-        progress.setProgressBackgroundTintList(android.content.res.ColorStateList.valueOf(0x00000000));
-        progress.setVisibility(View.GONE);
-        content.addView(progress, new LinearLayout.LayoutParams(-1, dp(2)));
+        // Private bottom deck: sits strictly below WebView (weight 1 above), hides cleanly on WebView IME
+        privateDeck = new FrameLayout(this);
+        privateDeck.setBackgroundColor(AikoTheme.SURFACE);
+        privateDeck.setElevation(dp(6));
+        content.addView(privateDeck, new LinearLayout.LayoutParams(-1, -2));
 
+        LinearLayout deckStack = new LinearLayout(this);
+        deckStack.setOrientation(LinearLayout.VERTICAL);
+        privateDeck.addView(deckStack, new FrameLayout.LayoutParams(-1, -2));
+
+        int hairlinePx = Math.max(1, Math.round(density));
         View hairline = new View(this);
-        hairline.setBackgroundColor(STROKE);
-        content.addView(hairline, new LinearLayout.LayoutParams(-1, 1));
+        hairline.setBackgroundColor(AikoTheme.DIVIDER);
+        deckStack.addView(hairline, new LinearLayout.LayoutParams(-1, hairlinePx));
 
         LinearLayout bar = new LinearLayout(this);
-        bar.setBackgroundColor(SURFACE);
         bar.setGravity(Gravity.CENTER_VERTICAL);
-        bar.setPadding(dp(8), dp(7), dp(8), dp(7));
-        content.addView(bar, new LinearLayout.LayoutParams(-1, dp(58)));
+        bar.setPadding(dp(6), dp(6), dp(6), dp(6));
+        deckStack.addView(bar, new LinearLayout.LayoutParams(-1, dp(56)));
 
-        control(bar, "‹", "后退", this::onBackPressed);
+        backBtn = iconControl(bar, BrowserIcon.Kind.BACK, "后退", AikoTheme.TEXT_DIM, this::onBackPressed);
 
         address = new EditText(this);
         address.setHint("无痕搜索或输入网址");
@@ -186,36 +190,109 @@ public final class PrivateActivity extends Activity {
         address.setSaveEnabled(false);
         address.setImportantForAutofill(View.IMPORTANT_FOR_AUTOFILL_NO);
         address.setTextSize(14);
-        address.setTextColor(TEXT);
-        address.setHintTextColor(MUTED);
-        address.setBackground(pillDrawable(ELEVATED, STROKE, dp(20)));
+        address.setTypeface(AikoTheme.MEDIUM);
+        address.setTextColor(AikoTheme.TEXT);
+        address.setHintTextColor(AikoTheme.TEXT_DIM);
+        addressBg = AikoTheme.capsule(density, dp(22));
+        address.setBackground(addressBg);
         address.setPadding(dp(14), 0, dp(14), 0);
         address.setImeOptions(EditorInfo.IME_ACTION_GO | EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING);
         address.setInputType(android.text.InputType.TYPE_CLASS_TEXT | android.text.InputType.TYPE_TEXT_VARIATION_URI);
+        address.setOnFocusChangeListener((v, hasFocus) -> {
+            addressBg.setStroke(hairlinePx, hasFocus ? AikoTheme.STROKE_ACCENT : AikoTheme.CAPSULE_STROKE);
+            applyPrivateInsets();
+        });
         address.setOnEditorActionListener((view, id, event) -> {
             if (id != EditorInfo.IME_ACTION_GO) return false;
             submit();
             return true;
         });
-        LinearLayout.LayoutParams addrLp = new LinearLayout.LayoutParams(0, dp(42), 1);
+        LinearLayout.LayoutParams addrLp = new LinearLayout.LayoutParams(0, dp(44), 1);
         addrLp.leftMargin = dp(4);
         addrLp.rightMargin = dp(4);
         bar.addView(address, addrLp);
 
-        control(bar, "›", "打开网址", this::submit);
-        control(bar, "×", "关闭无痕窗口", this::closeWindow);
+        iconControl(bar, BrowserIcon.Kind.GO, "打开网址", AikoTheme.ACCENT, this::submit);
+        iconControl(bar, BrowserIcon.Kind.CLOSE, "关闭无痕窗口", AikoTheme.TEXT_MUTED, this::closeWindow);
+
+        progress = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
+        progress.setMax(100);
+        progress.setProgressDrawable(MainActivity.createLoadingDrawable(dp(2)));
+        progress.setAlpha(0f);
+        progress.setVisibility(View.INVISIBLE);
+        int progressPx = Math.max(2, Math.round(2.5f * density));
+        privateDeck.addView(progress, new FrameLayout.LayoutParams(-1, progressPx, Gravity.TOP));
 
         root.addView(content, new FrameLayout.LayoutParams(-1, -1));
+
+        if (Build.VERSION.SDK_INT >= 30) {
+            root.setOnApplyWindowInsetsListener((view, insets) -> {
+                android.graphics.Insets bars = insets.getInsets(
+                        WindowInsets.Type.systemBars() | WindowInsets.Type.displayCutout());
+                android.graphics.Insets ime = insets.getInsets(WindowInsets.Type.ime());
+                insetLeft = bars.left;
+                insetTop = bars.top;
+                insetRight = bars.right;
+                insetBottom = bars.bottom;
+                imeBottom = ime.bottom;
+                applyPrivateInsets();
+                return WindowInsets.CONSUMED;
+            });
+        } else {
+            root.setFitsSystemWindows(true);
+            root.addOnLayoutChangeListener((v, l, t, r, b, ol, ot, or, ob) -> {
+                WindowInsets rw = v.getRootWindowInsets();
+                if (rw != null) {
+                    @SuppressWarnings("deprecation")
+                    boolean imeUp = (rw.getSystemWindowInsetBottom() - rw.getStableInsetBottom()) > dp(80);
+                    if (imeUp != legacyImeOpen) {
+                        legacyImeOpen = imeUp;
+                        root.removeCallbacks(reapplyInsetsTask);
+                        root.post(reapplyInsetsTask);
+                    }
+                }
+            });
+        }
+
         setContentView(root);
+        if (Build.VERSION.SDK_INT >= 30) {
+            WindowInsetsController wic = getWindow().getInsetsController();
+            if (wic != null) {
+                wic.setSystemBarsAppearance(0,
+                        WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS
+                                | WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS);
+            }
+        }
+        applyPrivateInsets();
         content.requestFocus();
     }
 
-    private GradientDrawable pillDrawable(int fill, int stroke, int radiusPx) {
-        GradientDrawable gd = new GradientDrawable();
-        gd.setColor(fill);
-        gd.setCornerRadius(radiusPx);
-        gd.setStroke(1, stroke);
-        return gd;
+    private void applyPrivateInsets() {
+        if (content == null || privateDeck == null || isDestroyed()) return;
+        if (fullscreenView != null) {
+            if (content.getVisibility() != View.GONE) content.setVisibility(View.GONE);
+            return;
+        }
+        if (content.getVisibility() != View.VISIBLE) content.setVisibility(View.VISIBLE);
+
+        boolean imeOpen = imeBottom > insetBottom;
+        boolean editingAddr = address != null && address.hasFocus();
+        boolean webImeHidden = web != null && !editingAddr && (imeOpen || legacyImeOpen);
+
+        if (webImeHidden) {
+            if (privateDeck.getVisibility() != View.GONE) privateDeck.setVisibility(View.GONE);
+            privateDeck.setPadding(0, 0, 0, 0);
+            content.setPadding(insetLeft, insetTop, insetRight, imeOpen ? imeBottom : 0);
+        } else {
+            if (privateDeck.getVisibility() != View.VISIBLE) privateDeck.setVisibility(View.VISIBLE);
+            if (editingAddr && imeOpen) {
+                privateDeck.setPadding(0, 0, 0, 0);
+                content.setPadding(insetLeft, insetTop, insetRight, imeBottom);
+            } else {
+                privateDeck.setPadding(0, 0, 0, insetBottom);
+                content.setPadding(insetLeft, insetTop, insetRight, 0);
+            }
+        }
     }
 
     private void submit() {
@@ -227,6 +304,7 @@ public final class PrivateActivity extends Activity {
         InputMethodManager imm = (InputMethodManager) getSystemService(INPUT_METHOD_SERVICE);
         if (imm != null) imm.hideSoftInputFromWindow(address.getWindowToken(), 0);
         address.clearFocus();
+        content.requestFocus();
         try {
             if (web == null) createWebView();
             page = new SiteFilter.Page(url);
@@ -240,7 +318,7 @@ public final class PrivateActivity extends Activity {
     private void createWebView() {
         WebView view = new WebView(this);
         web = view;
-        view.setBackgroundColor(CANVAS);
+        view.setBackgroundColor(AikoTheme.BG);
         view.setSaveEnabled(false);
         view.setImportantForAutofill(View.IMPORTANT_FOR_AUTOFILL_NO_EXCLUDE_DESCENDANTS);
         WebSettings settings = view.getSettings();
@@ -258,15 +336,18 @@ public final class PrivateActivity extends Activity {
         WebViewPerf.setAlgorithmicDarkening(view, siteExtras != null && siteExtras.isGlobalDarkWeb());
         if (displayMode != null) displayMode.attachView(view);
 
+        view.setOnTouchListener((v, ev) -> {
+            if (ev.getActionMasked() == MotionEvent.ACTION_DOWN && address != null && address.hasFocus()) {
+                address.clearFocus();
+                InputMethodManager imm = (InputMethodManager) getSystemService(INPUT_METHOD_SERVICE);
+                if (imm != null) imm.hideSoftInputFromWindow(address.getWindowToken(), 0);
+            }
+            return false;
+        });
+
         view.setWebChromeClient(new WebChromeClient() {
             @Override public void onProgressChanged(WebView v, int newProgress) {
-                if (progress == null) return;
-                if (newProgress >= 100) {
-                    progress.setVisibility(View.GONE);
-                } else {
-                    if (progress.getVisibility() != View.VISIBLE) progress.setVisibility(View.VISIBLE);
-                    progress.setProgress(Math.max(newProgress, 5), true);
-                }
+                updateProgressBar(newProgress);
             }
 
             @Override public void onShowCustomView(View custom, CustomViewCallback callback) {
@@ -276,6 +357,7 @@ public final class PrivateActivity extends Activity {
                 }
                 fullscreenView = custom;
                 fullscreenCallback = callback;
+                applyPrivateInsets();
                 custom.setBackgroundColor(0xFF000000);
                 root.addView(custom, new FrameLayout.LayoutParams(
                         ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
@@ -298,6 +380,7 @@ public final class PrivateActivity extends Activity {
                     page = new SiteFilter.Page(url);
                     if (!address.hasFocus()) address.setText(url);
                 }
+                syncBackTint();
             }
 
             @Override public void doUpdateVisitedHistory(WebView v, String url, boolean isReload) {
@@ -305,6 +388,7 @@ public final class PrivateActivity extends Activity {
                     page = new SiteFilter.Page(url);
                     if (!address.hasFocus()) address.setText(url);
                 }
+                syncBackTint();
             }
 
             @Override public WebResourceResponse shouldInterceptRequest(WebView v, WebResourceRequest request) {
@@ -312,7 +396,10 @@ public final class PrivateActivity extends Activity {
             }
 
             @Override public void onPageCommitVisible(WebView v, String url) {
+                boolean dark = siteExtras != null && siteExtras.isGlobalDarkWeb();
+                v.setBackgroundColor(dark ? AikoTheme.BG : Color.WHITE);
                 if (filter != null) filter.applyCss(v, url);
+                syncBackTint();
             }
 
             @Override public boolean onRenderProcessGone(WebView v, android.webkit.RenderProcessGoneDetail detail) {
@@ -326,6 +413,47 @@ public final class PrivateActivity extends Activity {
         frame.addView(view, new FrameLayout.LayoutParams(-1, -1));
     }
 
+    private void syncBackTint() {
+        if (backBtn != null) {
+            backBtn.tint(web != null && web.canGoBack() ? AikoTheme.TEXT : AikoTheme.TEXT_DIM);
+        }
+    }
+
+    private void updateProgressBar(int newProgress) {
+        if (progress == null) return;
+        if (newProgress < 100) {
+            progress.animate().setListener(null).cancel();
+            progress.setLayerType(View.LAYER_TYPE_NONE, null);
+            progress.setAlpha(1f);
+            if (progress.getVisibility() != View.VISIBLE) progress.setVisibility(View.VISIBLE);
+            progress.setProgress(Math.max(newProgress, 5), true);
+        } else {
+            progress.setProgress(100, true);
+            if (progress.getVisibility() == View.VISIBLE && progress.getAlpha() > 0.05f) {
+                progress.animate().setListener(null).cancel();
+                progress.animate()
+                        .alpha(0f)
+                        .setDuration(200)
+                        .setInterpolator(AikoTheme.FAST_OUT)
+                        .withLayer()
+                        .setListener(new AnimatorListenerAdapter() {
+                            private boolean cancelled;
+                            @Override public void onAnimationCancel(Animator a) {
+                                cancelled = true;
+                                progress.setLayerType(View.LAYER_TYPE_NONE, null);
+                                progress.animate().setListener(null);
+                            }
+                            @Override public void onAnimationEnd(Animator a) {
+                                progress.setLayerType(View.LAYER_TYPE_NONE, null);
+                                progress.animate().setListener(null);
+                                if (!cancelled) progress.setVisibility(View.INVISIBLE);
+                            }
+                        })
+                        .start();
+            }
+        }
+    }
+
     private void exitFullscreenVideo() {
         if (fullscreenView == null) return;
         root.removeView(fullscreenView);
@@ -335,6 +463,7 @@ public final class PrivateActivity extends Activity {
             fullscreenCallback = null;
         }
         setSystemBarsHidden(false);
+        applyPrivateInsets();
         if (displayMode != null) displayMode.setFullscreenVideo(false);
     }
 
@@ -366,18 +495,20 @@ public final class PrivateActivity extends Activity {
         address.setEnabled(false);
     }
 
-    private void control(LinearLayout bar, String text, String description, Runnable action) {
-        TextView button = new TextView(this);
-        button.setText(text);
-        button.setTextColor(TEXT);
-        button.setTextSize(24);
-        button.setGravity(Gravity.CENTER);
+    private BrowserIcon iconControl(LinearLayout bar, BrowserIcon.Kind kind, String description,
+                                    int tint, Runnable action) {
+        BrowserIcon button = new BrowserIcon(this, kind);
+        button.tint(tint);
         button.setContentDescription(description);
+        button.setForeground(AikoTheme.ripple(AikoTheme.RIPPLE_ACCENT, dp(16)));
+        button.setFocusable(true);
+        AikoTheme.attachPressFeedback(button, 0.92f);
         button.setOnClickListener(view -> action.run());
         bar.addView(button, new LinearLayout.LayoutParams(dp(44), dp(44)));
+        return button;
     }
 
-    private int dp(int n) { return Math.round(getResources().getDisplayMetrics().density * n); }
+    private int dp(int n) { return Math.round(density * n); }
 
     @Override public void onBackPressed() {
         if (fullscreenView != null) {
@@ -419,10 +550,13 @@ public final class PrivateActivity extends Activity {
 
     @Override public void onConfigurationChanged(Configuration newConfig) {
         super.onConfigurationChanged(newConfig);
+        density = getResources().getDisplayMetrics().density;
         if (displayMode != null) displayMode.apply();
+        applyPrivateInsets();
     }
 
     @Override protected void onDestroy() {
+        if (root != null) root.removeCallbacks(reapplyInsetsTask);
         exitFullscreenVideo();
         if (!closing && android.app.Application.getProcessName().equals(getPackageName() + ":private")) {
             endSession();

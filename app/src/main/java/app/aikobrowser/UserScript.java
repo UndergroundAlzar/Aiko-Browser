@@ -7,19 +7,19 @@ import java.util.*;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
-/** A local .user.js file, parsed without evaluating its body. */
-final class UserScript {
-    static final int MAX_BYTES = 256 * 1024;
+/** A local or remote .user.js file, parsed without evaluating its body (pure Java). */
+public final class UserScript {
+    static final int MAX_BYTES = 512 * 1024;
     private static final Pattern HEADER = Pattern.compile("(?m)^[ \\t]*//[ \\t]*==UserScript==[ \\t]*$");
     private static final Pattern END = Pattern.compile("(?m)^[ \\t]*//[ \\t]*==/UserScript==[ \\t]*$");
-    private static final Pattern ITEM = Pattern.compile("^[ \\t]*//[ \\t]*@([\\w-]+)(?:[ \\t]+(.*))?$");
+    private static final Pattern ITEM = Pattern.compile("^[ \\t]*//[ \\t]*@([\\w:-]+)(?:[ \\t]+(.*))?$");
     private static final Set<String> GRANTS = new HashSet<>(Arrays.asList(
             "GM_addStyle", "GM_log", "GM_info", "GM_getValue", "GM_setValue", "GM_deleteValue", "GM_listValues",
             "GM.addStyle", "GM.log", "GM.info", "GM.getValue", "GM.setValue", "GM.deleteValue", "GM.listValues"));
-    final String source, code, name, namespace, version, runAt;
-    final List<UrlPattern> includes, excludes;
-    final Set<String> grants;
-    final Set<String> origins;
+    public final String source, code, name, namespace, version, author, description, runAt;
+    public final List<UrlPattern> includes, excludes;
+    public final Set<String> grants;
+    public final Set<String> origins;
     final boolean requiresIsolation, pageWorld, anyPort;
 
     private UserScript(String source, String code, Map<String, String> metadata,
@@ -29,6 +29,10 @@ final class UserScript {
         name = metadata.get("name");
         namespace = metadata.getOrDefault("namespace", "");
         version = metadata.getOrDefault("version", "");
+        author = metadata.getOrDefault("author", "");
+        String descZh = metadata.get("description:zh-CN");
+        if (descZh == null || descZh.isEmpty()) descZh = metadata.get("description:zh");
+        description = (descZh != null && !descZh.isEmpty()) ? descZh : metadata.getOrDefault("description", "");
         runAt = metadata.getOrDefault("run-at", "document-idle");
         this.includes = Collections.unmodifiableList(includes);
         this.excludes = Collections.unmodifiableList(excludes);
@@ -45,9 +49,10 @@ final class UserScript {
         origins = allowed.contains("*") ? Collections.singleton("*") : Collections.unmodifiableSet(allowed);
     }
 
-    static UserScript parse(String input) {
+    public static UserScript parse(String input) {
+        if (input == null) throw invalid("脚本内容为空");
         if (input.length() > MAX_BYTES || input.getBytes(StandardCharsets.UTF_8).length > MAX_BYTES)
-            throw invalid("脚本不能超过 256 KiB");
+            throw invalid("脚本不能超过 512 KiB");
         String source = input.replace("\r\n", "\n").replace('\r', '\n');
         if (source.startsWith("\ufeff")) source = source.substring(1);
         Matcher start = HEADER.matcher(source), end = END.matcher(source);
@@ -66,6 +71,14 @@ final class UserScript {
                 case "name": case "namespace": case "version": case "run-at":
                     if (value.length() > 240) throw invalid("@" + key + " 太长");
                     metadata.putIfAbsent(key, value);
+                    break;
+                case "author":
+                    metadata.putIfAbsent("author", value.length() > 160 ? value.substring(0, 160) : value);
+                    break;
+                case "description":
+                case "description:zh-CN":
+                case "description:zh":
+                    metadata.putIfAbsent(key, value.length() > 400 ? value.substring(0, 400) : value);
                     break;
                 case "match": case "include":
                     includes.add(UrlPattern.parse(value, key));
@@ -105,21 +118,72 @@ final class UserScript {
         return new UserScript(source, code, metadata, includes, excludes, grants);
     }
 
-    boolean needsStorage() {
+    public boolean needsStorage() {
         for (String grant : grants) if (grant.contains("Value")) return true;
         return false;
     }
 
-    boolean permits(String method) { return grants.contains("GM_" + method) || grants.contains("GM." + method); }
+    public boolean permits(String method) { return grants.contains("GM_" + method) || grants.contains("GM." + method); }
 
-    boolean matches(URI url) {
+    public boolean matches(URI url) {
         if (url == null || url.getUserInfo() != null || url.getHost() == null) return false;
         for (UrlPattern rule : excludes) if (rule.matches(url)) return false;
         for (UrlPattern rule : includes) if (rule.matches(url)) return true;
         return false;
     }
 
-    static URI address(String url) {
+    /**
+     * Pure-Java detector for remote .user.js install URLs (Greasy Fork, Sleazy Fork,
+     * ScriptCat, OpenUserJS, GitHub raw, direct CDN .user.js, etc.).
+     * Strictly requires HTTP(S) and excludes HTML code-viewer pages (/blob/, /tree/, etc.).
+     */
+    public static boolean isUserScriptUrl(String url) {
+        if (url == null || url.isEmpty() || url.length() > 8192 || !HttpUrlUtil.isHttp(url)) return false;
+        int schemeEnd = url.indexOf("://");
+        if (schemeEnd < 0) return false;
+        int pathStart = url.indexOf('/', schemeEnd + 3);
+        if (pathStart < 0) return false;
+        int pathEnd = url.length();
+        for (int i = pathStart; i < pathEnd; i++) {
+            char c = url.charAt(i);
+            if (c == '?' || c == '#') {
+                pathEnd = i;
+                break;
+            }
+        }
+        int lastSlash = url.lastIndexOf('/', pathEnd - 1);
+        int fileStart = lastSlash >= pathStart ? lastSlash + 1 : pathStart;
+        int fileLen = pathEnd - fileStart;
+        if (fileLen <= 8 || !url.regionMatches(true, pathEnd - 8, ".user.js", 0, 8)) return false;
+
+        String host = HttpUrlUtil.extractHost(url);
+        if (isCodeHostHtmlView(host, url, pathStart, pathEnd)) return false;
+        return true;
+    }
+
+    /** Detects whether a download filename (e.g. from Content-Disposition) ends with .user.js. */
+    public static boolean isUserScriptFilename(String filename) {
+        if (filename == null) return false;
+        String s = filename.trim();
+        if (s.length() >= 2 && ((s.startsWith("\"") && s.endsWith("\""))
+                || (s.startsWith("'") && s.endsWith("'")))) {
+            s = s.substring(1, s.length() - 1).trim();
+        }
+        return s.length() > 8 && s.regionMatches(true, s.length() - 8, ".user.js", 0, 8);
+    }
+
+    private static boolean isCodeHostHtmlView(String host, String url, int pathStart, int pathEnd) {
+        if (!"github.com".equals(host) && !"gitlab.com".equals(host)
+                && !"gitee.com".equals(host) && !"codeberg.org".equals(host)) {
+            return false;
+        }
+        String path = url.substring(pathStart, pathEnd).toLowerCase(Locale.ROOT);
+        return path.contains("/blob/") || path.contains("/tree/")
+                || path.contains("/edit/") || path.contains("/blame/")
+                || path.contains("/commits/");
+    }
+
+    public static URI address(String url) {
         if (url == null || url.length() > 8192) return null;
         try {
             URI uri = URI.create(url);
@@ -146,10 +210,10 @@ final class UserScript {
 
     private static IllegalArgumentException invalid(String reason) { return new IllegalArgumentException(reason); }
 
-    static final class UrlPattern {
-        final String original, scheme, host, path;
-        final boolean subdomains, wildcardPort;
-        final int port;
+    public static final class UrlPattern {
+        public final String original, scheme, host, path;
+        public final boolean subdomains, wildcardPort;
+        public final int port;
 
         private UrlPattern(String original, String scheme, String host, boolean subdomains,
                            int port, boolean wildcardPort, String path) {
@@ -168,6 +232,7 @@ final class UserScript {
             if (schemeEnd <= 0 || pattern.length() > 512 || pattern.indexOf('#') >= 0 || pattern.indexOf('\\') >= 0)
                 throw invalid("不支持 @" + key + " " + value);
             String scheme = pattern.substring(0, schemeEnd).toLowerCase(Locale.ROOT);
+            if (scheme.equals("http*")) scheme = "*";
             if (!scheme.equals("*") && !httpScheme(scheme)) throw invalid("网址模式仅支持 HTTP(S)");
             int pathStart = pattern.indexOf('/', schemeEnd + 3);
             String authority = pattern.substring(schemeEnd + 3, pathStart < 0 ? pattern.length() : pathStart);

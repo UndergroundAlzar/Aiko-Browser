@@ -40,6 +40,10 @@ try {
     )
     $httpUtil = Join-Path $src 'HttpUrlUtil.java'
     if (Test-Path -LiteralPath $httpUtil) { $javaSources.Add($httpUtil) }
+    $urlCleaner = Join-Path $src 'UrlCleaner.java'
+    if (Test-Path -LiteralPath $urlCleaner) { $javaSources.Add($urlCleaner) }
+    $videoBooster = Join-Path $src 'VideoBooster.java'
+    if (Test-Path -LiteralPath $videoBooster) { $javaSources.Add($videoBooster) }
 
     Run-Timed "javac host checks & bench" {
         & $javac --add-modules jdk.httpserver -encoding UTF-8 -d $ClassesDir @javaSources
@@ -68,19 +72,26 @@ try {
 
     $flagshipTest = Join-Path $testing 'FlagshipUnitChecks.java'
     $displaySrc = Join-Path $src 'DisplayModeEngine.java'
+    $perfSrc = Join-Path $src 'PerfProfiles.java'
     $catalogSrc = Join-Path $src 'SearchEngineCatalog.java'
     $libSrc = Join-Path $src 'BrowserLibrary.java'
+    $themeSrc = Join-Path $src 'AikoTheme.java'
+    $iconSrc = Join-Path $src 'BrowserIcon.java'
+    $gestureSrc = Join-Path $src 'GestureChrome.java'
     $parentDir = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..\..')).Path
     $androidJar = Join-Path $ToolchainRoot 'platform-36_r02/android-36/android.jar'
     $jsonJar = Join-Path $parentDir 'work/aiko-test-json.jar'
     if ((Test-Path -LiteralPath $flagshipTest) -and (Test-Path -LiteralPath $httpUtil) `
-            -and (Test-Path -LiteralPath $displaySrc) -and (Test-Path -LiteralPath $catalogSrc) `
-            -and (Test-Path -LiteralPath $androidJar) -and (Test-Path -LiteralPath $jsonJar)) {
+            -and (Test-Path -LiteralPath $displaySrc) -and (Test-Path -LiteralPath $perfSrc) `
+            -and (Test-Path -LiteralPath $catalogSrc) `
+            -and (Test-Path -LiteralPath $gestureSrc) -and (Test-Path -LiteralPath $themeSrc) `
+            -and (Test-Path -LiteralPath $iconSrc) -and (Test-Path -LiteralPath $androidJar) `
+            -and (Test-Path -LiteralPath $jsonJar)) {
         $flagshipClasses = Join-Path $ClassesDir 'flagship'
         New-Item -ItemType Directory -Path $flagshipClasses -Force | Out-Null
         $flagCp = "$ClassesDir;$jsonJar;$androidJar"
         Run-Timed "javac FlagshipUnitChecks" {
-            & $javac -encoding UTF-8 -cp $flagCp -d $flagshipClasses $catalogSrc $displaySrc $libSrc $flagshipTest
+            & $javac -encoding UTF-8 -cp $flagCp -d $flagshipClasses $catalogSrc $displaySrc $perfSrc $libSrc $themeSrc $iconSrc $gestureSrc $flagshipTest
         }
         Run-Timed "FlagshipUnitChecks" {
             & $java -cp "$flagshipClasses;$flagCp" app.aikobrowser.FlagshipUnitChecks (Join-Path $RepoRoot 'app/src/main/assets/filters')

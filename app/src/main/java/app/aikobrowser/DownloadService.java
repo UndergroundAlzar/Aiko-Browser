@@ -37,7 +37,17 @@ public final class DownloadService extends Service {
         return thread;
     });
     static final TransferPacer PACER = new TransferPacer();
+    private static volatile int maxLanesLimit = RangeDownload.MAX_LANES;
     static volatile Job current;
+
+    /** Sets the performance-profile cap on concurrent download lanes (clamped 1..128). */
+    public static void setMaxLanesLimit(int maxLanes) {
+        maxLanesLimit = RangeDownload.clampLanes(maxLanes);
+    }
+
+    public static int getMaxLanesLimit() {
+        return maxLanesLimit;
+    }
 
     static final class Job {
         final String name, userAgent;
@@ -87,7 +97,8 @@ public final class DownloadService extends Service {
         RangeDownload.requireHttp(url);
         Context app = context.getApplicationContext();
         File folder = new File(app.getFilesDir(), "transfers");
-        DownloadRecord record = new DownloadRecord(url, safeName(name), ua, lanes);
+        int effectiveLanes = Math.min(RangeDownload.clampLanes(lanes), maxLanesLimit);
+        DownloadRecord record = new DownloadRecord(url, safeName(name), ua, effectiveLanes);
         Job job = new Job(record, partFile(folder, url));
         job.needsRecordWrite = true;
         job.state = "准备下载";
@@ -303,8 +314,8 @@ public final class DownloadService extends Service {
             String cookies = null;
             try { cookies = CookieManager.getInstance().getCookie(job.url.toExternalForm()); }
             catch (RuntimeException ignored) { }
-            RangeDownload transfer = new RangeDownload(job.url, job.part, job.lanes, job.userAgent, cookies,
-                    PACER, () -> {
+            RangeDownload transfer = new RangeDownload(job.url, job.part, job.lanes, maxLanesLimit,
+                    job.userAgent, cookies, PACER, () -> {
                         try { android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND); }
                         catch (SecurityException ignored) { }
                     });

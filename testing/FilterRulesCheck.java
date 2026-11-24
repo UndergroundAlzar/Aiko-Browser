@@ -59,8 +59,39 @@ public final class FilterRulesCheck {
             check(!block(live, "youtube.com", "r1.googlevideo.com", "/videoplayback", 16), "sample YouTube video URL allowed");
             String css = live.css("www.youtube.com", "https://www.youtube.com/");
             check(css.contains("ytd-ad-slot-renderer") || css.contains("ytd-promoted"), "YouTube page rule");
-            System.out.printf("PASS shipped lists: %,d network, %,d cosmetic, %,d skipped; JVM compile %d ms%n",
+            System.out.printf("PASS shipped 3-list baseline: %,d network, %,d cosmetic, %,d skipped; JVM compile %d ms%n",
                     live.networkCount, live.cosmeticCount, live.skipped, compileMs);
+
+            String[] allSeven = {
+                    "adguard-cn", "cjx-annoyance", "adguard-mobile", "adguard-mobile-app",
+                    "easylist", "easyprivacy", "adguard-cookies"
+            };
+            boolean hasAllSeven = true;
+            for (String id : allSeven) {
+                if (!Files.isRegularFile(root.resolve(id + ".txt.gz"))) {
+                    hasAllSeven = false;
+                    break;
+                }
+            }
+            if (hasAllSeven) {
+                FilterRules.Builder shipped7 = new FilterRules.Builder();
+                shipped7.suffixes(gzip(root, "psl"));
+                for (String id : allSeven) shipped7.read(gzip(root, id), id);
+                long t7 = System.nanoTime();
+                FilterRules live7 = shipped7.build();
+                long compile7Ms = (System.nanoTime() - t7) / 1_000_000;
+                check(live7.networkCount + live7.cosmeticCount > 130_000, "all 7 bundled lists recognized");
+                check(block(live7, "linux.do", "qzs.gdtimg.com", "/sample", 1), "7-list Chinese ad network");
+                check(block(live7, "m.youku.com", "ad.youku.com", "/sdk.js", 1), "7-list mobile ad network");
+                check(block(live7, "janitorai.com", "ad.doubleclick.net", "/sample", 1), "7-list international ad network");
+                check(block(live7, "janitorai.com", "www.google-analytics.com", "/analytics.js", 1), "7-list tracking rule");
+                check(!block(live7, "janitorai.com", "janitorai.com", "/api/chats", 0), "7-list Janitor AI chat allowed");
+                check(!block(live7, "youtube.com", "r1.googlevideo.com", "/videoplayback", 16), "7-list YouTube video allowed");
+                check(!block(live7, "github.com", "github.com", "/UndergroundAlzar/Aiko-Browser", 0), "7-list GitHub allowed");
+                System.out.printf("PASS shipped 7-list v0.3.0: %,d network, %,d cosmetic (%,d active), %,d skipped; JVM compile %d ms%n",
+                        live7.networkCount, live7.cosmeticCount, live7.networkCount + live7.cosmeticCount,
+                        live7.skipped, compile7Ms);
+            }
         }
         System.out.println("PASS scoped matching, exceptions and cosmetic sanitization");
     }

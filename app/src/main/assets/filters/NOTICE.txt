@@ -5,15 +5,45 @@ their respective upstreams. The files are separate data consumed by Aiko's
 own rule matcher. The corresponding text is included inside this APK and
 in the source archive.
 
-- EasyList (version 202611201235) and EasyPrivacy (version 202611201244)
+- EasyList (version 202611240609, 2026-11-24 06:09 UTC) and
+  EasyPrivacy (version 202611240602, 2026-11-24 06:02 UTC)
   The EasyList authors (https://easylist.to/).
   GPL-3.0-or-later option per https://easylist.to/pages/licence.html.
+  See LICENSE-GPL-3.0.txt.
   https://easylist.to/easylist/easylist.txt
   https://easylist.to/easylist/easyprivacy.txt
-- AdGuard Chinese filter (version 2.1.69.90), including EasyList China
+
+- AdGuard Chinese filter (version 2.1.70.15, 2026-11-24 02:11 UTC),
+  including EasyList China
   https://filters.adtidy.org/extension/chromium/filters/224.txt
-  Upstream license notices: https://github.com/AdguardTeam/AdguardFilters
-  See the original headers and LICENSE-GPL-3.0.txt.
-- Public Suffix List (version 2026-11-20_10-39-09_UTC)
+  GNU General Public License v3.0 (GPL-3.0).
+  Upstream repository & license: https://github.com/AdguardTeam/AdguardFilters
+  See LICENSE-GPL-3.0.txt.
+
+- AdGuard Mobile Ads filter (Optimized, version 2.0.73.62, 2026-11-23 17:08 UTC)
+  https://filters.adtidy.org/extension/chromium/filters/11_optimized.txt
+  GNU General Public License v3.0 (GPL-3.0).
+  Upstream repository & license: https://github.com/AdguardTeam/AdguardFilters
+  See LICENSE-GPL-3.0.txt.
+
+- AdGuard Mobile App Banners filter (version 2.0.34.45, 2026-11-23 16:08 UTC)
+  https://filters.adtidy.org/extension/chromium/filters/20.txt
+  GNU General Public License v3.0 (GPL-3.0).
+  Upstream repository & license: https://github.com/AdguardTeam/AdguardFilters
+  See LICENSE-GPL-3.0.txt.
+
+- AdGuard Cookie Notices filter (Optimized, version 2.1.0.28, 2026-11-24 05:09 UTC)
+  https://filters.adtidy.org/extension/chromium/filters/18_optimized.txt
+  GNU General Public License v3.0 (GPL-3.0).
+  Upstream repository & license: https://github.com/AdguardTeam/AdguardFilters
+  See LICENSE-GPL-3.0.txt.
+
+- CJX's Annoyance List (version 202610011010, 2026-10-01 10:10 +0800)
+  https://raw.githubusercontent.com/cjx82630/cjxlist/master/cjx-annoyance.txt
+  GNU Lesser General Public License v3.0 (LGPL-3.0).
+  Upstream repository & license: https://github.com/cjx82630/cjxlist
+  See LICENSE-LGPL-3.0.txt and LICENSE-GPL-3.0.txt.
+
+- Public Suffix List (version 2026-11-23_15-54-01_UTC)
   https://publicsuffix.org/list/public_suffix_list.dat
   Mozilla Public License 2.0; see LICENSE-MPL-2.0.txt.

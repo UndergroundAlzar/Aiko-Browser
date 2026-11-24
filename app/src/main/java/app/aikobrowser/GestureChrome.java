@@ -1,5 +1,7 @@
 package app.aikobrowser;
 
+import android.animation.Animator;
+import android.animation.AnimatorListenerAdapter;
 import android.content.Context;
 import android.graphics.Rect;
 import android.graphics.drawable.GradientDrawable;
@@ -10,6 +12,7 @@ import android.view.HapticFeedbackConstants;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewConfiguration;
+import android.view.animation.PathInterpolator;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.TextView;
@@ -23,7 +26,8 @@ import java.util.List;
  * 1. Bottom-bar horizontal swipe to switch prev/next tab with floating ghost preview pill.
  * 2. Bottom-bar swipe-up to open Tab switcher sheet.
  * 3. Zero-consume left/right edge Back/Forward swipe with dynamic system-gesture exclusion.
- * 4. GPU-only translationY auto-hide bottom bar on scroll (zero LayoutParams mutations).
+ * 4. Discrete-transition GPU auto-hide bottom bar + pure-Java viewport layout calculator
+ *    (zero per-scroll-pixel LayoutParams mutations, zero bottom-bar overlap when docked).
  */
 final class GestureChrome {
     interface Callbacks {
@@ -39,6 +43,143 @@ final class GestureChrome {
         void onOpenTabs();
         void onEdgeBack();
         void onEdgeForward();
+        void onBarLayoutChangeNeeded();
+    }
+
+    /**
+     * Pure-Java immutable layout snapshot for bottomDeck, viewport, and omniboxOverlay.
+     * Contains zero Android runtime calls so host JVM unit tests can verify every state directly.
+     */
+    static final class ChromeLayout {
+        final boolean deckVisible;
+        final int deckPaddingBottom;
+        final int deckTranslationY;
+        final int viewportBottomMargin;
+        final int omniboxBottomMargin;
+
+        ChromeLayout(boolean deckVisible, int deckPaddingBottom, int deckTranslationY,
+                     int viewportBottomMargin, int omniboxBottomMargin) {
+            this.deckVisible = deckVisible;
+            this.deckPaddingBottom = deckPaddingBottom;
+            this.deckTranslationY = deckTranslationY;
+            this.viewportBottomMargin = viewportBottomMargin;
+            this.omniboxBottomMargin = omniboxBottomMargin;
+        }
+    }
+
+    /**
+     * Pure-Java chrome/viewport layout state calculator covering all 8 states:
+     * 1. Fullscreen video -> deck hidden, viewport margin = 0 (true edge-to-edge).
+     * 2. Editing omnibox -> deck floats above IME/nav, viewport stays steady at docked height
+     *    (zero WebView reflow while typing URL), omniboxOverlay sits omniboxGapPx above deck.
+     * 3. Find-in-page open -> deck floats above IME/nav, viewport sits strictly above deck.
+     * 4. WebView IME open (!onHome && (imeOpen || legacyWebImeOpen)) -> deck hidden,
+     *    viewport sized directly above IME (maximum room for web chat/forms, zero obstruction).
+     * 5. Home start page -> deck visible with nav padding, viewport reserves exact visible deck height.
+     * 6. Normal webpage auto-hidden -> deck slid offscreen by +(deckH + nav), viewport margin = nav.
+     * 7. Normal webpage revealing (barSettlingShow) -> viewport stays at nav during 160ms GPU slide-in,
+     *    then snaps once to deckH + nav when settled (zero mid-fling relayout).
+     * 8. Normal webpage docked -> viewport ends strictly at top edge of bottomDeck (ZERO overlap).
+     */
+    static ChromeLayout computeChromeLayout(
+            boolean fullscreen,
+            boolean onHome,
+            boolean editingOmnibox,
+            boolean findOpen,
+            boolean barHidden,
+            boolean barSettlingShow,
+            boolean legacyWebImeOpen,
+            int insetBottom,
+            int imeBottom,
+            int deckContentHeight,
+            int omniboxGapPx) {
+        int nav = Math.max(0, insetBottom);
+        int ime = Math.max(0, imeBottom);
+        int deckH = Math.max(0, deckContentHeight);
+        int gap = Math.max(0, omniboxGapPx);
+        int dockedTotal = deckH + nav;
+        boolean imeOpen = ime > nav;
+
+        if (fullscreen) {
+            return new ChromeLayout(false, 0, 0, 0, 0);
+        }
+        if (editingOmnibox) {
+            int deckPad = imeOpen ? 0 : nav;
+            int deckTransY = imeOpen ? -ime : 0;
+            int baseBottom = imeOpen ? ime : nav;
+            return new ChromeLayout(true, deckPad, deckTransY, dockedTotal, baseBottom + deckH + gap);
+        }
+        if (findOpen) {
+            int deckPad = imeOpen ? 0 : nav;
+            int deckTransY = imeOpen ? -ime : 0;
+            int baseBottom = imeOpen ? ime : nav;
+            return new ChromeLayout(true, deckPad, deckTransY, baseBottom + deckH, 0);
+        }
+        if (!onHome && (imeOpen || legacyWebImeOpen)) {
+            return new ChromeLayout(false, 0, 0, imeOpen ? ime : 0, 0);
+        }
+        if (onHome) {
+            int vpMargin = Math.max(dockedTotal, imeOpen ? ime : 0);
+            return new ChromeLayout(true, nav, 0, vpMargin, 0);
+        }
+        if (barHidden) {
+            return new ChromeLayout(true, nav, dockedTotal, nav, 0);
+        }
+        if (barSettlingShow) {
+            return new ChromeLayout(true, nav, 0, nav, 0);
+        }
+        return new ChromeLayout(true, nav, 0, dockedTotal, 0);
+    }
+
+    static boolean canAutoHideForScroll(int maxScrollY, int deckContentHeight, int minExtraScrollPx) {
+        return maxScrollY > Math.max(0, deckContentHeight) + Math.max(0, minExtraScrollPx);
+    }
+
+    /** Zero-alloc tactile press-scale GPU feedback, preserving optional finger-down hook (e.g. preconnect). */
+    static void attachPressScale(View target, float pressedScale, Runnable onActionDown) {
+        final PathInterpolator curve = new PathInterpolator(0.2f, 0f, 0f, 1f);
+        final PathInterpolator settle = new PathInterpolator(0.18f, 0.92f, 0.30f, 1.04f);
+        final AnimatorListenerAdapter clearLayer = new AnimatorListenerAdapter() {
+            @Override public void onAnimationEnd(Animator animation) {
+                target.setLayerType(View.LAYER_TYPE_NONE, null);
+                target.animate().setListener(null);
+            }
+            @Override public void onAnimationCancel(Animator animation) {
+                target.setLayerType(View.LAYER_TYPE_NONE, null);
+                target.animate().setListener(null);
+            }
+        };
+        target.setOnTouchListener((v, ev) -> {
+            int action = ev.getActionMasked();
+            if (action == MotionEvent.ACTION_DOWN) {
+                if (onActionDown != null) onActionDown.run();
+                if (!v.isEnabled()) return false;
+                v.animate().setListener(null).cancel();
+                v.setLayerType(View.LAYER_TYPE_NONE, null);
+                v.animate()
+                        .scaleX(pressedScale)
+                        .scaleY(pressedScale)
+                        .setDuration(75)
+                        .setInterpolator(curve)
+                        .withLayer()
+                        .setListener(clearLayer)
+                        .start();
+            } else if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) {
+                v.animate().setListener(null).cancel();
+                v.setLayerType(View.LAYER_TYPE_NONE, null);
+                if (v.getScaleX() != 1f || v.getScaleY() != 1f) {
+                    v.animate()
+                            .scaleX(1f)
+                            .scaleY(1f)
+                            .setDuration(150)
+                            .setInterpolator(settle)
+                            .withLayer()
+                            .setListener(clearLayer)
+                            .start();
+                }
+            }
+            return false;
+        });
     }
 
     private final Callbacks cb;
@@ -48,6 +189,7 @@ final class GestureChrome {
     private final float edgeArmPx;
     private final float barSwitchArmPx;
     private final float barUpArmPx;
+    private final PathInterpolator emphasizedDecel;
 
     // Floating GPU indicators (hosted in root FrameLayout, GONE/alpha=0 when idle)
     private final LinearLayout ghostPill;
@@ -58,12 +200,17 @@ final class GestureChrome {
     private final BrowserIcon edgeIcon;
     private final GradientDrawable edgeBg;
 
-    // Auto-hide bottom deck state
+    // Auto-hide bottom deck state (discrete state transitions only)
     private View bottomDeck;
     private boolean barHidden;
+    private boolean barSettlingShow;
+    private boolean barAnimating;
+    private int barAnimGen;
     private int scrollAccum;
     private boolean autoHideEnabled = true;
     private boolean edgeGesturesEnabled = true;
+    private int topSafePx;
+    private int bottomSafePx;
 
     // Bottom bar gesture state
     private int barMode; // 0=none, 1=horizontal, 2=up
@@ -91,16 +238,19 @@ final class GestureChrome {
         this.edgeArmPx = 68f * density;
         this.barSwitchArmPx = 56f * density;
         this.barUpArmPx = 42f * density;
+        this.emphasizedDecel = new PathInterpolator(0.2f, 0f, 0f, 1f);
+        this.topSafePx = AikoTheme.dp(density, 44);
+        this.bottomSafePx = AikoTheme.dp(density, 72);
 
         // Ghost preview pill for bottom-bar tab switch / swipe-up tabs
-        ghostBg = AikoTheme.card(AikoTheme.SURFACE, AikoTheme.STROKE, density, AikoTheme.dp(density, 20));
+        ghostBg = AikoTheme.card(AikoTheme.SURFACE, AikoTheme.CAPSULE_STROKE, density, AikoTheme.dp(density, 20));
         ghostPill = new LinearLayout(ctx);
         ghostPill.setOrientation(LinearLayout.HORIZONTAL);
         ghostPill.setGravity(Gravity.CENTER_VERTICAL);
         ghostPill.setPadding(AikoTheme.dp(density, 14), AikoTheme.dp(density, 9),
                 AikoTheme.dp(density, 14), AikoTheme.dp(density, 9));
         ghostPill.setBackground(ghostBg);
-        ghostPill.setElevation(AikoTheme.dp(density, 8));
+        ghostPill.setElevation(AikoTheme.dp(density, 10));
         ghostPill.setVisibility(View.GONE);
         ghostPill.setAlpha(0f);
 
@@ -116,7 +266,7 @@ final class GestureChrome {
         ghostTitle.setTypeface(AikoTheme.MEDIUM);
         ghostTitle.setTextColor(AikoTheme.TEXT);
         ghostTitle.setSingleLine(true);
-        ghostTitle.setMaxWidth(AikoTheme.dp(density, 190));
+        ghostTitle.setMaxWidth(AikoTheme.dp(density, 196));
         ghostTitle.setEllipsize(TextUtils.TruncateAt.END);
         ghostPill.addView(ghostTitle);
 
@@ -128,14 +278,14 @@ final class GestureChrome {
         ghostPill.addView(ghostCounter);
 
         FrameLayout.LayoutParams glp = new FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL);
-        glp.bottomMargin = AikoTheme.dp(density, 74);
+        glp.bottomMargin = AikoTheme.dp(density, 72);
         overlayHost.addView(ghostPill, glp);
 
         // Edge Back/Forward floating pill indicator
-        edgeBg = AikoTheme.card(AikoTheme.SURFACE, AikoTheme.STROKE, density, AikoTheme.dp(density, 22));
+        edgeBg = AikoTheme.card(AikoTheme.SURFACE, AikoTheme.CAPSULE_STROKE, density, AikoTheme.dp(density, 22));
         edgeBadge = new FrameLayout(ctx);
         edgeBadge.setBackground(edgeBg);
-        edgeBadge.setElevation(AikoTheme.dp(density, 8));
+        edgeBadge.setElevation(AikoTheme.dp(density, 10));
         edgeBadge.setVisibility(View.GONE);
         edgeBadge.setAlpha(0f);
 
@@ -150,6 +300,17 @@ final class GestureChrome {
 
     void attachBottomDeck(View deck) {
         this.bottomDeck = deck;
+    }
+
+    void setSafeInsets(int topInsetPx, int deckTotalHeightPx) {
+        topSafePx = Math.max(AikoTheme.dp(density, 44), topInsetPx);
+        bottomSafePx = Math.max(AikoTheme.dp(density, 64), deckTotalHeightPx);
+        int desiredGhostMargin = Math.max(AikoTheme.dp(density, 68), deckTotalHeightPx + AikoTheme.dp(density, 12));
+        FrameLayout.LayoutParams glp = (FrameLayout.LayoutParams) ghostPill.getLayoutParams();
+        if (glp != null && glp.bottomMargin != desiredGhostMargin) {
+            glp.bottomMargin = desiredGhostMargin;
+            ghostPill.setLayoutParams(glp);
+        }
     }
 
     void setAutoHideEnabled(boolean enabled) {
@@ -167,25 +328,131 @@ final class GestureChrome {
         return barHidden;
     }
 
-    /** GPU-only bar reveal/hide — never modifies LayoutParams. */
-    void showBar(boolean animate) {
-        scrollAccum = 0;
-        if (bottomDeck == null) return;
-        barHidden = false;
-        if (animate) AikoTheme.animateTranslationY(bottomDeck, 0f, 150);
-        else {
-            bottomDeck.animate().cancel();
-            bottomDeck.setTranslationY(0f);
+    boolean isBarSettlingShow() {
+        return barSettlingShow;
+    }
+
+    boolean isBarAnimating() {
+        return barAnimating;
+    }
+
+    /** Cancels any active slide animation & clears GPU layer safely before state overrides. */
+    void cancelBarAnimation() {
+        barAnimGen++;
+        barAnimating = false;
+        barSettlingShow = false;
+        if (bottomDeck != null) {
+            bottomDeck.animate().setListener(null).cancel();
             bottomDeck.setLayerType(View.LAYER_TYPE_NONE, null);
         }
     }
 
+    /**
+     * Discrete-transition bar reveal:
+     * - animate=true: GPU-slides bottomDeck from +deckHeight -> 0 while keeping viewport steady
+     *   during the 160ms fling, then notifies onBarLayoutChangeNeeded() ONCE when settled.
+     * - animate=false: snaps immediately and notifies layout immediately if visibility changed.
+     */
+    void showBar(boolean animate) {
+        scrollAccum = 0;
+        if (bottomDeck == null) {
+            barHidden = false;
+            barSettlingShow = false;
+            barAnimating = false;
+            return;
+        }
+        boolean wasHidden = barHidden;
+        boolean wasSettling = barSettlingShow;
+        barHidden = false;
+
+        float curY = bottomDeck.getTranslationY();
+        if (!animate || curY <= 0.5f) {
+            barAnimGen++;
+            barAnimating = false;
+            barSettlingShow = false;
+            bottomDeck.animate().setListener(null).cancel();
+            bottomDeck.setLayerType(View.LAYER_TYPE_NONE, null);
+            if (curY > 0f) bottomDeck.setTranslationY(0f);
+            if (wasHidden || wasSettling) cb.onBarLayoutChangeNeeded();
+            return;
+        }
+
+        final int gen = ++barAnimGen;
+        barSettlingShow = true;
+        barAnimating = true;
+        bottomDeck.animate().setListener(null).cancel();
+        bottomDeck.setLayerType(View.LAYER_TYPE_NONE, null);
+        bottomDeck.animate()
+                .translationY(0f)
+                .setDuration(160)
+                .setInterpolator(emphasizedDecel)
+                .withLayer()
+                .setListener(new AnimatorListenerAdapter() {
+                    private boolean cancelled;
+                    @Override public void onAnimationCancel(Animator animation) {
+                        cancelled = true;
+                        bottomDeck.setLayerType(View.LAYER_TYPE_NONE, null);
+                        bottomDeck.animate().setListener(null);
+                    }
+                    @Override public void onAnimationEnd(Animator animation) {
+                        bottomDeck.setLayerType(View.LAYER_TYPE_NONE, null);
+                        bottomDeck.animate().setListener(null);
+                        if (!cancelled && gen == barAnimGen) {
+                            barAnimating = false;
+                            barSettlingShow = false;
+                            cb.onBarLayoutChangeNeeded();
+                        }
+                    }
+                })
+                .start();
+    }
+
+    /**
+     * Discrete-transition bar hide:
+     * Expands viewport ONCE immediately (zero flash because bottomDeck still covers the bottom strip)
+     * and GPU-slides bottomDeck smoothly offscreen (0 -> +deckHeight).
+     */
     void hideBar() {
         if (bottomDeck == null || !autoHideEnabled || cb.isEditingAddress() || cb.isHomeVisible()) return;
+        if (bottomDeck.getVisibility() != View.VISIBLE) return;
         int h = bottomDeck.getHeight();
         if (h <= 0) return;
+        if (barHidden && !barAnimating) return;
+
+        final int gen = ++barAnimGen;
         barHidden = true;
-        AikoTheme.animateTranslationY(bottomDeck, h + AikoTheme.dp(density, 8), 160);
+        barSettlingShow = false;
+        barAnimating = true;
+        cb.onBarLayoutChangeNeeded();
+
+        // Abort if an overriding state (Find-in-Page, IME, Fullscreen, Home) cancelled auto-hide during layout
+        if (!barAnimating || !barHidden || gen != barAnimGen || bottomDeck.getVisibility() != View.VISIBLE) {
+            return;
+        }
+
+        bottomDeck.animate().setListener(null).cancel();
+        bottomDeck.setLayerType(View.LAYER_TYPE_NONE, null);
+        bottomDeck.animate()
+                .translationY(h)
+                .setDuration(170)
+                .setInterpolator(emphasizedDecel)
+                .withLayer()
+                .setListener(new AnimatorListenerAdapter() {
+                    private boolean cancelled;
+                    @Override public void onAnimationCancel(Animator animation) {
+                        cancelled = true;
+                        bottomDeck.setLayerType(View.LAYER_TYPE_NONE, null);
+                        bottomDeck.animate().setListener(null);
+                    }
+                    @Override public void onAnimationEnd(Animator animation) {
+                        bottomDeck.setLayerType(View.LAYER_TYPE_NONE, null);
+                        bottomDeck.animate().setListener(null);
+                        if (!cancelled && gen == barAnimGen) {
+                            barAnimating = false;
+                        }
+                    }
+                })
+                .start();
     }
 
     void onPageScroll(int scrollY, int oldScrollY, int maxScrollY) {
@@ -203,7 +470,9 @@ final class GestureChrome {
 
         int hideThreshold = AikoTheme.dp(density, 28);
         int showThreshold = -AikoTheme.dp(density, 20);
-        if (!barHidden && scrollAccum > hideThreshold && maxScrollY > AikoTheme.dp(density, 80)) {
+        int deckH = Math.max(0, bottomDeck.getHeight() - bottomDeck.getPaddingBottom());
+        if (!barHidden && scrollAccum > hideThreshold
+                && canAutoHideForScroll(maxScrollY, deckH, AikoTheme.dp(density, 96))) {
             hideBar();
             scrollAccum = 0;
         } else if (barHidden && scrollAccum < showThreshold) {
@@ -275,8 +544,11 @@ final class GestureChrome {
                     }
                     float progress = Math.min(1f, Math.abs(dx) / barSwitchArmPx);
                     float travel = Math.signum(dx) * Math.min(AikoTheme.dp(density, 28), Math.abs(dx) * 0.28f);
+                    float scale = armed ? 1.03f : (0.94f + 0.06f * progress);
                     ghostPill.setTranslationX(travel);
                     ghostPill.setTranslationY(0f);
+                    ghostPill.setScaleX(scale);
+                    ghostPill.setScaleY(scale);
                     ghostPill.setAlpha(0.35f + 0.65f * progress);
                 } else if (barMode == 2) {
                     boolean armed = -dy >= barUpArmPx;
@@ -288,8 +560,11 @@ final class GestureChrome {
                         updateGhostPill("↑", "标签页", cb.tabCount() + " 个", armed);
                     }
                     float progress = Math.min(1f, Math.max(0f, -dy) / barUpArmPx);
+                    float scale = armed ? 1.03f : (0.94f + 0.06f * progress);
                     ghostPill.setTranslationX(0f);
                     ghostPill.setTranslationY(-Math.min(AikoTheme.dp(density, 24), Math.max(0f, -dy) * 0.35f));
+                    ghostPill.setScaleX(scale);
+                    ghostPill.setScaleY(scale);
                     ghostPill.setAlpha(0.35f + 0.65f * progress);
                 }
                 return true;
@@ -316,31 +591,47 @@ final class GestureChrome {
 
     private void updateGhostPill(String dir, String label, String counter, boolean armed) {
         if (ghostPill.getVisibility() != View.VISIBLE) {
-            ghostPill.animate().cancel();
+            ghostPill.animate().setListener(null).cancel();
+            ghostPill.setLayerType(View.LAYER_TYPE_NONE, null);
             ghostPill.setVisibility(View.VISIBLE);
         }
         if (!TextUtils.equals(ghostDirection.getText(), dir)) ghostDirection.setText(dir);
         if (!TextUtils.equals(ghostTitle.getText(), label)) ghostTitle.setText(label);
         if (!TextUtils.equals(ghostCounter.getText(), counter)) ghostCounter.setText(counter);
         ghostBg.setColor(armed ? AikoTheme.HIGHLIGHT : AikoTheme.SURFACE);
-        ghostBg.setStroke(Math.max(1, Math.round(density)), armed ? AikoTheme.ACCENT : AikoTheme.STROKE);
+        ghostBg.setStroke(Math.max(1, Math.round(density)), armed ? AikoTheme.ACCENT : AikoTheme.CAPSULE_STROKE);
         ghostDirection.setTextColor(armed ? AikoTheme.CYAN : AikoTheme.ACCENT);
     }
 
     private void hideGhostPill() {
         if (ghostPill.getVisibility() != View.VISIBLE) return;
-        ghostPill.animate().cancel();
+        ghostPill.animate().setListener(null).cancel();
         ghostPill.animate()
                 .alpha(0f)
                 .translationY(AikoTheme.dp(density, 8))
-                .setDuration(110)
-                .setInterpolator(AikoTheme.EASE_OUT)
+                .scaleX(0.95f)
+                .scaleY(0.95f)
+                .setDuration(120)
+                .setInterpolator(emphasizedDecel)
                 .withLayer()
-                .withEndAction(() -> {
-                    ghostPill.setLayerType(View.LAYER_TYPE_NONE, null);
-                    ghostPill.setVisibility(View.GONE);
-                    ghostPill.setTranslationX(0f);
-                    ghostPill.setTranslationY(0f);
+                .setListener(new AnimatorListenerAdapter() {
+                    private boolean cancelled;
+                    @Override public void onAnimationCancel(Animator animation) {
+                        cancelled = true;
+                        ghostPill.setLayerType(View.LAYER_TYPE_NONE, null);
+                        ghostPill.animate().setListener(null);
+                    }
+                    @Override public void onAnimationEnd(Animator animation) {
+                        ghostPill.setLayerType(View.LAYER_TYPE_NONE, null);
+                        ghostPill.animate().setListener(null);
+                        if (!cancelled) {
+                            ghostPill.setVisibility(View.GONE);
+                            ghostPill.setTranslationX(0f);
+                            ghostPill.setTranslationY(0f);
+                            ghostPill.setScaleX(1f);
+                            ghostPill.setScaleY(1f);
+                        }
+                    }
                 })
                 .start();
     }
@@ -353,7 +644,7 @@ final class GestureChrome {
 
     /**
      * Zero-consume screen-edge Back/Forward observer.
-     * Call from Activity.dispatchTouchEvent; ALWAYS returns false so WebView touches are never stolen.
+     * Call from Activity.dispatchTouchEvent; never steals WebView touches.
      */
     void observeEdgeTouch(View host, MotionEvent ev) {
         if (!edgeGesturesEnabled || cb.isEditingAddress() || cb.isHomeVisible()) {
@@ -373,7 +664,7 @@ final class GestureChrome {
                 float x = ev.getX();
                 float y = ev.getY();
                 // Ignore bottom bar area & status bar top edge
-                if (y < AikoTheme.dp(density, 44) || y > height - AikoTheme.dp(density, 72)) return;
+                if (y < topSafePx || y > height - bottomSafePx) return;
                 if (x <= edgeZonePx && cb.canGoBack() && !cb.canWebScrollHorizontally(-1)) {
                     edgeSide = -1;
                     edgeDownX = x;
@@ -404,7 +695,8 @@ final class GestureChrome {
                     }
                     if (inward > touchSlop * 1.25f && inward > Math.abs(dy) * 1.35f) {
                         edgeActive = true;
-                        edgeBadge.animate().cancel();
+                        edgeBadge.animate().setListener(null).cancel();
+                        edgeBadge.setLayerType(View.LAYER_TYPE_NONE, null);
                         FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams) edgeBadge.getLayoutParams();
                         lp.gravity = Gravity.CENTER_VERTICAL | (edgeSide < 0 ? Gravity.START : Gravity.END);
                         edgeBadge.setLayoutParams(lp);
@@ -420,7 +712,7 @@ final class GestureChrome {
                     edgeArmed = armed;
                     if (armed) host.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK);
                     edgeBg.setColor(armed ? AikoTheme.HIGHLIGHT : AikoTheme.SURFACE);
-                    edgeBg.setStroke(Math.max(1, Math.round(density)), armed ? AikoTheme.ACCENT : AikoTheme.STROKE);
+                    edgeBg.setStroke(Math.max(1, Math.round(density)), armed ? AikoTheme.ACCENT : AikoTheme.CAPSULE_STROKE);
                     edgeIcon.tint(armed ? AikoTheme.CYAN : AikoTheme.TEXT_MUTED);
                 }
                 float progress = Math.min(1f, clamped / edgeArmPx);
@@ -458,18 +750,27 @@ final class GestureChrome {
         edgeArmed = false;
         edgeCancelled = false;
         if (edgeBadge.getVisibility() == View.VISIBLE) {
-            edgeBadge.animate().cancel();
+            edgeBadge.animate().setListener(null).cancel();
             edgeBadge.animate()
                     .alpha(0f)
                     .translationX(0f)
                     .scaleX(0.85f)
                     .scaleY(0.85f)
-                    .setDuration(110)
-                    .setInterpolator(AikoTheme.EASE_OUT)
+                    .setDuration(120)
+                    .setInterpolator(emphasizedDecel)
                     .withLayer()
-                    .withEndAction(() -> {
-                        edgeBadge.setLayerType(View.LAYER_TYPE_NONE, null);
-                        edgeBadge.setVisibility(View.GONE);
+                    .setListener(new AnimatorListenerAdapter() {
+                        private boolean cancelled;
+                        @Override public void onAnimationCancel(Animator animation) {
+                            cancelled = true;
+                            edgeBadge.setLayerType(View.LAYER_TYPE_NONE, null);
+                            edgeBadge.animate().setListener(null);
+                        }
+                        @Override public void onAnimationEnd(Animator animation) {
+                            edgeBadge.setLayerType(View.LAYER_TYPE_NONE, null);
+                            edgeBadge.animate().setListener(null);
+                            if (!cancelled) edgeBadge.setVisibility(View.GONE);
+                        }
                     })
                     .start();
         }

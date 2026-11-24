@@ -268,23 +268,153 @@ public final class FilterRulesBench {
                 cssSizes);
 
         // 6. Binary cache write/read benchmark (v0.2.0+ via reflection, skipped on v0.1.9)
-        benchBinaryCache(live, topKeys, sig.toString().hashCode());
+        benchBinaryCache("BINARY_CACHE", live, topKeys, sig.toString().hashCode());
 
-        // 7. URL validation throughput (baseline MainActivity.http() = new URL + RangeDownload.requireHttp,
+        // 7. Full v0.3.0 7-list bundled benchmark (when all 7 built-in .txt.gz lists are present)
+        String[] allSevenIds = {
+                "adguard-cn", "cjx-annoyance", "adguard-mobile", "adguard-mobile-app",
+                "easylist", "easyprivacy", "adguard-cookies"
+        };
+        boolean hasAllSeven = true;
+        for (String id : allSevenIds) {
+            if (!Files.isRegularFile(filtersDir.resolve(id + ".txt.gz"))) {
+                hasAllSeven = false;
+                break;
+            }
+        }
+        if (hasAllSeven) {
+            acc += benchAllSeven(filtersDir, allSevenIds);
+        }
+
+        // 8. URL validation throughput (baseline MainActivity.http() = new URL + RangeDownload.requireHttp,
         //    plus HttpUrlUtil.isHttp() via reflection when present in v0.2.0+)
         benchUrlValidation();
 
         SINK = acc;
     }
 
-    private static void benchBinaryCache(FilterRules live, String[] topKeys, int expectedSigHash) throws Exception {
+    private static long benchAllSeven(Path filtersDir, String[] listIds) throws Exception {
+        RETAINED = null;
+        long heapBefore = usedHeapAfterGc();
+        CompileTiming cold = compileLists(filtersDir, listIds);
+        RETAINED = cold.rules;
+        long heapAfter = usedHeapAfterGc();
+        double retainedMb = Math.max(0L, heapAfter - heapBefore) / (1024.0 * 1024.0);
+        System.out.printf(Locale.ROOT,
+                "ALL7_COMPILE_COLD psl=%.2fms read=%.2fms build=%.2fms total=%.2fms retained_heap=%.2fMB network=%d cosmetic=%d skipped=%d%n",
+                cold.pslMs, cold.readMs, cold.buildMs, cold.totalMs, retainedMb,
+                cold.rules.networkCount, cold.rules.cosmeticCount, cold.rules.skipped);
+
+        for (int i = 0; i < 2; i++) RETAINED = compileLists(filtersDir, listIds).rules;
+        double[] wPsl = new double[5], wRead = new double[5], wBuild = new double[5], wTot = new double[5];
+        for (int i = 0; i < 5; i++) {
+            CompileTiming t = compileLists(filtersDir, listIds);
+            RETAINED = t.rules;
+            wPsl[i] = t.pslMs;
+            wRead[i] = t.readMs;
+            wBuild[i] = t.buildMs;
+            wTot[i] = t.totalMs;
+        }
+        System.out.printf(Locale.ROOT,
+                "ALL7_COMPILE_WARM_MEDIAN psl=%.2fms read=%.2fms build=%.2fms total=%.2fms%n",
+                median(wPsl), median(wRead), median(wBuild), median(wTot));
+
+        FilterRules live = (FilterRules) RETAINED;
+        String[] topKeys = new String[WORKLOAD.length];
+        for (int i = 0; i < WORKLOAD.length; i++) topKeys[i] = live.siteKey(WORKLOAD[i].topHost);
+
+        int blockedCount = 0;
+        StringBuilder sig = new StringBuilder();
+        for (int i = 0; i < WORKLOAD.length; i++) {
+            RequestSample s = WORKLOAD[i];
+            FilterRules.Rule hit = live.blockingRule(s.topHost, topKeys[i], s.host, s.url, s.type, s.fetchSite);
+            if (hit != null) blockedCount++;
+            String info = hit == null ? "ALLOW" : ("BLOCK[" + hit.source + "] " + live.description(hit));
+            sig.append(i).append(':').append(info).append('\n');
+        }
+        System.out.printf(Locale.ROOT, "ALL7_WORKLOAD_MATCHES blocked=%d/%d sigHash=0x%08x%n",
+                blockedCount, WORKLOAD.length, sig.toString().hashCode());
+
+        long acc = 0;
+        for (int w = 0; w < 1_000; w++) {
+            for (int i = 0; i < WORKLOAD.length; i++) {
+                RequestSample s = WORKLOAD[i];
+                if (live.blockingRule(s.topHost, topKeys[i], s.host, s.url, s.type, s.fetchSite) != null) acc++;
+            }
+        }
+        final int batchSweeps = 5_000;
+        long bStart = System.nanoTime();
+        for (int w = 0; w < batchSweeps; w++) {
+            for (int i = 0; i < WORKLOAD.length; i++) {
+                RequestSample s = WORKLOAD[i];
+                if (live.blockingRule(s.topHost, topKeys[i], s.host, s.url, s.type, s.fetchSite) != null) acc++;
+            }
+        }
+        double batchMeanUs = ((System.nanoTime() - bStart) / 1000.0) / (batchSweeps * (double) WORKLOAD.length);
+
+        final int sampleSweeps = 2_000;
+        long[] allSamples = new long[sampleSweeps * WORKLOAD.length];
+        int idx = 0;
+        for (int w = 0; w < sampleSweeps; w++) {
+            for (int i = 0; i < WORKLOAD.length; i++) {
+                RequestSample s = WORKLOAD[i];
+                long t0 = System.nanoTime();
+                FilterRules.Rule r = live.blockingRule(s.topHost, topKeys[i], s.host, s.url, s.type, s.fetchSite);
+                long dt = System.nanoTime() - t0;
+                if (r != null) acc++;
+                allSamples[idx++] = dt;
+            }
+        }
+        Arrays.sort(allSamples);
+        System.out.printf(Locale.ROOT,
+                "ALL7_BLOCKING_RULE_US batch_mean=%.3f p50=%.3f p95=%.3f p99=%.3f max=%.3f samples=%d%n",
+                batchMeanUs,
+                percentile(allSamples, 0.50) / 1000.0,
+                percentile(allSamples, 0.95) / 1000.0,
+                percentile(allSamples, 0.99) / 1000.0,
+                allSamples[allSamples.length - 1] / 1000.0,
+                allSamples.length);
+
+        for (int w = 0; w < 500; w++) {
+            for (String[] pair : CSS_HOSTS) acc += live.css(pair[0], pair[1]).length();
+        }
+        final int cssSweeps = 2_000;
+        long[] cssSamples = new long[cssSweeps * CSS_HOSTS.length];
+        int cIdx = 0;
+        StringBuilder cssSizes = new StringBuilder();
+        for (String[] pair : CSS_HOSTS) {
+            if (cssSizes.length() > 0) cssSizes.append(", ");
+            cssSizes.append(pair[0]).append('=').append(live.css(pair[0], pair[1]).length()).append("ch");
+        }
+        for (int w = 0; w < cssSweeps; w++) {
+            for (String[] pair : CSS_HOSTS) {
+                long t0 = System.nanoTime();
+                String css = live.css(pair[0], pair[1]);
+                long dt = System.nanoTime() - t0;
+                acc += css.length();
+                cssSamples[cIdx++] = dt;
+            }
+        }
+        Arrays.sort(cssSamples);
+        System.out.printf(Locale.ROOT,
+                "ALL7_CSS_LOOKUP_US p50=%.3f p95=%.3f p99=%.3f sizes=[%s]%n",
+                percentile(cssSamples, 0.50) / 1000.0,
+                percentile(cssSamples, 0.95) / 1000.0,
+                percentile(cssSamples, 0.99) / 1000.0,
+                cssSizes);
+
+        benchBinaryCache("ALL7_BINARY_CACHE", live, topKeys, sig.toString().hashCode());
+        return acc;
+    }
+
+    private static void benchBinaryCache(String tag, FilterRules live, String[] topKeys, int expectedSigHash) throws Exception {
         Method writeBinary;
         Method readBinary;
         try {
             writeBinary = FilterRules.class.getDeclaredMethod("writeBinary", java.io.DataOutputStream.class);
             readBinary = FilterRules.class.getDeclaredMethod("readBinary", java.io.DataInputStream.class);
         } catch (NoSuchMethodException notPresent) {
-            System.out.println("BINARY_CACHE not_present (baseline v0.1.9)");
+            System.out.println(tag + " not_present (baseline v0.1.9)");
             return;
         }
         writeBinary.setAccessible(true);
@@ -329,8 +459,8 @@ public final class FilterRulesBench {
                         + Integer.toHexString(expectedSigHash) + " got 0x" + Integer.toHexString(loadedHash));
             }
             System.out.printf(Locale.ROOT,
-                    "BINARY_CACHE size=%.2fMB write=%.2fms read_cold=%.2fms read_warm_median=%.2fms sigHash=0x%08x%n",
-                    bytes / (1024.0 * 1024.0), writeMs, coldReadMs, median(warmReads), loadedHash);
+                    "%s size=%.2fMB write=%.2fms read_cold=%.2fms read_warm_median=%.2fms sigHash=0x%08x%n",
+                    tag, bytes / (1024.0 * 1024.0), writeMs, coldReadMs, median(warmReads), loadedHash);
         } finally {
             Files.deleteIfExists(tmp);
         }
@@ -423,13 +553,15 @@ public final class FilterRulesBench {
     }
 
     private static CompileTiming compileOnce(Path root) throws IOException {
+        return compileLists(root, new String[]{"easylist", "easyprivacy", "adguard-cn"});
+    }
+
+    private static CompileTiming compileLists(Path root, String[] ids) throws IOException {
         long tStart = System.nanoTime();
         FilterRules.Builder b = new FilterRules.Builder();
         b.suffixes(gzip(root, "psl"));
         long tPsl = System.nanoTime();
-        b.read(gzip(root, "easylist"), "EasyList");
-        b.read(gzip(root, "easyprivacy"), "EasyPrivacy");
-        b.read(gzip(root, "adguard-cn"), "AdGuard 中文");
+        for (String id : ids) b.read(gzip(root, id), id);
         long tRead = System.nanoTime();
         FilterRules rules = b.build();
         long tBuild = System.nanoTime();
