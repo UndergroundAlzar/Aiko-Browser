@@ -18,7 +18,7 @@ import java.util.EnumMap;
  */
 final class BrowserIcon extends View {
     enum Kind {
-        BACK, FORWARD, SEARCH, SHIELD, TABS, MENU, REFRESH, STOP, GO, ADD, CLOSE,
+        BACK, FORWARD, DOWN, SEARCH, SHIELD, TABS, MENU, REFRESH, STOP, GO, ADD, CLOSE,
         STAR, HISTORY, FIND, SHARE, DOWNLOAD, PRIVATE, HOME, SPEED, COPY, CODE,
         DESKTOP, FONT, IMAGE, READER, MUTE, UNMUTE, PIN, ENGINE, PICKER, DARK,
         PDF, BOLT, GESTURE, CHECK, PALETTE, INFO, VIDEO
@@ -158,6 +158,7 @@ final class BrowserIcon extends View {
         // Optically centered 45-degree navigation chevrons
         poly(stroke(Kind.BACK), 14.75f, 5.5f, 8.25f, 12f, 14.75f, 18.5f);
         poly(stroke(Kind.FORWARD), 9.25f, 5.5f, 15.75f, 12f, 9.25f, 18.5f);
+        poly(stroke(Kind.DOWN), 6.0f, 9.25f, 12.0f, 15.25f, 18.0f, 9.25f);
 
         // Search / Find: exact tangent join between lens and handle at +45 deg
         Path search = stroke(Kind.SEARCH);

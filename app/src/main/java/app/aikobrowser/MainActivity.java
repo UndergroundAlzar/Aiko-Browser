@@ -153,12 +153,14 @@ public final class MainActivity extends Activity {
 
     // Chrome view hierarchy
     private FrameLayout root, viewport, page;
+    private View omniboxScrim;
     private BottomDeckLayout bottomDeck;
     private LinearLayout controls, addressRow, findBar;
     private GradientDrawable addressCapsuleBg;
     private View homeSpacer, deckDivider;
     private EditText address, homeSearch, findInput;
-    private BrowserIcon backButton, tabButton, menuButton, siteButton, goButton, actionButton;
+    private BrowserIcon backButton, omniboxDismissButton, tabButton, menuButton, siteButton,
+            addressClearButton, addressCopyButton, goButton, actionButton;
     private ProgressBar loading;
 
     // Reusable Home view & dynamic sections
@@ -287,6 +289,7 @@ public final class MainActivity extends Activity {
         restoreTabs(state == null ? incomingLink(getIntent()) : null);
         setupHudIfEnabled();
         if (state == null && getIntent().getBooleanExtra("downloads", false)) showDownloads();
+        if (state == null) handleScriptIntent(getIntent());
 
         // Sync preloaded SiteExtras gesture flags & active PerfProfile off frame 1 without blocking UI thread
         ioExecutor.execute(() -> {
@@ -361,10 +364,12 @@ public final class MainActivity extends Activity {
             goButton.tint(AikoTheme.ACCENT);
             goButton.setForeground(AikoTheme.ripple(AikoTheme.RIPPLE_ACCENT, dp(16)));
         }
-        BrowserIcon[] chromeBtns = {backButton, tabButton, menuButton, siteButton, actionButton};
+        BrowserIcon[] chromeBtns = {backButton, omniboxDismissButton, tabButton, menuButton, siteButton,
+                addressClearButton, addressCopyButton, actionButton};
         for (BrowserIcon btn : chromeBtns) {
             if (btn != null) btn.setForeground(AikoTheme.ripple(AikoTheme.RIPPLE_ACCENT, dp(16)));
         }
+        if (addressCopyButton != null) addressCopyButton.tint(AikoTheme.ACCENT_CYAN);
         if (omniboxOverlay != null) {
             omniboxOverlay.setBackground(AikoTheme.card(AikoTheme.SURFACE, AikoTheme.CAPSULE_STROKE, density, dp(20)));
         }
@@ -471,8 +476,17 @@ public final class MainActivity extends Activity {
     private void handleIntent(Intent intent) {
         if (intent == null) return;
         if (intent.getBooleanExtra("downloads", false)) showDownloads();
+        if (handleScriptIntent(intent)) return;
         String link = incomingLink(intent);
         if (link != null) addTab(link, false);
+    }
+
+    private boolean handleScriptIntent(Intent intent) {
+        if (intent == null || !Intent.ACTION_VIEW.equals(intent.getAction())) return false;
+        Uri data = intent.getData();
+        if (data == null || !"content".equals(data.getScheme())) return false;
+        scriptTools.importFile(data);
+        return true;
     }
 
     private String incomingLink(Intent intent) {
@@ -512,6 +526,14 @@ public final class MainActivity extends Activity {
         page.setBackgroundColor(AikoTheme.BG);
         viewport.addView(page, new FrameLayout.LayoutParams(-1, -1));
 
+        // Tap-outside backdrop shown behind omniboxOverlay & bottomDeck when editing address bar
+        omniboxScrim = new View(this);
+        omniboxScrim.setBackgroundColor(0x66000000);
+        omniboxScrim.setVisibility(View.GONE);
+        omniboxScrim.setAlpha(0f);
+        omniboxScrim.setOnClickListener(v -> dismissOmnibox());
+        root.addView(omniboxScrim, new FrameLayout.LayoutParams(-1, -1));
+
         // Bottom deck: direct child of root so viewport sits strictly above it (ZERO overlap!)
         int hairlinePx = Math.max(1, Math.round(density));
         deckContentHeight = dp(56) + hairlinePx;
@@ -541,6 +563,12 @@ public final class MainActivity extends Activity {
             if (!moveHistory(1)) toast("没有可前进的页面");
             return true;
         });
+
+        omniboxDismissButton = icon(DOWN, "收起地址栏", this::dismissOmnibox);
+        omniboxDismissButton.tint(AikoTheme.TEXT_MUTED);
+        omniboxDismissButton.setVisibility(View.GONE);
+        AikoTheme.attachPressFeedback(omniboxDismissButton, 0.92f);
+        controls.addView(omniboxDismissButton, new LinearLayout.LayoutParams(dp(40), dp(44)));
 
         addressRow = new LinearLayout(this);
         addressRow.setGravity(Gravity.CENTER_VERTICAL);
@@ -581,11 +609,31 @@ public final class MainActivity extends Activity {
         AikoTheme.attachPressFeedback(actionButton, 0.92f);
         addressRow.addView(actionButton, new LinearLayout.LayoutParams(dp(38), -1));
 
+        addressClearButton = icon(CLOSE, "清空输入", () -> {
+            address.setText("");
+            address.requestFocus();
+        });
+        addressClearButton.tint(AikoTheme.TEXT_DIM);
+        addressClearButton.setVisibility(View.GONE);
+        AikoTheme.attachPressFeedback(addressClearButton, 0.90f);
+        addressRow.addView(addressClearButton, new LinearLayout.LayoutParams(dp(34), -1));
+
+        addressCopyButton = icon(COPY, "一键复制链接", () -> {
+            if (current != null && HttpUrlUtil.isHttp(current.url)) {
+                copyUrl("网址", current.url);
+                dismissOmnibox();
+            }
+        });
+        addressCopyButton.tint(AikoTheme.ACCENT_CYAN);
+        addressCopyButton.setVisibility(View.GONE);
+        AikoTheme.attachPressFeedback(addressCopyButton, 0.92f);
+        addressRow.addView(addressCopyButton, new LinearLayout.LayoutParams(dp(36), -1));
+
         goButton = icon(GO, "前往", () -> submitAddress(address));
         goButton.tint(AikoTheme.ACCENT);
         goButton.setVisibility(View.GONE);
         AikoTheme.attachPressFeedback(goButton, 0.92f);
-        addressRow.addView(goButton, new LinearLayout.LayoutParams(dp(42), -1));
+        addressRow.addView(goButton, new LinearLayout.LayoutParams(dp(38), -1));
 
         homeSpacer = new View(this);
         homeSpacer.setVisibility(View.GONE);
@@ -593,7 +641,7 @@ public final class MainActivity extends Activity {
 
         tabButton = icon(TABS, "标签页，长按新建", this::showTabs);
         AikoTheme.attachPressFeedback(tabButton, 0.92f);
-        tabButton.setOnLongClickListener(v -> { addTab(null, true); return true; });
+        tabButton.setOnLongClickListener(v -> { addTab(null, false); return true; });
         controls.addView(tabButton, new LinearLayout.LayoutParams(dp(44), dp(44)));
 
         menuButton = icon(MENU, "浏览工具，长按打开下载", this::showTools);
@@ -613,24 +661,30 @@ public final class MainActivity extends Activity {
                 }
                 addressRow.setVisibility(View.VISIBLE);
                 homeSpacer.setVisibility(View.GONE);
+                showOmniboxScrim();
             } else {
+                hideOmniboxScrim();
                 addressRow.setVisibility(onHome ? View.GONE : View.VISIBLE);
                 homeSpacer.setVisibility(onHome ? View.VISIBLE : View.GONE);
             }
             int vis = editing ? View.GONE : View.VISIBLE;
             backButton.setVisibility(editing || onHome ? View.GONE : View.VISIBLE);
+            omniboxDismissButton.setVisibility(editing ? View.VISIBLE : View.GONE);
             tabButton.setVisibility(vis);
             menuButton.setVisibility(vis);
             siteButton.setVisibility(vis);
             actionButton.setVisibility(editing ? View.GONE : View.VISIBLE);
             goButton.setVisibility(editing ? View.VISIBLE : View.GONE);
-            address.setPadding(editing ? dp(12) : dp(2), 0, editing ? dp(6) : dp(2), 0);
+            address.setPadding(editing ? dp(12) : dp(2), 0, editing ? dp(4) : dp(2), 0);
             address.setEllipsize(editing ? null : TextUtils.TruncateAt.END);
             if (editing) {
                 address.setText(current.url == null ? "" : current.url);
                 address.selectAll();
+                updateOmniboxEditButtons(address.getText());
                 showOmniboxOverlay(address.getText());
             } else {
+                addressClearButton.setVisibility(View.GONE);
+                addressCopyButton.setVisibility(View.GONE);
                 hideOmniboxOverlay();
                 updateAddress();
             }
@@ -639,7 +693,10 @@ public final class MainActivity extends Activity {
         address.addTextChangedListener(new TextWatcher() {
             @Override public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
             @Override public void onTextChanged(CharSequence s, int start, int before, int count) {
-                if (address.hasFocus()) showOmniboxOverlay(s);
+                if (address.hasFocus()) {
+                    updateOmniboxEditButtons(s);
+                    showOmniboxOverlay(s);
+                }
             }
             @Override public void afterTextChanged(Editable s) {}
         });
@@ -1329,9 +1386,7 @@ public final class MainActivity extends Activity {
         tile.setBackground(AikoTheme.card(AikoTheme.CARD, AikoTheme.STROKE, density, dp(16)));
         tile.setForeground(AikoTheme.ripple(AikoTheme.RIPPLE_ACCENT, dp(16)));
 
-        String host = HttpUrlUtil.extractHost(entry.url);
-        String mono = !host.isEmpty() ? host.substring(0, 1).toUpperCase(Locale.ROOT)
-                : (!entry.title.isEmpty() ? entry.title.substring(0, 1).toUpperCase(Locale.ROOT) : "A");
+        String mono = siteMonogram(entry.url, entry.title);
 
         TextView circle = new TextView(this);
         circle.setText(mono);
@@ -1530,6 +1585,65 @@ public final class MainActivity extends Activity {
         root.addView(omniboxOverlay, lp);
     }
 
+    private static String siteMonogram(String url, String title) {
+        if (title != null) {
+            String t = title.trim();
+            if (!t.isEmpty() && !t.contains("://") && !t.regionMatches(true, 0, "www.", 0, 4)) {
+                int cp = t.codePointAt(0);
+                if (Character.isLetterOrDigit(cp)) {
+                    return new String(Character.toChars(Character.toUpperCase(cp)));
+                }
+            }
+        }
+        String host = url == null ? "" : HttpUrlUtil.extractHost(url);
+        String cleanHost = stripSubdomainPrefix(host);
+        if (!cleanHost.isEmpty()) return cleanHost.substring(0, 1).toUpperCase(Locale.ROOT);
+        return "A";
+    }
+
+    private static String stripSubdomainPrefix(String host) {
+        if (host == null || host.isEmpty()) return "";
+        String s = host;
+        if (s.startsWith("www.") && s.length() > 4) s = s.substring(4);
+        else if (s.startsWith("m.") && s.length() > 2) s = s.substring(2);
+        else if (s.startsWith("mobile.") && s.length() > 7) s = s.substring(7);
+        else if (s.startsWith("wap.") && s.length() > 4) s = s.substring(4);
+        return s;
+    }
+
+    private void updateOmniboxEditButtons(CharSequence text) {
+        if (addressClearButton != null) {
+            boolean hasText = text != null && text.length() > 0;
+            addressClearButton.setVisibility(editingOmnibox && hasText ? View.VISIBLE : View.GONE);
+        }
+        if (addressCopyButton != null) {
+            boolean hasPageUrl = current != null && HttpUrlUtil.isHttp(current.url);
+            addressCopyButton.setVisibility(editingOmnibox && hasPageUrl ? View.VISIBLE : View.GONE);
+        }
+    }
+
+    private void showOmniboxScrim() {
+        if (omniboxScrim == null) return;
+        omniboxScrim.animate().setListener(null).cancel();
+        omniboxScrim.setVisibility(View.VISIBLE);
+        omniboxScrim.animate().alpha(1f).setDuration(120).setInterpolator(AikoTheme.EMPHASIZED_DECEL).start();
+    }
+
+    private void hideOmniboxScrim() {
+        if (omniboxScrim == null || omniboxScrim.getVisibility() == View.GONE) return;
+        omniboxScrim.animate().setListener(null).cancel();
+        omniboxScrim.setAlpha(0f);
+        omniboxScrim.setVisibility(View.GONE);
+    }
+
+    private void dismissOmnibox() {
+        hideOmniboxOverlay();
+        hideOmniboxScrim();
+        hideKeyboardIfNeeded();
+        updateChrome();
+        applyInsetsLayout();
+    }
+
     private void showOmniboxOverlay(CharSequence querySeq) {
         ensureOmniboxOverlay();
         String query = querySeq == null ? "" : querySeq.toString().trim();
@@ -1540,6 +1654,15 @@ public final class MainActivity extends Activity {
         omniboxList.removeAllViews();
 
         int rows = 0;
+
+        // 0. Active webpage quick-action card (1-tap Copy Link / Share / Clear)
+        boolean showedCurrentCard = false;
+        if (current != null && !onHome && HttpUrlUtil.isHttp(current.url)
+                && (query.isEmpty() || query.equals(current.url))) {
+            addCurrentPageOmniboxCard(current.title, current.url);
+            showedCurrentCard = true;
+            rows++;
+        }
 
         // 1. Clipboard Quick-Paste Chip (only when query empty or matches active URL)
         String clip = readClipboardSnippet();
@@ -1559,14 +1682,16 @@ public final class MainActivity extends Activity {
                 if (t.url.toLowerCase(Locale.ROOT).contains(low) || title.toLowerCase(Locale.ROOT).contains(low)) {
                     addSuggestionRow(TABS, "切换到标签 · " + (title.isEmpty() ? t.cachedHost : title),
                             t.url, AikoTheme.EMERALD, null, () -> showTab(t, false));
-                    if (++rows >= 2) break;
+                    if (++rows >= 3) break;
                 }
             }
         }
 
         // 3. Instant local Bookmark + History matches
-        List<BrowserLibrary.Entry> matches = library.search(query, Math.max(2, 6 - rows));
+        String searchKey = (current != null && query.equals(current.url)) ? "" : query;
+        List<BrowserLibrary.Entry> matches = library.search(searchKey, Math.max(3, 7 - rows));
         for (BrowserLibrary.Entry item : matches) {
+            if (showedCurrentCard && current != null && item.url.equals(current.url)) continue;
             boolean saved = library.isBookmarked(item.url);
             addSuggestionRow(saved ? STAR : HISTORY, item.title, item.url,
                     saved ? AikoTheme.ACCENT : AikoTheme.TEXT_MUTED, item.url, () -> navigate(item.url));
@@ -1615,6 +1740,58 @@ public final class MainActivity extends Activity {
             omniboxOverlay.setVisibility(View.GONE);
         }
         applyInsetsLayout();
+    }
+
+    private void addCurrentPageOmniboxCard(String title, String url) {
+        LinearLayout card = new LinearLayout(this);
+        card.setOrientation(LinearLayout.HORIZONTAL);
+        card.setGravity(Gravity.CENTER_VERTICAL);
+        card.setPadding(dp(10), dp(8), dp(6), dp(8));
+        card.setBackground(AikoTheme.card(AikoTheme.CARD, AikoTheme.STROKE_ACCENT, density, dp(13)));
+        LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(-1, -2);
+        clp.bottomMargin = dp(6);
+        omniboxList.addView(card, clp);
+
+        LinearLayout info = stack();
+        card.addView(info, new LinearLayout.LayoutParams(0, -2, 1));
+
+        String heading = (title == null || title.isEmpty() || title.equals(url))
+                ? HttpUrlUtil.extractHost(url) : title;
+        TextView titleTv = label(heading, 12, AikoTheme.TEXT);
+        titleTv.setTypeface(AikoTheme.BOLD);
+        titleTv.setSingleLine(true);
+        titleTv.setEllipsize(TextUtils.TruncateAt.END);
+        info.addView(titleTv);
+
+        TextView urlTv = label(url, 11, AikoTheme.TEXT_MUTED);
+        urlTv.setSingleLine(true);
+        urlTv.setEllipsize(TextUtils.TruncateAt.MIDDLE);
+        info.addView(urlTv);
+
+        TextView copyPill = AikoTheme.badge(this, density, "复制链接",
+                AikoTheme.onAccentColor(), AikoTheme.ACCENT, 0);
+        copyPill.setTextSize(11);
+        copyPill.setTypeface(AikoTheme.BOLD);
+        copyPill.setPadding(dp(10), dp(5), dp(10), dp(5));
+        copyPill.setForeground(AikoTheme.ripple(AikoTheme.RIPPLE_LIGHT, dp(12)));
+        AikoTheme.attachPressFeedback(copyPill, 0.94f);
+        copyPill.setOnClickListener(v -> {
+            copyUrl("网址", url);
+            dismissOmnibox();
+        });
+        LinearLayout.LayoutParams cplp = new LinearLayout.LayoutParams(-2, dp(32));
+        cplp.leftMargin = dp(8);
+        card.addView(copyPill, cplp);
+
+        BrowserIcon shareBtn = icon(SHARE, "分享链接", () -> {
+            dismissOmnibox();
+            shareLink(url);
+        });
+        shareBtn.tint(AikoTheme.TEXT_MUTED);
+        AikoTheme.attachPressFeedback(shareBtn, 0.90f);
+        LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(dp(34), dp(34));
+        slp.leftMargin = dp(2);
+        card.addView(shareBtn, slp);
     }
 
     private void addSuggestionRow(BrowserIcon.Kind kind, String title, String sub,
@@ -1796,6 +1973,10 @@ public final class MainActivity extends Activity {
                 syncNavigationFlags(tab, view, url, true);
                 restoreScroll(tab, view, url);
                 filter.applyCss(view, tab.cachedHost, url);
+                if (isGreasyForkHost(tab.cachedHost)) {
+                    // Tell Greasy Fork / Sleazy Fork that Aiko handles .user.js natively so 1-tap Install skips the extension modal
+                    view.evaluateJavascript("try{localStorage.setItem('manualOverrideInstallJS','1');}catch(e){}", null);
+                }
                 long elapsed = finishNavigation(tab, url, "可绘制");
                 if (elapsed >= 0) {
                     tab.lastCommitMs = elapsed;
@@ -1817,6 +1998,7 @@ public final class MainActivity extends Activity {
                 }
                 syncNavigationFlags(tab, view, url, false);
                 restoreScroll(tab, view, url);
+                filter.applyCss(view, tab.cachedHost, url);
                 if (isEffectiveUltraScroll(tab.cachedHost)) {
                     view.evaluateJavascript(SiteExtras.ultraScrollJs(true), null);
                 }
@@ -2593,7 +2775,7 @@ public final class MainActivity extends Activity {
         LinearLayout panel = AikoTheme.sheetContainer(this, density, "标签页 · " + tabs.size(), dialog::dismiss);
 
         LinearLayout quick = sheetRow(panel);
-        sheetAction(dialog, quick, ADD, "新建标签", true, () -> addTab(null, true));
+        sheetAction(dialog, quick, ADD, "新建标签", true, () -> addTab(null, false));
         View recent = sheetAction(dialog, quick, HISTORY, "最近关闭", !closedTabs.isEmpty(), this::showClosedTabs);
         sheetAction(dialog, quick, PRIVATE, "无痕窗口", true, () -> startActivity(new Intent(this, PrivateActivity.class)));
 
@@ -2760,7 +2942,8 @@ public final class MainActivity extends Activity {
             image.setImageBitmap(useIcon ? tab.favicon : null);
             fallback.setVisibility(useIcon ? View.GONE : View.VISIBLE);
             if (!useIcon) {
-                String letter = host == null ? "A" : host.substring(0, 1).toUpperCase(Locale.ROOT);
+                String cleanHost = stripSubdomainPrefix(host);
+                String letter = cleanHost.isEmpty() ? "A" : cleanHost.substring(0, 1).toUpperCase(Locale.ROOT);
                 if (!TextUtils.equals(fallback.getText(), letter)) fallback.setText(letter);
             }
             activeBar.setVisibility(isCurrent ? View.VISIBLE : View.INVISIBLE);
@@ -3061,7 +3244,7 @@ public final class MainActivity extends Activity {
 
         // 1. Quick Row
         LinearLayout quick = sheetRow(body);
-        sheetAction(dialog, quick, ADD, "新建标签", true, () -> addTab(null, true));
+        sheetAction(dialog, quick, ADD, "新建标签", true, () -> addTab(null, false));
         sheetAction(dialog, quick, PRIVATE, "无痕", true, () -> startActivity(new Intent(this, PrivateActivity.class)));
         sheetAction(dialog, quick, DOWNLOAD, "下载", true, this::showDownloads);
         sheetAction(dialog, quick, CODE, "油猴脚本", true, this::showUserScriptsSheet);
@@ -4734,6 +4917,12 @@ public final class MainActivity extends Activity {
         });
     }
 
+    private static boolean isGreasyForkHost(String host) {
+        if (host == null) return false;
+        return "greasyfork.org".equals(host) || host.endsWith(".greasyfork.org")
+                || "sleazyfork.org".equals(host) || host.endsWith(".sleazyfork.org");
+    }
+
     private static boolean isUserScriptDownload(String url, String disposition, String guessedFilename) {
         if (UserScripts.isUserScriptUrl(url)) return true;
         if (UserScripts.isUserScriptFilename(guessedFilename)) return true;
@@ -4768,17 +4957,33 @@ public final class MainActivity extends Activity {
         });
     }
 
+    void showLocalUserScriptSheet(UserScript script, UserScripts.Entry previous, String sourceLabel, Runnable onInstalled) {
+        if (script == null) return;
+        String srcLabel = (sourceLabel == null || sourceLabel.isEmpty()) ? "本地文件" : sourceLabel;
+        UserScripts.RemoteScript synthetic = new UserScripts.RemoteScript(
+                "", script.source, null, script, previous != null, previous == null ? null : previous.id);
+        showUserScriptReviewSheet(synthetic, srcLabel, null, null, onInstalled);
+    }
+
     private void showRemoteUserScriptSheet(UserScripts.RemoteScript remote, String fallbackFilename, String ua) {
+        showUserScriptReviewSheet(remote, HttpUrlUtil.extractHost(remote.url), fallbackFilename, ua, null);
+    }
+
+    private void showUserScriptReviewSheet(UserScripts.RemoteScript remote, String originBadge,
+                                           String fallbackFilename, String ua, Runnable onInstalled) {
         UserScript script = remote.parsed;
-        String fname = (fallbackFilename == null || fallbackFilename.isEmpty())
-                ? URLUtil.guessFileName(remote.url, null, "application/javascript") : fallbackFilename;
+        boolean hasRemoteUrl = HttpUrlUtil.isHttp(remote.url);
+        String fname = hasRemoteUrl
+                ? ((fallbackFilename == null || fallbackFilename.isEmpty())
+                        ? URLUtil.guessFileName(remote.url, null, "application/javascript") : fallbackFilename)
+                : "";
         String author = script.author != null ? script.author : "";
         String desc = script.description != null ? script.description : "";
 
         Dialog dialog = new Dialog(this);
         dialog.requestWindowFeature(Window.FEATURE_NO_TITLE);
         LinearLayout panel = AikoTheme.sheetContainer(this, density,
-                remote.isUpdate ? "发现脚本更新" : "发现油猴脚本", dialog::dismiss);
+                remote.isUpdate ? "更新油猴脚本" : "导入油猴脚本", dialog::dismiss);
 
         ScrollView scroll = new ScrollView(this);
         scroll.setVerticalScrollBarEnabled(false);
@@ -4821,9 +5026,8 @@ public final class MainActivity extends Activity {
             ulp.rightMargin = dp(6);
             metaRow.addView(updPill, ulp);
         }
-        String srcHost = HttpUrlUtil.extractHost(remote.url);
-        if (!srcHost.isEmpty()) {
-            TextView hostPill = AikoTheme.badge(this, density, srcHost,
+        if (originBadge != null && !originBadge.isEmpty()) {
+            TextView hostPill = AikoTheme.badge(this, density, originBadge,
                     AikoTheme.TEXT_MUTED, AikoTheme.BG, AikoTheme.STROKE);
             metaRow.addView(hostPill, new LinearLayout.LayoutParams(-2, -2));
         }
@@ -4952,6 +5156,7 @@ public final class MainActivity extends Activity {
                     return;
                 }
                 dialog.dismiss();
+                if (onInstalled != null) onInstalled.run();
                 toast(remote.isUpdate
                         ? "已更新并启用「" + script.name + "」（原数据已保留）"
                         : "已安装并启用「" + script.name + "」，刷新匹配网页生效");
@@ -4967,16 +5172,36 @@ public final class MainActivity extends Activity {
         srlp.topMargin = dp(8);
         panel.addView(secRow, srlp);
 
-        TextView dlBtn = AikoTheme.badge(this, density, "普通下载",
-                AikoTheme.TEXT_MUTED, AikoTheme.CARD, AikoTheme.STROKE);
-        dlBtn.setForeground(AikoTheme.ripple(AikoTheme.RIPPLE_LIGHT, dp(12)));
-        dlBtn.setOnClickListener(v -> {
-            dialog.dismiss();
-            showNewDownload(remote.url, fname, ua);
-        });
-        LinearLayout.LayoutParams dlp = new LinearLayout.LayoutParams(0, dp(38), 1);
-        dlp.rightMargin = dp(8);
-        secRow.addView(dlBtn, dlp);
+        if (hasRemoteUrl) {
+            TextView dlBtn = AikoTheme.badge(this, density, "普通下载",
+                    AikoTheme.TEXT_MUTED, AikoTheme.CARD, AikoTheme.STROKE);
+            dlBtn.setForeground(AikoTheme.ripple(AikoTheme.RIPPLE_LIGHT, dp(12)));
+            dlBtn.setOnClickListener(v -> {
+                dialog.dismiss();
+                showNewDownload(remote.url, fname, ua);
+            });
+            LinearLayout.LayoutParams dlp = new LinearLayout.LayoutParams(0, dp(38), 1);
+            dlp.rightMargin = dp(8);
+            secRow.addView(dlBtn, dlp);
+        } else {
+            TextView saveOffBtn = AikoTheme.badge(this, density, "仅保存暂不启用",
+                    AikoTheme.TEXT_MUTED, AikoTheme.CARD, AikoTheme.STROKE);
+            saveOffBtn.setForeground(AikoTheme.ripple(AikoTheme.RIPPLE_LIGHT, dp(12)));
+            saveOffBtn.setOnClickListener(v -> {
+                try {
+                    UserScripts.Entry prev = userScripts.duplicate(script);
+                    userScripts.installLocal(script, prev, false);
+                    dialog.dismiss();
+                    if (onInstalled != null) onInstalled.run();
+                    toast("已保存「" + script.name + "」（当前停用）");
+                } catch (IllegalArgumentException err) {
+                    toast(err.getMessage());
+                }
+            });
+            LinearLayout.LayoutParams dlp = new LinearLayout.LayoutParams(0, dp(38), 1);
+            dlp.rightMargin = dp(8);
+            secRow.addView(saveOffBtn, dlp);
+        }
 
         TextView cancelBtn = AikoTheme.badge(this, density, "取消",
                 AikoTheme.TEXT_MUTED, AikoTheme.CARD, AikoTheme.STROKE);
@@ -5022,19 +5247,31 @@ public final class MainActivity extends Activity {
         irlp.bottomMargin = dp(4);
         body.addView(importRow, irlp);
 
-        TextView importBtn = AikoTheme.badge(this, density, "+ 导入 / 粘贴脚本",
+        TextView importFileBtn = AikoTheme.badge(this, density, "本地 .user.js",
                 AikoTheme.TEXT, AikoTheme.CARD, AikoTheme.STROKE);
-        importBtn.setForeground(AikoTheme.ripple(AikoTheme.RIPPLE_ACCENT, dp(12)));
-        AikoTheme.attachPressFeedback(importBtn, 0.95f);
-        importBtn.setOnClickListener(v -> {
+        importFileBtn.setForeground(AikoTheme.ripple(AikoTheme.RIPPLE_ACCENT, dp(12)));
+        AikoTheme.attachPressFeedback(importFileBtn, 0.95f);
+        importFileBtn.setOnClickListener(v -> {
             dialog.dismiss();
-            scriptTools.show();
+            scriptTools.openFile();
         });
         LinearLayout.LayoutParams imlp = new LinearLayout.LayoutParams(0, dp(38), 1);
-        imlp.rightMargin = dp(8);
-        importRow.addView(importBtn, imlp);
+        imlp.rightMargin = dp(6);
+        importRow.addView(importFileBtn, imlp);
 
-        TextView urlImportBtn = AikoTheme.badge(this, density, "从 .user.js 网址安装",
+        TextView pasteBtn = AikoTheme.badge(this, density, "粘贴脚本",
+                AikoTheme.TEXT, AikoTheme.CARD, AikoTheme.STROKE);
+        pasteBtn.setForeground(AikoTheme.ripple(AikoTheme.RIPPLE_ACCENT, dp(12)));
+        AikoTheme.attachPressFeedback(pasteBtn, 0.95f);
+        pasteBtn.setOnClickListener(v -> {
+            dialog.dismiss();
+            scriptTools.openEditor(null);
+        });
+        LinearLayout.LayoutParams pslp = new LinearLayout.LayoutParams(0, dp(38), 1);
+        pslp.rightMargin = dp(6);
+        importRow.addView(pasteBtn, pslp);
+
+        TextView urlImportBtn = AikoTheme.badge(this, density, "网址安装",
                 AikoTheme.ACCENT_CYAN, AikoTheme.CARD, AikoTheme.STROKE_ACCENT);
         urlImportBtn.setForeground(AikoTheme.ripple(AikoTheme.RIPPLE_ACCENT, dp(12)));
         AikoTheme.attachPressFeedback(urlImportBtn, 0.95f);
@@ -5413,7 +5650,7 @@ public final class MainActivity extends Activity {
             PackageInfo pi = getPackageManager().getPackageInfo(getPackageName(), 0);
             if (pi != null && pi.versionName != null && !pi.versionName.isEmpty()) return pi.versionName;
         } catch (Exception ignored) { }
-        return "0.3.0";
+        return "0.3.1";
     }
 
     private void showAboutSheet() {
@@ -5827,9 +6064,7 @@ public final class MainActivity extends Activity {
         if (elementPicker != null && elementPicker.isActive()) { elementPicker.stop(); return; }
         if (findTarget != null) { closeFind(); return; }
         if (isAnyOmniboxFocused()) {
-            hideOmniboxOverlay();
-            hideKeyboardIfNeeded();
-            updateChrome();
+            dismissOmnibox();
             return;
         }
         if (!goBack()) super.onBackPressed();
@@ -6098,6 +6333,7 @@ public final class MainActivity extends Activity {
         View focused = getCurrentFocus();
         boolean hadEditableFocus = focused instanceof EditText;
         editingOmnibox = false;
+        hideOmniboxScrim();
         viewport.requestFocus();
         if (hadEditableFocus || imeBottom > 0) {
             android.os.IBinder token = focused != null ? focused.getWindowToken() : viewport.getWindowToken();

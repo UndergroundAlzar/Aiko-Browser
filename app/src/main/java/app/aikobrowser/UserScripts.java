@@ -10,6 +10,7 @@ import android.util.Log;
 import android.webkit.WebView;
 
 import androidx.webkit.JavaScriptExecutionWorld;
+import androidx.webkit.JavaScriptReplyProxy;
 import androidx.webkit.ScriptHandler;
 import androidx.webkit.WebMessageCompat;
 import androidx.webkit.WebViewCompat;
@@ -23,6 +24,7 @@ import org.json.JSONTokener;
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.URI;
+import java.security.SecureRandom;
 import java.util.*;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
@@ -35,10 +37,12 @@ public final class UserScripts {
     private static final String BRIDGE = "__aikoScriptValues";
     private static final String PREFS_LIST = "userscripts";
     private static final String PREFS_VALUES = "userscript_values";
-    private static final String RELEASE = "0.3.0";
-    private static final int MAX_SCRIPTS = 24, MAX_SOURCES = 2 * 1024 * 1024, MAX_VALUE_CHARS = 32768;
+    private static final String RELEASE = "0.3.1";
+    private static final int MAX_SCRIPTS = 48, MAX_SOURCES = 4 * 1024 * 1024, MAX_VALUE_CHARS = 65536;
+    private static final int MAX_MESSAGE_CHARS = 140000;
     private static final long FLUSH_DELAY_MS = 400L;
     private static final long REBIND_FALLBACK_MS = 600L;
+    private static final SecureRandom RANDOM = new SecureRandom();
     private static final ExecutorService REMOTE_EXEC = Executors.newSingleThreadExecutor(r -> {
         Thread t = new Thread(() -> {
             try { Process.setThreadPriority(Process.THREAD_PRIORITY_BACKGROUND); }
@@ -70,6 +74,7 @@ public final class UserScripts {
     private final Context app;
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final Map<WebView, List<Binding>> views = new IdentityHashMap<>();
+    private final Map<WebView, Map<String, JavaScriptReplyProxy>> replyProxies = new IdentityHashMap<>();
     private final ArrayList<Entry> entries = new ArrayList<>();
     private final Map<String, JSONObject> values = new HashMap<>();
     private final Set<Entry> pending = new HashSet<>();
@@ -87,7 +92,7 @@ public final class UserScripts {
     private volatile Preloaded preloaded;
     private boolean loaded, registrationFailed, rebindScheduled;
     private String runtime;
-    private Boolean isolatedWorlds, earlyScripts;
+    private Boolean isolatedWorlds, earlyScripts, webMessageSupport;
 
     private static final class Preloaded {
         final List<Entry> entries;
@@ -112,6 +117,9 @@ public final class UserScripts {
         String quotedCode;
         String beforeValues, afterValues;
         String serializedValues;
+        String sessionToken;
+        String bridgeName;
+        boolean cachedEphemeral;
 
         Entry(String id, UserScript script, boolean enabled) {
             this.id = id;
@@ -123,15 +131,19 @@ public final class UserScripts {
     private static final class Binding {
         final Entry entry;
         final JavaScriptExecutionWorld world;
+        final String bridgeName;
+        final String token;
         final boolean bridge, legacyStart;
         final WebViewCompat.WebMessageListener listener;
         Set<String> extraOrigins;
         ScriptHandler handle;
 
-        Binding(Entry entry, JavaScriptExecutionWorld world, boolean bridge, boolean legacyStart,
-                WebViewCompat.WebMessageListener listener) {
+        Binding(Entry entry, JavaScriptExecutionWorld world, String bridgeName, String token,
+                boolean bridge, boolean legacyStart, WebViewCompat.WebMessageListener listener) {
             this.entry = entry;
             this.world = world;
+            this.bridgeName = bridgeName;
+            this.token = token;
             this.bridge = bridge;
             this.legacyStart = legacyStart;
             this.listener = listener;
@@ -156,9 +168,12 @@ public final class UserScripts {
             if (!bridge || listener == null) return;
             Set<String> allowed = activeOrigins();
             try {
-                WebViewCompat.addWebMessageListener(view, BRIDGE, allowed, world, listener);
+                if (world != null) WebViewCompat.addWebMessageListener(view, bridgeName, allowed, world, listener);
+                else WebViewCompat.addWebMessageListener(view, bridgeName, allowed, listener);
             } catch (IllegalArgumentException unsupportedOrigin) {
-                WebViewCompat.addWebMessageListener(view, BRIDGE, Collections.singleton("*"), world, listener);
+                Set<String> all = Collections.singleton("*");
+                if (world != null) WebViewCompat.addWebMessageListener(view, bridgeName, all, world, listener);
+                else WebViewCompat.addWebMessageListener(view, bridgeName, all, listener);
             }
         }
 
@@ -169,11 +184,13 @@ public final class UserScripts {
             }
             Set<String> allowed = activeOrigins();
             try {
-                handle = legacyStart ? WebViewCompat.addDocumentStartJavaScript(view, javascript, allowed)
+                handle = (legacyStart || world == null)
+                        ? WebViewCompat.addDocumentStartJavaScript(view, javascript, allowed)
                         : WebViewCompat.addJavaScriptOnEvent(view, javascript, event, allowed, world);
             } catch (IllegalArgumentException unsupportedOrigin) {
                 Set<String> fallback = Collections.singleton("*");
-                handle = legacyStart ? WebViewCompat.addDocumentStartJavaScript(view, javascript, fallback)
+                handle = (legacyStart || world == null)
+                        ? WebViewCompat.addDocumentStartJavaScript(view, javascript, fallback)
                         : WebViewCompat.addJavaScriptOnEvent(view, javascript, event, fallback, world);
             }
         }
@@ -185,7 +202,10 @@ public final class UserScripts {
                     handle = null;
                 }
             } finally {
-                if (bridge) WebViewCompat.removeWebMessageListener(view, world, BRIDGE);
+                if (bridge) {
+                    if (world != null) WebViewCompat.removeWebMessageListener(view, world, bridgeName);
+                    else WebViewCompat.removeWebMessageListener(view, bridgeName);
+                }
             }
         }
     }
@@ -268,7 +288,7 @@ public final class UserScripts {
             int totalChars = script.source.length();
             for (Entry item : entries) if (item != previous) totalChars += item.script.source.length();
             if (totalChars > MAX_SOURCES || (previous == null && entries.size() >= MAX_SCRIPTS)) {
-                postError(onError, "最多保存 24 个脚本，源码总量不能超过约 2 MiB。");
+                postError(onError, "最多保存 " + MAX_SCRIPTS + " 个脚本，源码总量不能超过约 4 MiB。");
                 return;
             }
             Entry collision = duplicate(script);
@@ -425,16 +445,27 @@ public final class UserScripts {
     }
 
     Entry save(UserScript script, Entry previous) {
+        return installLocal(script, previous, false);
+    }
+
+    Entry installLocal(UserScript script, Entry previous, boolean enable) {
         load();
         int count = script.source.length();
         for (Entry item : entries) if (item != previous) count += item.script.source.length();
         if (count > MAX_SOURCES || (previous == null && entries.size() >= MAX_SCRIPTS))
-            throw new IllegalArgumentException("最多保存 24 个脚本，源码总量不能超过约 2 MiB。");
+            throw new IllegalArgumentException("最多保存 " + MAX_SCRIPTS + " 个脚本，源码总量不能超过约 4 MiB。");
         Entry collision = duplicate(script);
         if (collision != null && collision != previous)
             throw new IllegalArgumentException("已有同名、同命名空间的脚本。");
         flushValues();
-        Entry next = new Entry(previous == null ? UUID.randomUUID().toString() : previous.id, script, false);
+        Entry next = new Entry(previous == null ? UUID.randomUUID().toString() : previous.id, script, enable);
+        if (enable) {
+            String incompat = compatibility(next);
+            if (!incompat.isEmpty()) next.enabled = false;
+        }
+        if (previous != null && script.needsStorage() && previous.serializedValues != null) {
+            next.serializedValues = previous.serializedValues;
+        }
         if (previous == null) entries.add(next); else entries.set(entries.indexOf(previous), next);
         saveList();
         refreshViews();
@@ -455,6 +486,9 @@ public final class UserScripts {
         pending.remove(entry);
         dirtyBindings.remove(entry);
         values.remove(entry.id);
+        for (Map<String, JavaScriptReplyProxy> map : replyProxies.values()) {
+            map.remove(entry.id);
+        }
         String key = "values-" + entry.id;
         valuePrefs().edit().remove(key).apply();
         SharedPreferences lp = listPrefs();
@@ -473,6 +507,7 @@ public final class UserScripts {
 
     void detach(WebView view) {
         views.remove(view);
+        replyProxies.remove(view);
         rebindQueue.remove(view);
     }
 
@@ -485,10 +520,10 @@ public final class UserScripts {
             if (address == null) return;
             for (Entry entry : entries) {
                 UserScript script = entry.script;
-                if (entry.enabled && !script.requiresIsolation && !script.runAt.equals("document-start")
+                if (entry.enabled && !script.needsStorage() && !script.runAt.equals("document-start")
                         && script.matches(address)) {
                     try {
-                        view.evaluateJavascript(payload(entry), null);
+                        view.evaluateJavascript(payload(entry, false), null);
                     } catch (IOException | RuntimeException error) {
                         registrationFailed = true;
                         Log.w("AikoScripts", "Could not inject end-of-load userscript");
@@ -515,12 +550,14 @@ public final class UserScripts {
             if (binding.addExtraOrigin(origin)) {
                 try {
                     if (binding.bridge) {
-                        WebViewCompat.removeWebMessageListener(view, binding.world, BRIDGE);
+                        if (binding.world != null) WebViewCompat.removeWebMessageListener(view, binding.world, binding.bridgeName);
+                        else WebViewCompat.removeWebMessageListener(view, binding.bridgeName);
                         binding.registerBridge(view);
                     }
-                    binding.register(view, payload(binding.entry), event(script));
-                    if (!script.requiresIsolation && !script.runAt.equals("document-start")) {
-                        view.evaluateJavascript(payload(binding.entry), null);
+                    boolean ephemeral = binding.world == null && binding.bridge;
+                    binding.register(view, payload(binding.entry, ephemeral), event(script));
+                    if (!script.requiresIsolation && !script.needsStorage() && !script.runAt.equals("document-start")) {
+                        view.evaluateJavascript(payload(binding.entry, ephemeral), null);
                     }
                 } catch (IOException | RuntimeException | LinkageError error) {
                     Log.w("AikoScripts", "Could not expand non-default port userscript origin");
@@ -549,16 +586,24 @@ public final class UserScripts {
     }
 
     String compatibility(Entry entry) {
-        if (isolatedWorlds()) return "";
-        if (entry.script.requiresIsolation) return "当前系统 WebView 缺少隔离执行支持。更新 WebView 后可运行。";
-        if (entry.script.runAt.equals("document-start") && !earlyScripts())
-            return "当前系统 WebView 不支持 document-start。更新 WebView 后可运行。";
+        if (isolatedWorlds() && !entry.script.pageWorld) return "";
+        if (earlyScripts()) {
+            if (entry.script.needsStorage() && !webMessageSupport()) {
+                return "当前系统 WebView 缺少脚本存储桥接接口。更新系统 WebView 后可运行。";
+            }
+            return "";
+        }
+        if (entry.script.needsStorage()) return "当前系统 WebView 缺少脚本存储支持。更新系统 WebView 后可运行。";
+        if (entry.script.runAt.equals("document-start"))
+            return "当前系统 WebView 不支持 document-start。更新系统 WebView 后可运行。";
         return "";
     }
 
     String status() {
-        if (registrationFailed) return "部分脚本未注册成功。可在详情中检查相容性。";
-        if (isolatedWorlds()) return "隔离执行可用";
+        if (registrationFailed) return "部分脚本未注册成功，可在详情中检查兼容性";
+        if (isolatedWorlds()) return "隔离世界模式 · 全部接口可用";
+        if (earlyScripts() && webMessageSupport()) return "兼容执行模式 · 支持 GM 存储与监听";
+        if (earlyScripts()) return "基础执行模式 · 仅支持无存储脚本";
         return "旧版 WebView · 仅运行无授权脚本";
     }
 
@@ -571,6 +616,7 @@ public final class UserScripts {
     private void refreshViews() {
         registrationFailed = false;
         dirtyBindings.clear();
+        replyProxies.clear();
         rebindQueue.clear();
         cancelRebindSchedule();
         for (Map.Entry<WebView, List<Binding>> item : views.entrySet()) {
@@ -588,32 +634,61 @@ public final class UserScripts {
 
     private void register(WebView view, List<Binding> output) {
         boolean worlds = isolatedWorlds();
-        boolean legacyStart = !worlds && earlyScripts();
-        if (!worlds && !legacyStart) return;
+        boolean early = earlyScripts();
+        boolean canMessage = webMessageSupport();
+        if (!worlds && !early) return;
         for (Entry entry : entries) {
-            if (!entry.enabled || entry.script.requiresIsolation && !worlds) continue;
+            if (!entry.enabled) continue;
+            // Tier 1: Chromium isolated world when available and script doesn't need page world (unsafeWindow / @sandbox raw).
+            // Tier 2: Universal document-start script (supported on all Android 10+ WebViews) with ephemeral token-authenticated bridge.
+            boolean useIsolated = worlds && !entry.script.pageWorld;
+            if (!useIsolated && !early) continue;
+            boolean needsBridge = entry.script.needsStorage();
+            if (needsBridge && !useIsolated && !canMessage) continue;
             Binding binding = null;
             try {
-                JavaScriptExecutionWorld world = worlds ? WebViewCompat.getExecutionWorld(view,
-                        entry.script.pageWorld ? JavaScriptExecutionWorld.PAGE_WORLD_NAME : "aiko-" + entry.id) : null;
-                boolean bridge = worlds && entry.script.needsStorage();
-                WebViewCompat.WebMessageListener listener = bridge ? (source, message, origin, main, reply) -> {
+                JavaScriptExecutionWorld world = useIsolated
+                        ? WebViewCompat.getExecutionWorld(view, "aiko-" + entry.id) : null;
+                boolean ephemeral = !useIsolated && needsBridge;
+                String bridgeName = BRIDGE;
+                String token = null;
+                if (ephemeral) {
+                    ensureSessionToken(entry);
+                    bridgeName = entry.bridgeName;
+                    token = entry.sessionToken;
+                }
+                final String expectedToken = token;
+                WebViewCompat.WebMessageListener listener = needsBridge ? (source, message, origin, main, reply) -> {
                     if (main && source == view && views.containsKey(view)
-                            && message.getType() == WebMessageCompat.TYPE_STRING)
-                        receive(entry, message.getData(), origin.toString());
+                            && message.getType() == WebMessageCompat.TYPE_STRING) {
+                        receive(view, entry, message.getData(), origin.toString(), reply, expectedToken);
+                    }
                 } : null;
-                binding = new Binding(entry, world, bridge, legacyStart, listener);
-                if (bridge) binding.registerBridge(view);
-                binding.register(view, payload(entry), event(entry.script));
+                binding = new Binding(entry, world, bridgeName, expectedToken, needsBridge, !useIsolated, listener);
+                if (needsBridge) binding.registerBridge(view);
+                binding.register(view, payload(entry, ephemeral), event(entry.script));
                 output.add(binding);
             } catch (IOException | RuntimeException | LinkageError error) {
                 registrationFailed = true;
                 if (binding != null) {
                     try { binding.remove(view); } catch (RuntimeException | LinkageError ignored) {}
                 }
-                Log.w("AikoScripts", "Could not register userscript");
+                Log.w("AikoScripts", "Could not register userscript: " + entry.script.name, error);
             }
         }
+    }
+
+    private static void ensureSessionToken(Entry entry) {
+        if (entry.sessionToken != null && entry.bridgeName != null) return;
+        byte[] bytes = new byte[16];
+        RANDOM.nextBytes(bytes);
+        StringBuilder hex = new StringBuilder(32);
+        final char[] digits = "0123456789abcdef".toCharArray();
+        for (byte b : bytes) {
+            hex.append(digits[(b >>> 4) & 0xF]).append(digits[b & 0xF]);
+        }
+        entry.sessionToken = hex.toString();
+        entry.bridgeName = "__aikoSv_" + entry.sessionToken.substring(0, 12);
     }
 
     private static int event(UserScript script) {
@@ -631,29 +706,64 @@ public final class UserScripts {
         return earlyScripts;
     }
 
+    private boolean webMessageSupport() {
+        if (webMessageSupport == null) webMessageSupport = supports(WebViewFeature.WEB_MESSAGE_LISTENER);
+        return webMessageSupport;
+    }
+
     private static boolean supports(String feature) {
         try { return WebViewFeature.isFeatureSupported(feature); }
         catch (RuntimeException | LinkageError error) { return false; }
     }
 
-    private void receive(Entry entry, String message, String sourceOrigin) {
-        if (!entry.enabled || !entries.contains(entry) || message == null || message.length() > 76000) return;
+    private void receive(WebView sourceView, Entry entry, String message, String sourceOrigin,
+                         JavaScriptReplyProxy reply, String expectedToken) {
+        if (!entry.enabled || !entries.contains(entry) || message == null || message.length() > MAX_MESSAGE_CHARS) return;
         try {
             JSONArray data = new JSONArray(message);
-            if (data.length() < 3 || data.length() > 4) return;
+            if (data.length() < 2 || data.length() > 5) return;
             URI address = UserScript.address(data.getString(0));
             if (!UserScript.sameOrigin(address, UserScript.address(sourceOrigin)) || !entry.script.matches(address)) return;
-            String op = data.getString(1), key = data.getString(2);
+            String op = data.getString(1);
+
+            if ("hello".equals(op)) {
+                if (expectedToken != null) {
+                    if (data.length() != 3 || !expectedToken.equals(data.optString(2, ""))) return;
+                } else if (data.length() > 3) {
+                    return;
+                }
+                if (reply != null && entry.script.needsValueListener) {
+                    replyProxies.computeIfAbsent(sourceView, k -> new HashMap<>()).put(entry.id, reply);
+                }
+                return;
+            }
+
+            if (data.length() < 3) return;
+            String key = data.getString(2);
             if (key.length() > 128) return;
+            if (reply != null && entry.script.needsValueListener) {
+                replyProxies.computeIfAbsent(sourceView, k -> new HashMap<>()).put(entry.id, reply);
+            }
+
             JSONObject current = values(entry);
+            boolean hadOld = current.has(key);
+            Object oldVal = hadOld ? current.opt(key) : JSONObject.NULL;
+            Object newVal = JSONObject.NULL;
+            boolean hasNew = false;
             String serialized;
-            if (op.equals("set") && data.length() == 4 && entry.script.permits("setValue")) {
+
+            if ("set".equals(op) && (entry.script.permits("setValue") || entry.script.permits("setValues"))) {
+                if (expectedToken != null) {
+                    if (data.length() != 5 || !expectedToken.equals(data.optString(4, ""))) return;
+                } else if (data.length() != 4) {
+                    return;
+                }
                 String encoded = data.getString(3);
                 if (encoded.length() > MAX_VALUE_CHARS) return;
                 JSONTokener tokener = new JSONTokener(encoded);
                 Object incoming = tokener.nextValue();
                 if (tokener.nextClean() != 0) return;
-                Object previous = current.opt(key);
+                Object previous = hadOld ? oldVal : null;
                 current.put(key, incoming);
                 if (current.length() > 128) {
                     if (previous == null) current.remove(key); else current.put(key, previous);
@@ -664,7 +774,14 @@ public final class UserScripts {
                     if (previous == null) current.remove(key); else current.put(key, previous);
                     return;
                 }
-            } else if (op.equals("delete") && data.length() == 3 && entry.script.permits("deleteValue")) {
+                newVal = incoming;
+                hasNew = true;
+            } else if ("delete".equals(op) && (entry.script.permits("deleteValue") || entry.script.permits("deleteValues"))) {
+                if (expectedToken != null) {
+                    if (data.length() != 4 || !expectedToken.equals(data.optString(3, ""))) return;
+                } else if (data.length() != 3) {
+                    return;
+                }
                 if (current.remove(key) == null) return;
                 serialized = current.toString();
             } else {
@@ -674,8 +791,39 @@ public final class UserScripts {
             entry.program = null;
             if (pending.isEmpty()) handler.postDelayed(flush, FLUSH_DELAY_MS);
             pending.add(entry);
+            if (entry.script.needsValueListener) {
+                broadcastValueChange(sourceView, entry.id, key, hadOld, oldVal, hasNew, newVal);
+            }
         } catch (JSONException | RuntimeException invalid) {
             Log.d("AikoScripts", "Invalid userscript storage message");
+        }
+    }
+
+    private void broadcastValueChange(WebView sourceView, String entryId, String key,
+                                      boolean hadOld, Object oldVal, boolean hasNew, Object newVal) {
+        if (replyProxies.isEmpty()) return;
+        String payload;
+        try {
+            payload = new JSONArray()
+                    .put(key)
+                    .put(hadOld)
+                    .put(hadOld ? oldVal : JSONObject.NULL)
+                    .put(hasNew)
+                    .put(hasNew ? newVal : JSONObject.NULL)
+                    .toString();
+        } catch (RuntimeException ignored) {
+            return;
+        }
+        for (Map.Entry<WebView, Map<String, JavaScriptReplyProxy>> item : replyProxies.entrySet()) {
+            if (item.getKey() == sourceView) continue;
+            Map<String, JavaScriptReplyProxy> map = item.getValue();
+            JavaScriptReplyProxy proxy = map.get(entryId);
+            if (proxy == null) continue;
+            try {
+                proxy.postMessage(payload);
+            } catch (RuntimeException | LinkageError stale) {
+                map.remove(entryId);
+            }
         }
     }
 
@@ -735,7 +883,8 @@ public final class UserScripts {
             for (Binding binding : bindings) {
                 if (!binding.bridge || !dirtyBindings.contains(binding.entry)) continue;
                 try {
-                    binding.register(view, payload(binding.entry), event(binding.entry.script));
+                    boolean ephemeral = binding.world == null && binding.bridge;
+                    binding.register(view, payload(binding.entry, ephemeral), event(binding.entry.script));
                     updated = true;
                 } catch (IOException | RuntimeException | LinkageError error) {
                     registrationFailed = true;
@@ -794,19 +943,36 @@ public final class UserScripts {
         }
     }
 
-    private String payload(Entry entry) throws IOException {
-        if (entry.program != null) return entry.program;
+    private String payload(Entry entry, boolean ephemeralBridge) throws IOException {
+        if (entry.program != null && entry.cachedEphemeral == ephemeralBridge) return entry.program;
+        if (entry.cachedEphemeral != ephemeralBridge) {
+            entry.beforeValues = null;
+            entry.afterValues = null;
+            entry.program = null;
+            entry.cachedEphemeral = ephemeralBridge;
+        }
         if (runtime == null) runtime = readRuntimeAsset();
         UserScript script = entry.script;
         if (entry.quotedCode == null) entry.quotedCode = JSONObject.quote(script.code);
         try {
             if (entry.beforeValues == null) {
+                JSONObject scriptMeta = new JSONObject()
+                        .put("name", script.name)
+                        .put("namespace", script.namespace)
+                        .put("version", script.version)
+                        .put("description", script.description)
+                        .put("author", script.author)
+                        .put("run-at", script.runAt);
                 JSONObject staticConfig = new JSONObject()
                         .put("id", entry.id).put("release", RELEASE).put("runAt", script.runAt)
                         .put("includes", patterns(script.includes)).put("excludes", patterns(script.excludes))
                         .put("grants", new JSONArray(script.grants)).put("storage", script.needsStorage())
-                        .put("script", new JSONObject().put("name", script.name).put("namespace", script.namespace)
-                                .put("version", script.version));
+                        .put("script", scriptMeta);
+                if (ephemeralBridge && entry.bridgeName != null && entry.sessionToken != null) {
+                    staticConfig.put("bridge", entry.bridgeName)
+                            .put("token", entry.sessionToken)
+                            .put("ephemeralBridge", true);
+                }
                 if (!script.needsStorage()) staticConfig.put("values", new JSONObject());
                 String guard = fastGuard(script);
                 if (script.needsStorage()) {

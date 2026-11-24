@@ -9,18 +9,30 @@ import java.util.regex.Pattern;
 
 /** A local or remote .user.js file, parsed without evaluating its body (pure Java). */
 public final class UserScript {
-    static final int MAX_BYTES = 512 * 1024;
+    static final int MAX_BYTES = 1024 * 1024;
+    private static final int MAX_HEADER_CHARS = 65_536;
     private static final Pattern HEADER = Pattern.compile("(?m)^[ \\t]*//[ \\t]*==UserScript==[ \\t]*$");
     private static final Pattern END = Pattern.compile("(?m)^[ \\t]*//[ \\t]*==/UserScript==[ \\t]*$");
     private static final Pattern ITEM = Pattern.compile("^[ \\t]*//[ \\t]*@([\\w:-]+)(?:[ \\t]+(.*))?$");
     private static final Set<String> GRANTS = new HashSet<>(Arrays.asList(
-            "GM_addStyle", "GM_log", "GM_info", "GM_getValue", "GM_setValue", "GM_deleteValue", "GM_listValues",
-            "GM.addStyle", "GM.log", "GM.info", "GM.getValue", "GM.setValue", "GM.deleteValue", "GM.listValues"));
+            "GM_addStyle", "GM_addElement", "GM_log", "GM_info",
+            "GM_getValue", "GM_setValue", "GM_deleteValue", "GM_listValues",
+            "GM_getValues", "GM_setValues", "GM_deleteValues",
+            "GM_addValueChangeListener", "GM_removeValueChangeListener",
+            "GM_setClipboard", "GM_registerMenuCommand", "GM_unregisterMenuCommand",
+            "GM_openInTab", "GM_notification",
+            "GM.addStyle", "GM.addElement", "GM.log", "GM.info",
+            "GM.getValue", "GM.setValue", "GM.deleteValue", "GM.listValues",
+            "GM.getValues", "GM.setValues", "GM.deleteValues",
+            "GM.addValueChangeListener", "GM.removeValueChangeListener",
+            "GM.setClipboard", "GM.registerMenuCommand", "GM.unregisterMenuCommand",
+            "GM.openInTab", "GM.notification",
+            "unsafeWindow", "window.close", "window.focus", "window.onurlchange"));
     public final String source, code, name, namespace, version, author, description, runAt;
     public final List<UrlPattern> includes, excludes;
     public final Set<String> grants;
     public final Set<String> origins;
-    final boolean requiresIsolation, pageWorld, anyPort;
+    final boolean requiresIsolation, pageWorld, usesUnsafeWindow, needsValueListener, anyPort;
 
     private UserScript(String source, String code, Map<String, String> metadata,
                        List<UrlPattern> includes, List<UrlPattern> excludes, Set<String> grants) {
@@ -37,8 +49,11 @@ public final class UserScript {
         this.includes = Collections.unmodifiableList(includes);
         this.excludes = Collections.unmodifiableList(excludes);
         this.grants = Collections.unmodifiableSet(grants);
-        requiresIsolation = !grants.isEmpty() || "DOM".equals(metadata.get("sandbox"));
-        pageWorld = "raw".equals(metadata.get("sandbox"));
+        usesUnsafeWindow = grants.contains("unsafeWindow");
+        needsValueListener = grants.contains("GM_addValueChangeListener") || grants.contains("GM.addValueChangeListener");
+        String sandbox = metadata.get("sandbox");
+        requiresIsolation = !usesUnsafeWindow && (!grants.isEmpty() || "DOM".equals(sandbox) || "JavaScript".equals(sandbox));
+        pageWorld = "raw".equals(sandbox) || usesUnsafeWindow;
         boolean hasAnyPort = false;
         Set<String> allowed = new LinkedHashSet<>();
         for (UrlPattern rule : includes) {
@@ -52,11 +67,11 @@ public final class UserScript {
     public static UserScript parse(String input) {
         if (input == null) throw invalid("脚本内容为空");
         if (input.length() > MAX_BYTES || input.getBytes(StandardCharsets.UTF_8).length > MAX_BYTES)
-            throw invalid("脚本不能超过 512 KiB");
+            throw invalid("脚本不能超过 1 MiB");
         String source = input.replace("\r\n", "\n").replace('\r', '\n');
         if (source.startsWith("\ufeff")) source = source.substring(1);
         Matcher start = HEADER.matcher(source), end = END.matcher(source);
-        if (!start.find() || start.start() > 4096 || !end.find(start.end()) || end.start() - start.end() > 16_384)
+        if (!start.find() || start.start() > 4096 || !end.find(start.end()) || end.start() - start.end() > MAX_HEADER_CHARS)
             throw invalid("缺少完整的 // ==UserScript== 元数据区");
         Map<String, String> metadata = new HashMap<>();
         List<UrlPattern> includes = new ArrayList<>(), excludes = new ArrayList<>();
@@ -95,7 +110,8 @@ public final class UserScript {
                     unsupported.add("@" + key);
                     break;
                 case "sandbox":
-                    if (!value.equals("DOM") && !value.equals("raw")) unsupported.add("@sandbox " + value);
+                    if (!value.equals("DOM") && !value.equals("raw") && !value.equals("JavaScript"))
+                        unsupported.add("@sandbox " + value);
                     else metadata.put("sandbox", value);
                     break;
                 default:
@@ -237,6 +253,10 @@ public final class UserScript {
             int pathStart = pattern.indexOf('/', schemeEnd + 3);
             String authority = pattern.substring(schemeEnd + 3, pathStart < 0 ? pattern.length() : pathStart);
             String path = pathStart < 0 ? "/*" : pattern.substring(pathStart);
+            // Common Greasy Fork shorthand: @include https://example.com* (without slash before '*')
+            if (pathStart < 0 && authority.length() > 1 && authority.endsWith("*")) {
+                authority = authority.substring(0, authority.length() - 1);
+            }
             if (authority.contains("@") || authority.contains("?")) throw invalid("网址模式的域名无效");
             boolean subdomains = authority.startsWith("*.");
             if (subdomains) authority = authority.substring(2);

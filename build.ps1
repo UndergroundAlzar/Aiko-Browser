@@ -6,7 +6,7 @@ param(
     [string] $BuildTools,
     [string] $SigningKey = (Join-Path $PSScriptRoot 'build/local-preview.p12'),
     [string] $SigningAlias = 'aiko-preview',
-    [string] $OutputFile = (Join-Path $PSScriptRoot 'build/Aiko-Browser-0.3.0.apk')
+    [string] $OutputFile = (Join-Path $PSScriptRoot 'build/Aiko-Browser-0.3.1.apk')
 )
 $ErrorActionPreference = 'Stop'
 if (-not $AndroidJar -and $SdkRoot) { $AndroidJar = Join-Path $SdkRoot 'platforms/android-36/android.jar' }
@@ -99,7 +99,101 @@ Run-Native $java @('-cp',"$BuildTools/lib/d8.jar",'com.android.tools.r8.R8','--r
     '--lib',$AndroidJar,'--classpath',$annotations,'--classpath',$experimentalJar,'--classpath',$jspecify,'--classpath',$kotlinAnnotations,
     '--pg-conf',"$PSScriptRoot/androidx-keep.pro",'--pg-conf',$webkitKeep,'--output',$dex,$classJar,$webkitJar,$coreJar)
 Run-Native $jar @('uf',$unsigned,'-C',$dex,'classes.dex')
-Run-Native $zipalign @('-f','4',$unsigned,$aligned)
+
+# Fix Windows aapt2.exe bug that writes backslashes into subdirectory asset paths (e.g. assets/filters\psl.txt.gz),
+# which causes Android AssetManager.open("filters/psl.txt.gz") to throw FileNotFoundException on device.
+$normalizedApk = Join-Path $build 'normalized.apk'
+$normalizerSrc = Join-Path $build 'NormalizeApkZip.java'
+@'
+import java.io.*;
+import java.util.*;
+import java.util.zip.*;
+
+public final class NormalizeApkZip {
+    public static void main(String[] args) throws Exception {
+        String mode = args[0];
+        if ("normalize".equals(mode)) {
+            normalize(new File(args[1]), new File(args[2]));
+        } else if ("verify".equals(mode)) {
+            verify(new File(args[1]), args, 2);
+        } else {
+            throw new IllegalArgumentException("Unknown mode: " + mode);
+        }
+    }
+
+    private static void normalize(File src, File dst) throws Exception {
+        byte[] buf = new byte[65536];
+        int fixedCount = 0;
+        try (ZipFile zf = new ZipFile(src);
+             ZipOutputStream zos = new ZipOutputStream(new BufferedOutputStream(new FileOutputStream(dst), 65536))) {
+            Enumeration<? extends ZipEntry> en = zf.entries();
+            Set<String> seen = new HashSet<>();
+            while (en.hasMoreElements()) {
+                ZipEntry oldEntry = en.nextElement();
+                String origName = oldEntry.getName();
+                String normName = origName.replace('\\', '/');
+                if (!normName.equals(origName)) fixedCount++;
+                if (!seen.add(normName)) continue;
+
+                ZipEntry next = new ZipEntry(normName);
+                int method = oldEntry.getMethod();
+                next.setMethod(method);
+                if (oldEntry.getTime() != -1L) next.setTime(oldEntry.getTime());
+                if (oldEntry.getExtra() != null) next.setExtra(oldEntry.getExtra());
+                if (method == ZipEntry.STORED) {
+                    next.setSize(oldEntry.getSize());
+                    next.setCompressedSize(oldEntry.getSize());
+                    next.setCrc(oldEntry.getCrc());
+                }
+                zos.putNextEntry(next);
+                if (!oldEntry.isDirectory()) {
+                    try (InputStream in = zf.getInputStream(oldEntry)) {
+                        for (int n; (n = in.read(buf)) >= 0; ) {
+                            zos.write(buf, 0, n);
+                        }
+                    }
+                }
+                zos.closeEntry();
+            }
+        }
+        System.out.println("APK ZIP normalized: fixed " + fixedCount + " backslash entry path(s).");
+    }
+
+    private static void verify(File apk, String[] args, int offset) throws Exception {
+        Set<String> present = new HashSet<>();
+        List<String> badPaths = new ArrayList<>();
+        boolean arscStored = false;
+        try (ZipFile zf = new ZipFile(apk)) {
+            Enumeration<? extends ZipEntry> en = zf.entries();
+            while (en.hasMoreElements()) {
+                ZipEntry e = en.nextElement();
+                String name = e.getName();
+                if (name.indexOf('\\') >= 0) badPaths.add(name);
+                present.add(name);
+                if ("resources.arsc".equals(name)) {
+                    arscStored = (e.getMethod() == ZipEntry.STORED);
+                }
+            }
+        }
+        if (!badPaths.isEmpty()) {
+            throw new IllegalStateException("APK contains invalid backslash ZIP entries: " + badPaths);
+        }
+        if (!arscStored) {
+            throw new IllegalStateException("resources.arsc must be STORED (uncompressed) for Android R+.");
+        }
+        List<String> missing = new ArrayList<>();
+        for (int i = offset; i < args.length; i++) {
+            if (!present.contains(args[i])) missing.add(args[i]);
+        }
+        if (!missing.isEmpty()) {
+            throw new IllegalStateException("APK is missing required forward-slash assets: " + missing);
+        }
+        System.out.println("PASS APK asset verification (" + present.size() + " POSIX entries, 0 backslashes, resources.arsc STORED).");
+    }
+}
+'@ | Set-Content -LiteralPath $normalizerSrc -Encoding utf8
+Run-Native $java @($normalizerSrc,'normalize',$unsigned,$normalizedApk)
+Run-Native $zipalign @('-f','4',$normalizedApk,$aligned)
 
 # Local preview keys use a random password protected by Windows for the current user.
 $passwordFile = $SigningKey + '.dpapi'
@@ -138,4 +232,11 @@ try {
 }
 Run-Native $zipalign @('-c','4',$OutputFile)
 Run-Native $java @('-jar',"$BuildTools/lib/apksigner.jar",'verify','--verbose',$OutputFile)
+$requiredAssets = @(
+    Get-ChildItem -Path "$primary/assets" -Recurse -File | ForEach-Object {
+        $rel = [IO.Path]::GetRelativePath($primary, $_.FullName).Replace('\', '/')
+        $rel
+    }
+)
+Run-Native $java (@($normalizerSrc,'verify',$OutputFile) + $requiredAssets)
 Get-Item -LiteralPath $OutputFile | Select-Object FullName,Length

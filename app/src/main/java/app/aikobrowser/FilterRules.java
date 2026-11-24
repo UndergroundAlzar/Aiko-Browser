@@ -16,7 +16,7 @@ final class FilterRules {
     private static final int BINARY_VERSION = 1;
     private static final int MAX_BINARY_ITEMS = 600_000;
     private static final int MAX_EVIDENCE_BYTES = 24 * 1024 * 1024;
-    private static final int MAX_RULE_LINE_CHARS = 4096;
+    private static final int MAX_RULE_LINE_CHARS = 32_768;
     private static final int MAX_UNIQUE_LINES = 450_000;
 
     private static final int FLAG_ALLOW = 1 << 16;
@@ -1742,6 +1742,7 @@ final class FilterRules {
         static Scope parse(String value, int start, int end, char delimiter) {
             ArrayList<String> allow = null;
             ArrayList<String> deny = null;
+            boolean sawPositive = false;
             int pos = start;
             // Exact match for String.split(delimiter): trailing empty tokens are ignored,
             // leading/middle empty tokens produce "" which fails validHost("").
@@ -1757,20 +1758,34 @@ final class FilterRules {
                 boolean neg = partEnd > pos && value.charAt(pos) == '~';
                 int hStart = neg ? pos + 1 : pos;
                 String host = toLowerAsciiString(value.substring(hStart, partEnd));
-                if (!validHost(host)) return null;
                 if (neg) {
+                    if (!validHost(host)) return null;
                     if (deny == null) deny = new ArrayList<>(2);
                     deny.add(host);
                 } else {
-                    if (allow == null) allow = new ArrayList<>(2);
-                    allow.add(host);
+                    sawPositive = true;
+                    if (validHost(host)) {
+                        if (allow == null) allow = new ArrayList<>(2);
+                        allow.add(host);
+                    } else if (!isWildcardTldHost(host)) {
+                        // Reject malformed tokens, while skipping only unsupported wildcard-TLD siblings (e.g. tripadvisor.*)
+                        return null;
+                    }
                 }
                 if (next < 0 || next >= effectiveEnd) break;
                 pos = next + 1;
             }
+            // Never turn a positive-scoped rule (e.g. $domain=google.*) into global Scope.ANY when all positives were skipped
+            if (sawPositive && allow == null) return null;
             return new Scope(
                     allow == null ? EMPTY : allow.toArray(new String[0]),
                     deny == null ? EMPTY : deny.toArray(new String[0]));
+        }
+
+        private static boolean isWildcardTldHost(String host) {
+            int len = host.length();
+            return len >= 3 && host.charAt(len - 2) == '.' && host.charAt(len - 1) == '*'
+                    && validHost(host.substring(0, len - 2));
         }
 
         boolean applies(String host) {

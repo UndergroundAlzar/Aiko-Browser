@@ -217,7 +217,7 @@ public final class SiteFilter {
     private static final int GZIP_BUFFER = 32 * 1024;
     private static final int IO_BUFFER = 64 * 1024;
     private static final int CACHE_MAGIC = 0x41494B43; // "AIKC"
-    private static final int CACHE_VERSION = 2;
+    private static final int CACHE_VERSION = 3;
     private static final String CACHE_FILE = "filter-rules-v1.bin";
     private static final int CSS_CACHE_LIMIT = 16;
 
@@ -1216,7 +1216,7 @@ public final class SiteFilter {
             conn.setConnectTimeout(FETCH_TIMEOUT_MS);
             conn.setReadTimeout(FETCH_TIMEOUT_MS);
             conn.setInstanceFollowRedirects(false);
-            conn.setRequestProperty("User-Agent", "AikoBrowser/0.3.0");
+            conn.setRequestProperty("User-Agent", "AikoBrowser/0.3.1");
             conn.setRequestProperty("Accept", "text/plain, */*;q=0.5");
             conn.setRequestProperty("Accept-Encoding", "gzip");
             try {
@@ -1341,8 +1341,9 @@ public final class SiteFilter {
     }
 
     boolean blocks(Page page, android.webkit.WebResourceRequest request) {
-        if (page == null || !enabled(page.host) || request.isForMainFrame()
-                || !"GET".equals(request.getMethod())) return false;
+        if (page == null || !enabled(page.host) || request.isForMainFrame()) return false;
+        String method = request.getMethod();
+        if (!"GET".equals(method) && !"POST".equals(method) && !"HEAD".equals(method)) return false;
         Uri uri = request.getUrl();
         String scheme = uri.getScheme();
         if (!"https".equals(scheme) && !"http".equals(scheme)) return false;
@@ -1449,10 +1450,11 @@ public final class SiteFilter {
         CssEntry entry = lookupCssEntry(normalizedHost, url);
         if (entry == null || entry.css.isEmpty()) return;
         view.evaluateJavascript("(function(){if(location.href!==" + org.json.JSONObject.quote(url)
-                + ")return;var s=document.getElementById('aiko-filter-style');"
+                + ")return;var css=" + entry.quoted + ";var s=document.getElementById('aiko-filter-style');"
+                + "if(s&&s.textContent===css)return;"
                 + "if(!s){s=document.createElement('style');s.id='aiko-filter-style';"
-                + "(document.head||document.documentElement).appendChild(s);}"
-                + "s.textContent=" + entry.quoted + ";})();", null);
+                + "var root=document.head||document.documentElement;if(!root)return;root.appendChild(s);}"
+                + "s.textContent=css;})();", null);
     }
 
     private CssEntry lookupCssEntry(String normalizedHost, String url) {

@@ -54,14 +54,20 @@ final class ScriptTools {
                 .setNegativeButton("返回", (d, w) -> show()).show();
     }
 
-    private void openFile() {
+    void openFile() {
         Intent pick = new Intent(Intent.ACTION_OPEN_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE).setType("*/*");
         try { activity.startActivityForResult(pick, PICK_FILE); }
         catch (android.content.ActivityNotFoundException unavailable) { activity.toast("找不到文件选择器"); }
     }
 
+    void openEditor(UserScripts.Entry entry) {
+        editor(entry);
+    }
+
     void importFile(Uri uri) {
-        if (uri == null || !"content".equals(uri.getScheme())) return;
+        if (uri == null) return;
+        String scheme = uri.getScheme();
+        if (!"content".equals(scheme) && !"file".equals(scheme)) return;
         importInBackground(() -> {
             try (InputStream input = activity.getContentResolver().openInputStream(uri)) {
                 return new UserScriptInput.Downloaded(UserScriptInput.read(input, UserScript.MAX_BYTES), "本地文件");
@@ -153,22 +159,7 @@ final class ScriptTools {
     }
 
     private void review(UserScript script, UserScripts.Entry previous, String source, Runnable closeEditor) {
-        String message = (source == null ? "" : "来源  " + source + "\n\n") + summary(script)
-                + (previous == null ? "\n\n导入后默认停用，可在脚本详情中启用。"
-                : "\n\n将替换已有脚本。新源码默认停用，并保留该脚本已保存的值。");
-        AlertDialog dialog = new AlertDialog.Builder(activity).setTitle(script.name).setMessage(message)
-                .setNegativeButton("取消", null).setPositiveButton(previous == null ? "导入" : "替换", null).create();
-        dialog.show();
-        dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(view -> {
-            try {
-                UserScripts.Entry installed = scripts.save(script, previous);
-                dialog.dismiss();
-                closeEditor.run();
-                details(installed);
-            } catch (IllegalArgumentException blocked) {
-                activity.toast(blocked.getMessage());
-            }
-        });
+        activity.showLocalUserScriptSheet(script, previous, source == null ? "手动编写" : source, closeEditor);
     }
 
     private void details(UserScripts.Entry entry) {

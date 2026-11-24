@@ -67,6 +67,24 @@ public final class UserCustomizationCheck {
                 UserScript.address("https://forum.example")), "native gate checks scheme");
         require(UserScript.sameOrigin(UserScript.address("https://forum.example/wiki/"),
                 UserScript.address("https://forum.example:443")), "explicit default port is same origin");
+
+        // Verify v0.3.1 expanded Tampermonkey grants (GM_addValueChangeListener, unsafeWindow, etc.)
+        String janitorLike = "// ==UserScript==\n// @name Aiko Janitor\n// @namespace aiko.janitor\n"
+                + "// @version 1.0.1\n// @match https://janitorai.com/*\n// @include https://jani.com*\n"
+                + "// @run-at document-idle\n// @noframes\n// @sandbox DOM\n"
+                + "// @grant GM_getValue\n// @grant GM_setValue\n// @grant GM_addValueChangeListener\n"
+                + "// @grant GM_removeValueChangeListener\n// ==/UserScript==\nconsole.log('ok');";
+        UserScript j = UserScript.parse(janitorLike);
+        require(j.requiresIsolation && !j.pageWorld && j.needsStorage() && j.needsValueListener
+                && j.permits("addValueChangeListener") && j.matches(UserScript.address("https://janitorai.com/zh/chats/1373717782"))
+                && j.matches(UserScript.address("https://jani.com/chats/1")), "aiko-janitor metadata and grants");
+
+        String unsafeScript = "// ==UserScript==\n// @name UnsafeHelper\n// @match https://janitorai.com/*\n"
+                + "// @grant unsafeWindow\n// @grant GM_addElement\n// @grant GM_registerMenuCommand\n"
+                + "// @grant window.onurlchange\n// ==/UserScript==\nunsafeWindow.x = 1;";
+        UserScript u = UserScript.parse(unsafeScript);
+        require(!u.requiresIsolation && u.pageWorld && u.usesUnsafeWindow, "unsafeWindow uses pageWorld");
+
         expectInvalid("// @grant GM_xmlhttpRequest", "GM_xmlhttpRequest");
         expectInvalid("// @require https://example.com/dependency.js", "@require");
         expectInvalid("// @grant none\n// @grant GM_setValue", "@grant none");

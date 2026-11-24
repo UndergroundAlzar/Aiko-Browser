@@ -88,4 +88,70 @@ for (const [url, frame] of [
     assert.equal(denied.ctx.escaped, undefined, url);
     assert.deepEqual(denied.state.logs, [], url);
 }
-console.log('PASS script runtime timing, document deduplication, privileges, storage messages and URL/frame scope');
+
+// Verify GM_addValueChangeListener local + cross-tab remote sync + token-authenticated ephemeral bridge
+{
+    const remoteListeners = [];
+    const posted = [];
+    const document = {
+        readyState: 'complete',
+        addEventListener() {},
+        head: {appendChild() {}},
+        body: {appendChild() {}},
+        createElement(tag) { return {tag, attrs: {}, setAttribute(k, v) { this.attrs[k] = v; }, appendChild() {}}; }
+    };
+    const bridgeObj = {
+        postMessage(msg) { posted.push(JSON.parse(msg)); },
+        addEventListener(type, fn) { if (type === 'message') remoteListeners.push(fn); }
+    };
+    const ctx = vm.createContext({
+        location: new URL('https://janitorai.com/zh/chats/1373717782'),
+        document,
+        console: {log() {}, warn() {}},
+        __aikoSv_deadbeef0001: bridgeObj,
+        requestIdleCallback(fn) { fn(); },
+        setTimeout(fn) { fn(); }
+    });
+    ctx.window = ctx;
+    ctx.top = ctx;
+    const cfg = {
+        id: 'janitor-test', release: '0.3.1', runAt: 'document-start',
+        includes: [['https', 'janitorai.com', false, -1, '/*']],
+        excludes: [],
+        grants: ['GM_getValue', 'GM_setValue', 'GM_addValueChangeListener', 'GM_removeValueChangeListener', 'GM_addElement'],
+        storage: true,
+        bridge: '__aikoSv_deadbeef0001',
+        token: 'secret-token-1234',
+        ephemeralBridge: true,
+        script: {name: 'Aiko Janitor', namespace: 'aiko.janitor', version: '1.0.1'},
+        values: {'aiko-janitor.settings.v1': {enabled: false}}
+    };
+    vm.runInContext(`(${program})(${JSON.stringify(cfg)},${JSON.stringify(`
+        window.bridgeLeaked = typeof __aikoSv_deadbeef0001 !== 'undefined';
+        window.events = [];
+        const lid = GM_addValueChangeListener('aiko-janitor.settings.v1', (k, oldV, newV, remote) => {
+            window.events.push({k, oldEnabled: oldV?.enabled, newEnabled: newV?.enabled, remote});
+        });
+        GM_setValue('aiko-janitor.settings.v1', {enabled: true});
+        window.el = GM_addElement('meta', {name: 'aiko-test', content: 'ok'});
+        window.lid = lid;
+    `)});`, ctx);
+    assert.equal(ctx.bridgeLeaked, false, 'ephemeral bridge deleted before body runs');
+    assert.equal(posted.length, 2, 'hello + set messages posted');
+    assert.deepEqual(posted[0].slice(1), ['hello', 'secret-token-1234']);
+    assert.equal(posted[1][1], 'set');
+    assert.equal(posted[1][4], 'secret-token-1234');
+    assert.equal(ctx.events.length, 1);
+    assert.equal(ctx.events[0].remote, false);
+    assert.equal(ctx.events[0].newEnabled, true);
+    assert.equal(ctx.el.attrs.content, 'ok');
+
+    // Simulate remote cross-tab push via JavaScriptReplyProxy
+    for (const fn of remoteListeners) {
+        fn({data: JSON.stringify(['aiko-janitor.settings.v1', true, {enabled: true}, true, {enabled: false}])});
+    }
+    assert.equal(ctx.events.length, 2);
+    assert.equal(ctx.events[1].remote, true);
+    assert.equal(ctx.events[1].newEnabled, false);
+}
+console.log('PASS script runtime timing, document deduplication, privileges, storage messages, value listeners and URL/frame scope');

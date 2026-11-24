@@ -159,7 +159,7 @@ final class UserScriptInput {
             connection.setInstanceFollowRedirects(false);
             connection.setRequestProperty("Accept", "text/javascript, application/javascript, text/plain, */*;q=0.5");
             connection.setRequestProperty("User-Agent",
-                    "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) AikoBrowser/0.3.0");
+                    "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) AikoBrowser/0.3.1");
             try {
                 int status = connection.getResponseCode();
                 if (status == 200) {

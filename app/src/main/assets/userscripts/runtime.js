@@ -43,45 +43,112 @@ function (config, body) {
     if (document[marker]) return;
     Object.defineProperty(document, marker, {value: true});
 
+    // Capture storage bridge immediately at document-start so ephemeral page-world bridges cannot be observed by page scripts.
+    const bridgeName = config.bridge || "__aikoScriptValues";
+    const capturedBridge = config.storage ? globalThis[bridgeName] : null;
+    if (config.ephemeralBridge && capturedBridge) {
+        try { delete globalThis[bridgeName]; } catch { /* Non-configurable host property */ }
+    }
+
     function run() {
         if (!permitted()) return;
-        const bridge = config.storage ? globalThis.__aikoScriptValues : null;
+        const bridge = capturedBridge;
+        const token = config.token || "";
         const values = Object.assign(Object.create(null), config.values);
         const owns = (key) => Object.prototype.hasOwnProperty.call(values, key);
-        const valuesLimit = 32768;
+        const valuesLimit = 65536;
         const keyLimit = 128;
+        const listeners = new Map();
+        let nextListenerId = 1;
+        const menuCommands = new Map();
+        let nextMenuId = 1;
+
         const keyText = (key) => {
             const text = String(key);
             if (text.length > keyLimit) throw new RangeError("GM value key is too long");
             return text;
         };
+        const cloneValue = (val) => {
+            if (val === undefined || val === null || typeof val !== "object") return val;
+            try { return JSON.parse(JSON.stringify(val)); } catch { return val; }
+        };
+        const notifyListeners = (key, oldVal, newVal, remote) => {
+            if (listeners.size === 0) return;
+            for (const entry of Array.from(listeners.values())) {
+                if (entry.key !== key) continue;
+                try {
+                    entry.cb(key, cloneValue(oldVal), cloneValue(newVal), remote);
+                } catch (err) {
+                    console.warn("[Aiko userscript] value listener error", err);
+                }
+            }
+        };
         const valueGet = (key, fallback) => {
             key = keyText(key);
-            return owns(key) ? values[key] : fallback;
+            return owns(key) ? cloneValue(values[key]) : fallback;
         };
         const valueSet = (key, value) => {
             key = keyText(key);
             if (!bridge) throw new Error("GM storage is unavailable");
             const encoded = JSON.stringify(value);
             if (encoded === undefined || encoded.length > valuesLimit) throw new TypeError("Unsupported GM value");
-            const envelope = JSON.stringify([location.href, "set", key, encoded]);
-            if (envelope.length > 76000) throw new RangeError("GM value is too large");
+            const payload = token ? [location.href, "set", key, encoded, token] : [location.href, "set", key, encoded];
+            const envelope = JSON.stringify(payload);
+            if (envelope.length > 140000) throw new RangeError("GM value is too large");
             const previous = owns(key) ? values[key] : undefined;
-            values[key] = JSON.parse(encoded);
+            const parsed = JSON.parse(encoded);
+            values[key] = parsed;
             if (Object.keys(values).length > 128 || JSON.stringify(values).length > valuesLimit) {
                 if (previous === undefined) delete values[key];
                 else values[key] = previous;
                 throw new RangeError("GM storage limit reached");
             }
             bridge.postMessage(envelope);
+            notifyListeners(key, previous, parsed, false);
         };
         const valueDelete = (key) => {
             key = keyText(key);
             if (!bridge) throw new Error("GM storage is unavailable");
+            const previous = owns(key) ? values[key] : undefined;
             delete values[key];
-            bridge.postMessage(JSON.stringify([location.href, "delete", key]));
+            const payload = token ? [location.href, "delete", key, token] : [location.href, "delete", key];
+            bridge.postMessage(JSON.stringify(payload));
+            if (previous !== undefined) notifyListeners(key, previous, undefined, false);
         };
         const valueList = () => Object.keys(values);
+        const valuesGet = (keysOrDefaults) => {
+            const out = {};
+            if (Array.isArray(keysOrDefaults)) {
+                for (const k of keysOrDefaults) {
+                    const key = keyText(k);
+                    if (owns(key)) out[key] = cloneValue(values[key]);
+                }
+            } else if (keysOrDefaults && typeof keysOrDefaults === "object") {
+                for (const k of Object.keys(keysOrDefaults)) {
+                    const key = keyText(k);
+                    out[key] = owns(key) ? cloneValue(values[key]) : keysOrDefaults[k];
+                }
+            }
+            return out;
+        };
+        const valuesSet = (entries) => {
+            if (!entries || typeof entries !== "object") return;
+            for (const k of Object.keys(entries)) valueSet(k, entries[k]);
+        };
+        const valuesDelete = (keys) => {
+            if (!Array.isArray(keys)) return;
+            for (const k of keys) valueDelete(k);
+        };
+        const addValueChangeListener = (key, callback) => {
+            key = keyText(key);
+            if (typeof callback !== "function") throw new TypeError("GM_addValueChangeListener requires a function");
+            const id = nextListenerId++;
+            listeners.set(id, {key, cb: callback});
+            return id;
+        };
+        const removeValueChangeListener = (id) => {
+            listeners.delete(id);
+        };
         const addStyle = (css) => {
             const style = document.createElement("style");
             style.textContent = String(css);
@@ -92,16 +159,162 @@ function (config, body) {
             }, {once: true});
             return style;
         };
+        const addElement = (first, second, third) => {
+            let parent = null, tag = first, attrs = second;
+            if (first && typeof first === "object" && typeof first.appendChild === "function") {
+                parent = first;
+                tag = second;
+                attrs = third;
+            }
+            const el = document.createElement(String(tag));
+            if (attrs && typeof attrs === "object") {
+                for (const [k, v] of Object.entries(attrs)) {
+                    if (k === "textContent") el.textContent = String(v);
+                    else if (v !== undefined && v !== null) el.setAttribute(k, String(v));
+                }
+            }
+            const target = parent || document.head || document.body || document.documentElement;
+            if (target) target.appendChild(el);
+            return el;
+        };
+        const setClipboard = (data) => {
+            const text = String(data ?? "");
+            if (navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
+                return navigator.clipboard.writeText(text).catch(() => {});
+            }
+            try {
+                const ta = document.createElement("textarea");
+                ta.value = text;
+                ta.style.cssText = "position:fixed;opacity:0;pointer-events:none;left:-9999px;top:0;";
+                (document.body || document.documentElement).appendChild(ta);
+                ta.focus();
+                ta.select();
+                document.execCommand("copy");
+                ta.remove();
+            } catch { /* Ignore clipboard errors in non-gesture context */ }
+        };
+        const registerMenuCommand = (caption, onClick, options) => {
+            const id = "cmd-" + (nextMenuId++);
+            menuCommands.set(id, {caption: String(caption ?? ""), onClick, options});
+            return id;
+        };
+        const unregisterMenuCommand = (id) => {
+            menuCommands.delete(id);
+        };
+        const openInTab = (url) => {
+            const target = String(url ?? "");
+            if (!/^https?:\/\//i.test(target)) return {closed: true, close() {}, onclose: null};
+            const opened = window.open(target, "_blank", "noopener");
+            return {
+                get closed() { return !opened || opened.closed; },
+                close() { try { opened && opened.close(); } catch {} },
+                onclose: null
+            };
+        };
+        const notification = (first, second, _third, fourth) => {
+            const opts = (first && typeof first === "object")
+                ? first
+                : {text: String(first ?? ""), title: second ? String(second) : config.script.name, onclick: fourth};
+            try {
+                const host = document.createElement("div");
+                host.style.cssText = "position:fixed;top:14px;right:14px;z-index:2147483647;max-width:300px;pointer-events:auto;";
+                const root = host.attachShadow ? host.attachShadow({mode: "open"}) : host;
+                const box = document.createElement("div");
+                box.style.cssText = "background:#171B26;color:#F3F5FA;border:1px solid #3A4666;border-radius:14px;"
+                    + "padding:10px 14px;font:13px/1.4 system-ui,sans-serif;box-shadow:0 8px 24px rgba(0,0,0,.45);cursor:pointer;";
+                if (opts.title) {
+                    const t = document.createElement("div");
+                    t.style.cssText = "font-weight:700;margin-bottom:2px;";
+                    t.textContent = String(opts.title);
+                    box.appendChild(t);
+                }
+                const m = document.createElement("div");
+                m.style.cssText = "color:#B8C2D8;";
+                m.textContent = String(opts.text ?? "");
+                box.appendChild(m);
+                root.appendChild(box);
+                (document.body || document.documentElement)?.appendChild(host);
+                let closed = false;
+                const finish = (clicked) => {
+                    if (closed) return;
+                    closed = true;
+                    host.remove();
+                    if (clicked && typeof opts.onclick === "function") try { opts.onclick(); } catch {}
+                    if (typeof opts.ondone === "function") try { opts.ondone(clicked); } catch {}
+                };
+                box.addEventListener("click", () => finish(true), {once: true});
+                setTimeout(() => finish(false), Math.max(1200, Math.min(15000, Number(opts.timeout) || 4000)));
+            } catch { /* Ignore DOMless contexts */ }
+        };
+
+        const enabled = new Set(config.grants);
+
+        // Subscribe to live cross-tab storage updates when GM_addValueChangeListener is granted.
+        if (bridge && (enabled.has("GM_addValueChangeListener") || enabled.has("GM.addValueChangeListener"))) {
+            const onRemoteMessage = (event) => {
+                try {
+                    const msg = JSON.parse(typeof event === "string" ? event : event.data);
+                    if (!Array.isArray(msg) || msg.length < 5) return;
+                    const [key, hadOld, oldVal, hasNew, newVal] = msg;
+                    if (typeof key !== "string") return;
+                    const prev = hadOld ? oldVal : (owns(key) ? values[key] : undefined);
+                    if (hasNew) values[key] = newVal;
+                    else delete values[key];
+                    notifyListeners(key, prev, hasNew ? newVal : undefined, true);
+                } catch { /* Ignore malformed bridge message */ }
+            };
+            if (typeof bridge.addEventListener === "function") bridge.addEventListener("message", onRemoteMessage);
+            else if ("onmessage" in bridge) bridge.onmessage = onRemoteMessage;
+            try {
+                const hello = token ? [location.href, "hello", token] : [location.href, "hello"];
+                bridge.postMessage(JSON.stringify(hello));
+            } catch { /* Best-effort cross-tab registration */ }
+        }
+
+        // Optional SPA URL change watcher when @grant window.onurlchange is requested.
+        if (enabled.has("window.onurlchange") && typeof history === "object") {
+            let lastHref = location.href;
+            const emitUrlChange = () => {
+                if (location.href === lastHref) return;
+                lastHref = location.href;
+                const info = {url: lastHref};
+                try { window.dispatchEvent(new CustomEvent("urlchange", {detail: info})); } catch {}
+                if (typeof window.onurlchange === "function") {
+                    try { window.onurlchange(info); } catch {}
+                }
+            };
+            for (const fn of ["pushState", "replaceState"]) {
+                const orig = history[fn];
+                if (typeof orig === "function") {
+                    history[fn] = function (...args) {
+                        const res = orig.apply(this, args);
+                        emitUrlChange();
+                        return res;
+                    };
+                }
+            }
+            window.addEventListener("popstate", emitUrlChange);
+            window.addEventListener("hashchange", emitUrlChange);
+        }
+
         const info = {scriptHandler: "Aiko Browser", version: config.release, script: config.script};
         const log = (...items) => console.log(...items);
         const functions = {
-            addStyle, log, getValue: valueGet, setValue: valueSet, deleteValue: valueDelete, listValues: valueList
+            addStyle, addElement, log,
+            getValue: valueGet, setValue: valueSet, deleteValue: valueDelete, listValues: valueList,
+            getValues: valuesGet, setValues: valuesSet, deleteValues: valuesDelete,
+            addValueChangeListener, removeValueChangeListener,
+            setClipboard, registerMenuCommand, unregisterMenuCommand,
+            openInTab, notification
         };
         const modern = Object.create(null);
-        const enabled = new Set(config.grants);
         if (enabled.has("GM.info")) modern.info = info;
         const names = ["GM", "GM_info"];
         const args = [modern, info];
+        if (enabled.has("unsafeWindow")) {
+            names.push("unsafeWindow");
+            args.push(window);
+        }
         for (const method of Object.keys(functions)) {
             const legacy = "GM_" + method;
             if (enabled.has(legacy)) {

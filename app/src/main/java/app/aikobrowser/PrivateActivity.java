@@ -3,7 +3,10 @@ package app.aikobrowser;
 import android.animation.Animator;
 import android.animation.AnimatorListenerAdapter;
 import android.app.Activity;
+import android.content.ClipData;
+import android.content.ClipboardManager;
 import android.content.res.Configuration;
+import android.widget.Toast;
 import android.graphics.Color;
 import android.graphics.drawable.GradientDrawable;
 import android.os.Build;
@@ -57,7 +60,7 @@ public final class PrivateActivity extends Activity {
     private LinearLayout content;
     private EditText address;
     private GradientDrawable addressBg;
-    private BrowserIcon backBtn;
+    private BrowserIcon backBtn, copyBtn;
     private TextView status, subtitle;
     private ProgressBar progress;
     private View fullscreenView;
@@ -212,6 +215,8 @@ public final class PrivateActivity extends Activity {
         addrLp.rightMargin = dp(4);
         bar.addView(address, addrLp);
 
+        copyBtn = iconControl(bar, BrowserIcon.Kind.COPY, "复制链接", AikoTheme.ACCENT_CYAN, this::copyCurrentUrl);
+        copyBtn.setVisibility(View.GONE);
         iconControl(bar, BrowserIcon.Kind.GO, "打开网址", AikoTheme.ACCENT, this::submit);
         iconControl(bar, BrowserIcon.Kind.CLOSE, "关闭无痕窗口", AikoTheme.TEXT_MUTED, this::closeWindow);
 
@@ -402,6 +407,11 @@ public final class PrivateActivity extends Activity {
                 syncBackTint();
             }
 
+            @Override public void onPageFinished(WebView v, String url) {
+                if (filter != null) filter.applyCss(v, url);
+                syncBackTint();
+            }
+
             @Override public boolean onRenderProcessGone(WebView v, android.webkit.RenderProcessGoneDetail detail) {
                 frame.removeView(v);
                 v.destroy();
@@ -416,6 +426,20 @@ public final class PrivateActivity extends Activity {
     private void syncBackTint() {
         if (backBtn != null) {
             backBtn.tint(web != null && web.canGoBack() ? AikoTheme.TEXT : AikoTheme.TEXT_DIM);
+        }
+        if (copyBtn != null) {
+            String url = web == null ? null : web.getUrl();
+            copyBtn.setVisibility(HttpUrlUtil.isHttp(url) ? View.VISIBLE : View.GONE);
+        }
+    }
+
+    private void copyCurrentUrl() {
+        String url = web == null ? null : web.getUrl();
+        if (!HttpUrlUtil.isHttp(url)) return;
+        ClipboardManager cm = getSystemService(ClipboardManager.class);
+        if (cm != null) {
+            cm.setPrimaryClip(ClipData.newPlainText("网址", url));
+            Toast.makeText(this, "已复制链接", Toast.LENGTH_SHORT).show();
         }
     }
 

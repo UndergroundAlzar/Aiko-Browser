@@ -83,6 +83,10 @@ public final class FilterRulesCheck {
                 check(live7.networkCount + live7.cosmeticCount > 130_000, "all 7 bundled lists recognized");
                 check(block(live7, "linux.do", "qzs.gdtimg.com", "/sample", 1), "7-list Chinese ad network");
                 check(block(live7, "m.youku.com", "ad.youku.com", "/sdk.js", 1), "7-list mobile ad network");
+                check(block(live7, "greasyfork.org", "server.ethicalads.io", "/decision/?publisher=greasyfork", 1), "7-list Greasy Fork EthicalAds network block");
+                check(block(live7, "greasyfork.org", "media.ethicalads.io", "/media/client/ethicalads.min.js", 1), "7-list Greasy Fork EthicalAds script block");
+                check(live7.css("greasyfork.org", "https://greasyfork.org/zh-CN/scripts/1").contains(".ad{display:none!important}"),
+                        "7-list rescued Greasy Fork cosmetic rule despite wildcard-TLD sibling");
                 check(block(live7, "janitorai.com", "ad.doubleclick.net", "/sample", 1), "7-list international ad network");
                 check(block(live7, "janitorai.com", "www.google-analytics.com", "/analytics.js", 1), "7-list tracking rule");
                 check(!block(live7, "janitorai.com", "janitorai.com", "/api/chats", 0), "7-list Janitor AI chat allowed");
