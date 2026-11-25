@@ -1,45 +1,169 @@
+<div align="center">
+
+<img src="docs/art/night-train.webp" alt="Aiko Browser — 夜行线" width="100%" />
+
+<br />
+
 # Aiko Browser
 
-Aiko Browser 是一个由 **Alzar** 开发的轻量高刷 Android 浏览器，基于系统 WebView、Java 与 Android 原生视图构建，采用动态 Material 暗夜设计系统与单手底部交互。最低 Android 10（API 29），目标 API 36。
+**轻至 2.53 MB，快至 185Hz —— 为旗舰高刷屏与重度网页玩家打造的纯 Java Android 浏览器**
 
-**[下载 v0.3.0 APK](https://github.com/UndergroundAlzar/Aiko-Browser/releases/download/v0.3.0/Aiko-Browser-0.3.0.apk)** · [发行说明与 SHA-256](https://github.com/UndergroundAlzar/Aiko-Browser/releases/tag/v0.3.0) · [English](docs/README.en.md) · [开源仓库](https://github.com/UndergroundAlzar/Aiko-Browser)
+[![Latest Release](https://img.shields.io/github/v/release/UndergroundAlzar/Aiko-Browser?style=flat-square&color=7C9BFF&label=Release)](https://github.com/UndergroundAlzar/Aiko-Browser/releases/latest)
+[![APK Size](https://img.shields.io/badge/APK-2.53%20MB-2DD4BF?style=flat-square)](https://github.com/UndergroundAlzar/Aiko-Browser/releases/download/v0.4.0/Aiko-Browser-0.4.0.apk)
+[![Android](https://img.shields.io/badge/Android-10%2B%20(API%2029–36)-3DDC84?style=flat-square&logo=android&logoColor=white)](https://github.com/UndergroundAlzar/Aiko-Browser/releases/latest)
+[![Refresh Rate](https://img.shields.io/badge/Display-Up%20to%20185Hz-F472B6?style=flat-square)](#实测性能与基准)
+[![Pure Java](https://img.shields.io/badge/Stack-Pure%20Java%20·%20Zero%20Bloat-FBBF24?style=flat-square)](#构建与验证)
+[![Tests](https://img.shields.io/badge/Checks-13%2F13%20PASS-34D399?style=flat-square)](docs/BUILD.md)
 
-## 功能
+<p>
+  <a href="https://github.com/UndergroundAlzar/Aiko-Browser/releases/download/v0.4.0/Aiko-Browser-0.4.0.apk"><strong>立即下载 v0.4.0 APK</strong></a>
+  &nbsp;·&nbsp;
+  <a href="https://github.com/UndergroundAlzar/Aiko-Browser/releases/tag/v0.4.0">发行说明与校验</a>
+  &nbsp;·&nbsp;
+  <a href="docs/CUSTOMIZATION.md">深度配置指南</a>
+  &nbsp;·&nbsp;
+  <a href="docs/BUILD.md">构建与基准</a>
+  &nbsp;·&nbsp;
+  <a href="docs/README.en.md">English</a>
+  &nbsp;·&nbsp;
+  <a href="docs/art/README.md">像素画廊</a>
+</p>
 
-| 模块 | 实现 |
-| --- | --- |
-| **性能引擎与 185Hz 高刷** | 全新「性能引擎」提供 **狂暴性能 / 智能均衡 / 持久省电** 3 档内置模式 + **无限自定义性能模式**（可自由组合刷新率策略、Android 12+ ADPF 大核突发助推、2–12 热标签上限、0–5 页 BFCache、预加载策略、单前台预光栅化、1–128 路下载并发上限与全局 185Hz 抗卡盾）；支持 120–185Hz 面板解锁、Android 15+ ARR 触控提频、全屏视频自动让步与零后台开销实时帧率浮标（HUD） |
-| **动态主题与交互界面** | Material / Material You 动态取色引擎（7 套精选预设含 Android 12+ 壁纸取色与纯黑 `#000000` OLED + 自定义色相/饱和度/底色浸染/Hex 调色台，零重启即时换肤并保障全色相 WCAG AA+ 对比度）；底部单行地址栏停靠零遮挡网页固定底栏与弹窗按钮、185Hz 离散切换滚动自动隐藏、左右滑动切标签、上滑开标签列表、屏幕边缘手势、38 枚统一光学线宽零分配矢量图标、多引擎搜索、首页快捷访问（Speed Dial）、0MB 稍后读、阅读模式、页内查找、标签静音、视频倍速控制器（0.5x–3.0x / 静音 / 画中画）、分享/复制链接自动净化与「关于 Aiko Browser」 |
-| **广告过滤与规则中心** | 内置 7 套 2026 实时开源精选规则（**中国**：AdGuard 中文 + CJX 弹窗引流净化；**移动**：AdGuard 移动广告 + 打开 App 横幅净化；**全球**：EasyList + EasyPrivacy + AdGuard Cookie 隐私弹窗净化，合计 **151,759 条**有效规则），支持单列表独立开关、一键在线更新全部规则、**在线订阅规则引擎**（内置 8 套中国+全球推荐订阅一键添加 + 任意自定义 ABP/EasyList 链接）、小白友好快速域屏蔽/放行、可视点选屏蔽（Element Picker）、手写 ABP 规则与化妆品作用域去重二进制缓存 |
-| **油猴脚本与 Greasy Fork** | 支持 **Greasy Fork / Sleazy Fork / ScriptCat / OpenUserJS / GitHub Raw `.user.js` 自动拦截与一键弹窗安装/覆盖更新**（展示站点匹配与权限徽章、源码预览，覆盖更新自动保留原有 `GM_setValue` 存储数据）；管理面板直达 Greasy Fork 并展示当前页生效脚本；兼容手动粘贴/本地 `.user.js`/HTTPS 导入、隔离执行、独立持久化存储（100% 兼容旧版迁移）与快速域名守卫 |
-| **站点控制与 X-Ray** | 地址栏盾牌打开「站点盾牌与极速 X-Ray」（首帧/完成耗时、BFCache 命中与拦截统计），按精确主机名配置广告过滤、185Hz 抗卡盾、站点强制高刷、站点脚本 JS、网页暗黑、桌面标识、网络图片、点选屏蔽、站点字号与一键恢复默认 |
-| **书签与历史** | 后台异步加载，支持实时关键词搜索、固定到首页快捷访问，以及标准 Netscape HTML 书签导入与导出 |
-| **分段下载** | 单文件最多 128 路（受当前性能模式并发上限调节），显示分段地图、逐路速率和预计剩余时间。支持经校验的断点续传、单段重试和浏览优先 |
-| **独立无痕** | 使用独立 Android 进程（`:private`）和 WebView 数据目录，与普通标签的登录、书签和浏览记录物理隔离 |
+</div>
 
-## 运行机制
+---
 
-- **真实硬件性能调度**：`PerfProfiles` 与 `DisplayModeEngine` / `WebViewPerf` / `DownloadService` 深度联动——刷新率在保持当前物理分辨率与 HDR 能力的前提下匹配目标模式，Android 12+ 可选事件驱动突发式 ADPF `PerformanceHintManager` 助推（仅在触控/导航突发上报并自动回落，待机零耗电），单前台标签预光栅化在切换后台或内存紧张时立即关闭防 OOM。
-- **动态取色与无遮挡底栏**：`AikoTheme.Palette` 纯 Java 派生 OLED 深色调色板，在任意色相下保证 `TEXT`/`TEXT_MUTED`/`ACCENT` 达到 WCAG AA+ 可读性，Android 12+ 读取系统 Monet `system_accent1` 色板、Android 10–11 优雅回退；`GestureChrome.computeChromeLayout` 实测底栏高度，确保网页 `position: fixed; bottom: 0` 与弹窗操作栏绝不被遮挡。
-- **7 合 1 过滤引擎与二进制缓存**：7 套内置规则与用户在线订阅（`sub-<id>.txt`）统一后台编译，利用化妆品 `Scope` 去重将 151,759 条规则的二进制缓存压缩至仅 **8.18 MB**（比 v0.2.0 的 3 列表缓存更小），指纹校验涵盖全部内置列表、在线订阅与自定义规则。
-- **油猴脚本与 Greasy Fork 拦截**：在主框架导航、重定向与下载回调中安全识别 `.user.js`（跳过代码托管 `/blob/` 网页视图、拦截 HTML 伪装页、安全编码重定向地址），一键安装并启用，同名更新原位保留 `userscript_values` 数据；保留对 `v0.1.9`–`v0.2.0` 全部本地用户数据的 100% 覆盖升级兼容。
+## 为什么是 Aiko？
+
+大多数手机浏览器不是堆满信息流与开屏广告，就是简陋得连油猴脚本和现代翻译都跑不起来。**Aiko Browser** 由 **Alzar** 打造，基于系统 WebView 与纯 Java 原生 Android 视图从零雕琢——不依赖臃肿框架、无任何商业遥测，在仅 **2.53 MB** 的体积内，将旗舰高刷性能、桌面级油猴生态、沉浸式 AI 翻译与高自由度定制融为一体。
+
+- **真·轻快高刷**：OnePlus 185Hz 真机实测冷启动 **159–166 ms**，943 帧连续高速滚动 **0 次丢 VSync**，Java 堆仅 **23.2 MB**。
+- **开箱即用，上限极高**：免费免 Key 的 **巴别塔（Babel）** 沉浸双语翻译、完整 **Tampermonkey** 级油猴引擎、**15 万+** 内置中英文广告规则，同时全部支持极客级自定义。
+- **单手友好，零遮挡美学**：全动态 Material / Material You 取色与 `#000000` 纯黑 OLED，实测高度停靠底栏绝不遮挡网页固定按钮，单手滑切标签一气呵成。
+- **数据完全属于你**：独立无痕进程（`:private`）物理隔离，支持一键导出/恢复单个 `.aiko` 全量备份包，换机重装秒级满血复活。
+
+---
+
+## 核心特性
+
+### 1. 巴别塔（Babel）沉浸式双语翻译
+打破语言隔阂，兼顾“免折腾直用”与“自接大模型上限”：
+- **三层引擎 + 无感降级**：默认 **Google 免费免 Key 直连**，内置国内免翻墙的 **微软必应（Edge 同款神经翻译）** 与 **有道备用**；选 Google 时若遇网络不通，自动无缝降级至微软必应，绝不卡白框。
+- **自定义 AI API 全参数调优**：支持 **OpenAI 兼容格式**（New API / OneAPI / DeepSeek / OpenRouter 等）与 **Gemini 原生格式**，支持多套配置档位、**根据端点和 Key 一键拉取模型列表**（亦可自由输入模型标识）与连通测试；完整开放 **最大并发数（1–16）**、**单次最大 Token（128–32768）**、**温度（0.0–1.5）**、单批字数/条数、超时秒数及 5 套内置/自定义 Prompt 模板。
+- **省 Token 与封神交互**：视口 + 1.5 屏懒加载与 4,096 条会话级哈希缓存，自动跳过代码块与公式；提供 5 种双语排版样式（柔色双语 / 主题竖线 / 虚线 / 模糊点击揭晓 / 纯译文替换）、**划词即译 + 朗读**，以及外网回帖/聊天神器 **输入框三连空格原地反译**。
+
+### 2. 油猴完全体 & 离线移动版 DevTools
+把手机浏览器的可玩性拉齐桌面端：
+- **Greasy Fork 真·一键安装**：自动跳过 Greasy Fork / Sleazy Fork 的“请先安装扩展”拦截弹窗，首次点击「安装此脚本」即呼出主题化安装卡片；支持同名脚本**原位覆盖更新并 100% 保留 `GM_setValue` 数据**，同时支持本地 `.user.js` 文件关联打开、粘贴与网址导入。
+- **Tampermonkey 级完整运行时**：支持隔离世界（`JavaScriptExecutionWorld`）与三层降级兼容，完整提供 `GM_xmlhttpRequest`（带 `@connect` 授权弹窗与跨源重定向安全清洗）、`@require` / `@resource` 安装时本地磁盘缓存、`GM_addValueChangeListener` 跨标签实时同步、`GM_registerMenuCommand` 面板内直接点击触发、以及全脚本一键检查更新。
+- **100% 离线 WebDevTools**：内置零外链悬浮 `DEV` 调试台，随时在手机上查看 **Console（含 JS REPL）**、**Network（fetch/XHR）**、**Storage（Cookie/LocalStorage 读写）** 与 **Elements DOM 检查器**。
+
+### 3. 185Hz 旗舰性能引擎 & 128 路高速下载
+面向旗舰高刷硬件的真实系统级调度，绝非心理安慰开关：
+- **狂暴 / 均衡 / 省电 + 无限自定义性能模式**：真实联动刷新率锁定（最高 185Hz / 自适应 / 60Hz）、Android 12+ 突发式 **ADPF 大核助推**（待机零耗电）、Android 15+ ARR 触控提频、热标签保活上限（狂暴 12 / 均衡 6 / 省电 3）、BFCache 页数、预加载/预握手（Speculative Preconnect）、单前台预光栅化与零后台开销实时帧率浮标（HUD）。
+- **128 线程可视化分片下载**：单文件最高 128 路并发分段（受性能模式调控），新增**实时速率曲线 Sparkline**、分片并行地图、已校验断点续传与浏览优先让路机制，并支持与网页媒体嗅探无缝联动。
+
+### 4. 7 合 1 中国 + 全球广告过滤与站点盾牌 X-Ray
+- **开箱 152,033 条有效规则**：内置 7 套实时活跃开源规则（AdGuard 中文、CJX 弹窗引流净化、AdGuard 移动广告、打开 App 横幅净化、EasyList、EasyPrivacy、AdGuard Cookie 隐私弹窗），二进制编译缓存仅 **8.34 MB**，热载仅 **22 ms**。
+- **小白友好 + 极客兼容**：支持 8 套推荐订阅（`anti-AD`、`AdRules`、`HaGeZi` 等）一键订阅、自定义 ABP 订阅链接、一键屏蔽/放行域名、可视化 **点选屏蔽（Element Picker）与盾牌内一键撤销**、以及防反广告弹窗 Scriptlets。
+- **站点盾牌 X-Ray**：按精确主机名实时查看首帧/完成耗时与拦截明细，独立配置广告过滤、185Hz 抗卡盾、强制高刷、JS、暗黑模式、桌面标识、解除禁止复制、强制双指缩放、定时自动刷新（15s–5m）、自定义站点 CSS 及单站点 Cookie/存储一键重置。
+
+### 5. 极致自由定制、媒体套件与效率神器
+- **自定义首页 & 新标签页（秒开预热）**：独立或同步指定首页与新标签页网址（内置 Aiko 原生、**iTab**、WeTab、MTab、空白页预设或任意网址），支持后台预热 1 个隐形新标签，打开 iTab 零白屏闪现。
+- **Material / Material You 动态工坊 & AMOLED 护眼**：7 套旗舰暗夜预设（含 Android 12+ 壁纸取色与 `#000000` 纯黑 OLED）+ 自由色相/饱和度/浸染调色台，零重启即时生效；新增定时日夜切换、深夜极暗/暖色温护眼滤镜，以及导入手机本地 `.ttf / .otf` 字体。
+- **单手手势与超级交互**：底栏支持自定义主页/巴别塔键与**悬浮胶囊形态**、底栏左右滑动切标签、上滑展开网格/列表双视图标签页（含搜索与置顶）；长按链接支持后台静默打开与 **Arc 风格半屏交互式小窗预览（Peek）**。
+
+<details>
+<summary><strong>展开查看全部 20+ 进阶实用工具清单</strong></summary>
+
+| 分类 | 功能细节 |
+| :--- | :--- |
+| **媒体与看图** | 全屏视频原生手势（左亮度 / 右音量 / 横滑进度 / 长按临时 `2.0x` 倍速）、锁屏媒体通知后台听声、网页 `.mp4`/`.m3u8`/`.mp3` 音视频嗅探、185Hz 沉浸看图相册（双指缩放 + 批量保存）、真·全页网页长截图（带可选网址与二维码尾标） |
+| **效率与导航** | 20+ `!bang` 瞬搜（`!gh`、`!gf`、`!b`、`!ld` 等 + 自定义指令）、地址栏 `/命令`（`/babel`、`/devtools`、`/gallery`、`/qr` 等）、剪贴板智能感知胶囊、纯 Java 主题色二维码生成与相册扫码、Android 原生 TTS 网页朗读（`0.8x–2.0x`）、PWA 桌面独立全屏应用化 |
+| **防护与安全** | 防跳转 App 卫士（拦截强跳并按站点记忆）、一键解除网页禁止复制/右键/选中、链接分享自动去追踪参数净化、表单草稿防丢失保护、WebView 渲染进程 OOM 崩溃自动无损自愈、独立 `:private` 无痕进程、`.aiko` 全量一键加密结构备份与恢复 |
+
+</details>
+
+---
+
+## 实测性能与基准
+
+### 真机 185Hz 硬件实测
+测试机型：**OnePlus PMS110**（`SM8850` / Android 17 / 1272×2772 @ **185Hz** `modeId 6` / WebView Canary `160.0.8181.0`）
+
+| 实测指标 | 实机表现 | 说明 |
+| :--- | :---: | :--- |
+| **应用冷启动**（`am start -W`） | **`159–166 ms`** | 完整加载 7 套规则二进制缓存 |
+| **185Hz 高速连续滚动**（`dumpsys gfxinfo`） | **`943` 帧 · 丢 VSync `0`** | 抖动仅 4 帧（**`0.42%`**），VSync `5.405 ms` |
+| **滚动帧耗时分位**（CPU / GPU） | **p95 `5 ms` · p99 `6 ms`** | GPU 渲染 `p95 = 2 ms` / `p99 = 3 ms` |
+| **运行时内存占用**（`dumpsys meminfo`） | **`23.2 MB` Java Heap** | Native `25.8 MB` · Total PSS `193.6 MB` |
+| **广告过滤实战**（内置 7 套 + `anti-AD`） | **`172,031` 条有效规则** | Greasy Fork 广告 100% 清除，0 异常日志 |
+
+### 主机端微基准与回归（`v0.4.0` · JDK 21 / Node.js / 无头 Chromium）
+全套 **13/13** 自动化测试（含 `BabelEngineCheck`、`V040EnginesCheck`、`babel_dom_check.mjs`、`userscript_chromium_smoke.mjs` 及真实用户脚本端到端测试）全部通过：
+
+| 核心引擎基准 | 实测数据 | 对比基线（`v0.1.9`） |
+| :--- | :---: | :---: |
+| **7 套规则网络匹配**（151,979 条，p50） | **`0.400 µs / req`** | 提速 **30×+** |
+| **页面 CSS 隐藏规则查表**（p50） | **`0.200 µs`** | + 站点级 LRU 缓存 |
+| **7 套规则二进制缓存**（体积 / 热载） | **`8.34 MB` / `22.42 ms`** | 常驻堆降低 **~39%** |
+| **URL 合法性混合校验**（`HttpUrlUtil`） | **`43.4 ns`** | 提速 **71.9×** |
+| **油猴 10-iframe 突发守卫**（p50） | **`7.0 µs`** | 提速 **5.5×** |
+
+---
+
+## 快速安装与升级
+
+1. 前往 [Releases 页面](https://github.com/UndergroundAlzar/Aiko-Browser/releases/latest) 下载 **`Aiko-Browser-0.4.0.apk`**（`2.53 MB`）。
+2. 系统要求 **Android 10（API 29）及以上**，无需 Root，普通安装即可。
+3. **平滑覆盖升级**：所有官方发行版均沿用同一签名证书（`ae71c828...`），从 `v0.1.7`–`v0.3.1` 直接覆盖安装即可 **100% 保留** 主题、性能模式、书签、历史、过滤订阅、油猴脚本及脚本存储数据。
+
+```text
+APK SHA-256   d23cb60d3e7f694e27390a6597e6804bfca113a86f3e86020b74cdb8b6c765b8
+CERT SHA-256  ae71c82831309c76ebf55c407d91afbba16776e97389bd73c5e8400fe9397fe4
+```
+
+---
 
 ## 构建与验证
 
-Windows 构建需要 PowerShell 7、JDK 21、Android SDK Platform 36 和 Build Tools 36.0.0。设置 `JAVA_HOME` 和 `ANDROID_HOME` 后在仓库根目录运行：
+无 Gradle 依赖膨胀，在 Windows 上安装 PowerShell 7、JDK 21、Android SDK Platform 36 与 Build Tools 36.0.0，配置 `JAVA_HOME` 和 `ANDROID_HOME` 后直接编译：
 
 ```powershell
+# 一键编译、R8 优化、ZIP 路径规范化校验并签名
 pwsh -NoProfile -File ./build.ps1
+
+# 运行全部 13 项主机单测、微基准与无头 Chromium 烟雾测试
+pwsh -NoProfile -File ./testing/run_benchmarks.ps1 -IncludeChromiumSmoke
 ```
 
-脚本校验固定版本的 AndroidX 依赖摘要，启用 R8 优化与裁剪（保留反射边界与调试类名，自动为 API 29–30 外联 API 31+ 调用），并从源码生成本地签名 APK（v0.3.0 为 **2,447,119 字节** / 2.33 MiB，含全部 7 套 2026 过滤规则，可直接覆盖安装相同签名的 v0.1.0–v0.2.0）。发行包的签名指纹、校验方法、全套测试与基准命令见[构建指南](docs/BUILD.md)。
+完整的签名校验、DEX 体积说明与各项测试细节请见 **[构建与验证指南](docs/BUILD.md)**，功能详解请见 **[深度配置指南](docs/CUSTOMIZATION.md)**。
 
-v0.3.0 已通过电脑端全部 8 项回归测试（`FlagshipUnitChecks` 扩展至 11 组单测，覆盖 `PerfProfiles`、`UrlCleaner`、`UserScript.isUserScriptUrl`、`AikoTheme.Palette` 360° 对比度、`CustomFilterList`、`VideoBooster` 与 `GestureChrome` 8 状态机），同环境电脑端基准测试（JDK 21 / Node.js，对比 v0.1.9）结果如下：
+---
 
-- **过滤规则匹配（20 URL 批次均值）**：3 列表基线 `16.540 µs` → `0.551 µs/req`（**30.0×**）；v0.3.0 全 7 列表（151,759 条规则）**`0.422 µs/req`**（p50 `0.4 µs` / p95 `0.8 µs`）
-- **过滤引擎缓存与内存**：全 7 列表常驻堆仅 **`24.71 MB`**（相比 v0.1.9 的 3 列表 `40.67 MB` 仍 **-39.2%**），二进制缓存仅 **`8.18 MB`**（热载 `20.35 ms`；3 列表 `7.08 MB`，冷载 `35.24 ms` / 热载 `19.35 ms`）
-- **URL 校验与油猴快速守卫**：`HttpUrlUtil` 混合校验 `3,119.1 ns` → `43.4 ns`（**71.9×**）；油猴 10-iframe 突发注入 p50 `38.4 µs` → `6.9 µs`（**5.6×**）
+## 像素画廊
 
-以上数据为电脑端主机基准；「⋯ → 性能引擎 / 性能诊断」与实时帧率浮标可用于实机观测。Android 185Hz 实机硬件帧率与 ADPF 表现仍有待实体设备持续复测。
+<div align="center">
+<table>
+  <tr>
+    <td align="center" width="50%">
+      <a href="docs/art/window-seat.webp"><img src="docs/art/window-seat.webp" alt="窗边的位置" width="100%" /></a>
+      <br /><sub>窗边的位置 · 沉浸阅读与巴别塔</sub>
+    </td>
+    <td align="center" width="50%">
+      <a href="docs/art/signal-room.webp"><img src="docs/art/signal-room.webp" alt="信号室" width="100%" /></a>
+      <br /><sub>信号室 · 185Hz 调度与 128 路分片引擎</sub>
+    </td>
+  </tr>
+</table>
+</div>
 
-**作者**：Alzar · [GitHub 仓库](https://github.com/UndergroundAlzar/Aiko-Browser) · [规则列表许可](app/src/main/assets/filters/NOTICE.txt) · [AndroidX 许可](app/src/main/assets/notices/NOTICE.txt) · [配置指南](docs/CUSTOMIZATION.md) · [美术画廊](docs/art/README.md)
+---
+
+<div align="center">
+
+**作者**：**Alzar** · [GitHub 仓库](https://github.com/UndergroundAlzar/Aiko-Browser) · [规则列表许可](app/src/main/assets/filters/NOTICE.txt) · [AndroidX 许可](app/src/main/assets/notices/NOTICE.txt) · [美术画廊](docs/art/README.md)
+
+<sub>Built with pure Java, zero bloat, and obsessive care for 185Hz smoothness.</sub>
+
+</div>
