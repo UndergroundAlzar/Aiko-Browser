@@ -6,7 +6,7 @@ param(
     [string] $BuildTools,
     [string] $SigningKey = (Join-Path $PSScriptRoot 'build/local-preview.p12'),
     [string] $SigningAlias = 'aiko-preview',
-    [string] $OutputFile = (Join-Path $PSScriptRoot 'build/Aiko-Browser-0.4.0.apk')
+    [string] $OutputFile = (Join-Path $PSScriptRoot 'build/Aiko-Browser-0.5.0.apk')
 )
 $ErrorActionPreference = 'Stop'
 if (-not $AndroidJar -and $SdkRoot) { $AndroidJar = Join-Path $SdkRoot 'platforms/android-36/android.jar' }

@@ -154,6 +154,7 @@ public final class MainActivity extends Activity {
     private final Runnable autoRefreshTask = this::runAutoRefreshTick;
     private final Runnable preloadNewTabTask = this::ensurePreloadedNewTab;
     private final Runnable hideClipboardCapsuleTask = this::hideClipboardCapsule;
+    private final Runnable hideScrollTopTask = this::hideScrollTopPill;
 
     private float density;
     private boolean isLowRam;
@@ -171,18 +172,23 @@ public final class MainActivity extends Activity {
     private UserScripts userScripts;
     private ScriptTools scriptTools;
     private StartPageConfig startPageConfig;
+    private MenuConfig menuConfig;
     private BangCatalog bangCatalog;
     private BabelConfig babelConfig;
     private BabelEngine babelEngine;
     private BabelUi babelUi;
     private AikoV040Ui.ReadAloudController readAloud;
     private AikoV040Ui.Host v040Host;
+    private SettingsCenterUi.Host settingsHost;
     private String desktopAgent;
     private boolean fetchingRemoteScript;
     private long lastAdpfBoostMs;
+    private long lastBackPressMs;
 
     // Chrome view hierarchy
     private FrameLayout root, viewport, page;
+    private FrameLayout scrollTopPill;
+    private BrowserIcon scrollTopIcon;
     private View omniboxScrim;
     private View nightComfortOverlay;
     private BottomDeckLayout bottomDeck;
@@ -365,6 +371,7 @@ public final class MainActivity extends Activity {
         userScripts = new UserScripts(this);
         scriptTools = new ScriptTools(this, userScripts);
         startPageConfig = new StartPageConfig(this);
+        menuConfig = new MenuConfig(this);
         bangCatalog = new BangCatalog(this);
         babelConfig = new BabelConfig(this);
         babelEngine = new BabelEngine(babelConfig);
@@ -378,6 +385,7 @@ public final class MainActivity extends Activity {
         });
         babelUi.setDisplayModeEngine(displayMode);
         v040Host = buildV040Host();
+        settingsHost = buildSettingsHost();
         wireUserScriptsHostActions();
         MediaPlaybackService.setPlaybackListener(mediaPlaybackListener);
 
@@ -423,6 +431,11 @@ public final class MainActivity extends Activity {
     private void onWebViewEngineReady() {
         if (isDestroyed() || isFinishing()) return;
         engineReady = true;
+        // Flagship v0.5.0 engine stack: Service Worker adblock + Speculative Loading + 512MB UFS cache + HTTP/3 QUIC 0-RTT
+        WebViewPerf.installServiceWorkerFilter(filter());
+        WebViewPerf.applyFlagshipProfileTuning(activeProfile, isLowRam);
+        WebViewPerf.warmUpQuicHints(collectQuicHosts());
+
         if (current != null && current.url != null && current.view == null) {
             ensureWebViewAndLoad(current);
         }
@@ -435,6 +448,26 @@ public final class MainActivity extends Activity {
             }
         }
         scheduleNewTabPreload(400L);
+    }
+
+    private Set<String> collectQuicHosts() {
+        Set<String> hosts = new HashSet<>();
+        String searchOrigin = SearchEngines.searchOrigin(SearchEngines.currentId(this), SearchEngines.customTemplate(this));
+        String sh = HttpUrlUtil.extractHost(searchOrigin);
+        if (!sh.isEmpty()) hosts.add(sh);
+        if (startPageConfig != null) {
+            String hh = HttpUrlUtil.extractHost(startPageConfig.resolveHomeUrl());
+            if (!hh.isEmpty()) hosts.add(hh);
+            String nh = HttpUrlUtil.extractHost(startPageConfig.resolveNewTabUrl());
+            if (!nh.isEmpty()) hosts.add(nh);
+        }
+        if (library != null) {
+            for (BrowserLibrary.Entry pin : library.pins()) {
+                String ph = HttpUrlUtil.extractHost(pin.url);
+                if (!ph.isEmpty()) hosts.add(ph);
+            }
+        }
+        return hosts;
     }
 
     private AikoV040Ui.Host buildV040Host() {
@@ -475,6 +508,77 @@ public final class MainActivity extends Activity {
             @Override public void startBackupImport() { MainActivity.this.startBackupImport(); }
             @Override public void reloadCurrentTab() { reloadPreservingScroll(); }
             @Override public boolean effectiveDarkWeb(String host) { return MainActivity.this.effectiveDarkWeb(host); }
+        };
+    }
+
+    private SettingsCenterUi.Host buildSettingsHost() {
+        return new SettingsCenterUi.Host() {
+            @Override public Activity activity() { return MainActivity.this; }
+            @Override public float density() { return density; }
+            @Override public DisplayModeEngine displayMode() { return displayMode; }
+            @Override public MenuConfig menuConfig() { return menuConfig; }
+            @Override public StartPageConfig startPageConfig() { return startPageConfig; }
+            @Override public PerfProfiles.Profile activePerfProfile() { return activeProfile; }
+            @Override public String appVersionName() { return MainActivity.this.appVersionName(); }
+            @Override public String babelSummary() { return babelConfig.activeEngineDisplayName(); }
+            @Override public String searchEngineName() { return SearchEngines.engineName(SearchEngines.currentId(MainActivity.this)); }
+            @Override public String themeSummary() { return AikoTheme.modeShortLabel(AikoTheme.loadMode(MainActivity.this)); }
+            @Override public String filterSummary() {
+                SiteFilter f = filter();
+                int count = f.totalRuleCount();
+                return count > 0 ? String.format(Locale.ROOT, "%,d 条有效规则", count) : "7 合 1 规则引擎";
+            }
+            @Override public boolean isGlobalDarkWeb() { return siteExtras != null && siteExtras.isGlobalDarkWeb(); }
+            @Override public boolean isCleanLinks() { return PerfProfiles.isCleanLinksEnabled(MainActivity.this); }
+            @Override public boolean isPageOpen() {
+                return current != null && current.view != null && HttpUrlUtil.isHttp(current.url);
+            }
+            @Override public void toast(String msg) { MainActivity.this.toast(msg); }
+
+            @Override public void openThemeStudio() { showThemeStudio(); }
+            @Override public void openPerformanceCenter() { showPerformanceCenter(); }
+            @Override public void openPerformanceDiagnostics() { showPerformance(); }
+            @Override public void openCustomizationSheet() { AikoV040Ui.showCustomizationSheet(v040Host); }
+            @Override public void openGestureSettings() { showGestureSettings(); }
+            @Override public void openBabelSheet() {
+                Tab tab = current;
+                boolean ok = tab != null && tab.view != null && HttpUrlUtil.isHttp(tab.url);
+                babelUi.showSheet(ok ? tab.view : null, ok ? tab.url : null);
+            }
+            @Override public void openFilterRules() { showFilterRules(); }
+            @Override public void openSearchEnginePicker() { showSearchEnginePicker(); }
+            @Override public void openUserScripts() { showUserScriptsSheet(); }
+            @Override public void openBangManager() { AikoV040Ui.showBangManagerSheet(v040Host); }
+            @Override public void openBackupSheet() { AikoV040Ui.showBackupSheet(v040Host); }
+            @Override public void openAboutSheet() { showAboutSheet(); }
+            @Override public void toggleGlobalDarkWeb() {
+                boolean next = !siteExtras.isGlobalDarkWeb();
+                siteExtras.setGlobalDarkWeb(next);
+                refreshAllTabsDarkMode();
+                toast(next ? "已开启全局网页深色模式" : "已关闭全局网页深色模式");
+            }
+            @Override public void toggleCleanLinks() {
+                boolean next = !PerfProfiles.isCleanLinksEnabled(MainActivity.this);
+                PerfProfiles.setCleanLinksEnabled(MainActivity.this, next);
+                toast(next ? "已开启分享/复制链接自动净化" : "已关闭链接自动净化");
+            }
+            @Override public void clearWebHttpCache(Runnable onDone) {
+                for (Tab t : tabs) {
+                    if (t.view != null) {
+                        try { t.view.clearCache(true); } catch (RuntimeException ignored) { }
+                        break;
+                    }
+                }
+                if (onDone != null) onDone.run();
+            }
+            @Override public void clearAllHistory() {
+                library.clearHistory();
+                toast("已清空全部浏览历史");
+            }
+            @Override public void executeMenuAction(MenuConfig.ActionId action) { MainActivity.this.executeMenuAction(action); }
+            @Override public String actionDynamicSubtitle(MenuConfig.ActionId action) { return MainActivity.this.actionDynamicSubtitle(action); }
+            @Override public boolean actionIsActive(MenuConfig.ActionId action) { return MainActivity.this.actionIsActive(action); }
+            @Override public int actionAccentColor(MenuConfig.ActionId action) { return MainActivity.this.actionAccentColor(action); }
         };
     }
 
@@ -589,6 +693,12 @@ public final class MainActivity extends Activity {
         if (hudPill != null) {
             hudPill.setBackground(AikoTheme.card((AikoTheme.BG & 0x00FFFFFF) | 0xCC000000, AikoTheme.STROKE, density, dp(12)));
         }
+        if (scrollTopPill != null) {
+            scrollTopPill.setBackground(AikoTheme.card(
+                    (AikoTheme.SURFACE & 0x00FFFFFF) | 0xE8000000, AikoTheme.STROKE_ACCENT, density, dp(21)));
+            scrollTopPill.setForeground(AikoTheme.ripple(AikoTheme.RIPPLE_ACCENT, dp(21)));
+        }
+        if (scrollTopIcon != null) scrollTopIcon.tint(AikoTheme.ACCENT);
         if (homeView != null) {
             homeView.setBackgroundColor(AikoTheme.BG);
             if (homeEmblemFrame != null) {
@@ -632,6 +742,7 @@ public final class MainActivity extends Activity {
         maxHotTabs = isLowRam ? Math.min(capFromProfile, 3) : capFromProfile;
         if (displayMode != null) displayMode.applyProfile(activeProfile);
         DownloadService.setMaxLanesLimit(activeProfile.downloadLanes);
+        WebViewPerf.applyFlagshipProfileTuning(activeProfile, isLowRam);
         for (Tab t : tabs) {
             if (t.view != null) {
                 boolean activeTab = (t == current && !onHome && visible);
@@ -1089,6 +1200,33 @@ public final class MainActivity extends Activity {
         pwaLp.bottomMargin = dp(18);
         root.addView(pwaTogglePill, pwaLp);
 
+        // 185Hz Quick Scroll-to-Top floating pill (appears only on upward scroll deep in long pages)
+        scrollTopPill = new FrameLayout(this);
+        scrollTopPill.setBackground(AikoTheme.card(
+                (AikoTheme.SURFACE & 0x00FFFFFF) | 0xE8000000, AikoTheme.STROKE_ACCENT, density, dp(21)));
+        scrollTopPill.setForeground(AikoTheme.ripple(AikoTheme.RIPPLE_ACCENT, dp(21)));
+        scrollTopPill.setElevation(dp(10));
+        scrollTopPill.setContentDescription("返回顶部");
+        scrollTopPill.setVisibility(View.GONE);
+        scrollTopIcon = new BrowserIcon(this, BrowserIcon.Kind.UP);
+        scrollTopIcon.tint(AikoTheme.ACCENT);
+        scrollTopPill.addView(scrollTopIcon, new FrameLayout.LayoutParams(dp(20), dp(20), Gravity.CENTER));
+        scrollTopPill.setOnClickListener(v -> {
+            hideScrollTopPill();
+            if (current != null && current.view != null) {
+                if (current.view.getScrollY() > dp(2400)) {
+                    current.view.scrollTo(0, dp(900));
+                }
+                current.view.evaluateJavascript(
+                        "(function(){try{if(window.scrollY>2400)window.scrollTo(0,900);window.scrollTo({top:0,behavior:'smooth'});}catch(e){window.scrollTo(0,0);}})()",
+                        null);
+            }
+        });
+        FrameLayout.LayoutParams topLp = new FrameLayout.LayoutParams(dp(42), dp(42), Gravity.BOTTOM | Gravity.END);
+        topLp.rightMargin = dp(14);
+        topLp.bottomMargin = dp(82);
+        root.addView(scrollTopPill, topLp);
+
         // Full-screen non-touch-intercepting AMOLED Night Comfort dimmer/warmth overlay
         nightComfortOverlay = new View(this) {
             @Override public boolean dispatchTouchEvent(MotionEvent event) { return false; }
@@ -1220,6 +1358,20 @@ public final class MainActivity extends Activity {
             if (plp != null && plp.bottomMargin != pwaBottom) {
                 plp.bottomMargin = pwaBottom;
                 pwaTogglePill.setLayoutParams(plp);
+            }
+        }
+        if (scrollTopPill != null) {
+            if (isFullscreen || onHome || editingOmni || findOpen || (imeBottom > insetBottom) || legacyImeOpen) {
+                hideScrollTopPill();
+            } else {
+                FrameLayout.LayoutParams tlp = (FrameLayout.LayoutParams) scrollTopPill.getLayoutParams();
+                int topRight = insetRight + dp(14);
+                int topBottom = vpBottom + dp(16);
+                if (tlp != null && (tlp.rightMargin != topRight || tlp.bottomMargin != topBottom)) {
+                    tlp.rightMargin = topRight;
+                    tlp.bottomMargin = topBottom;
+                    scrollTopPill.setLayoutParams(tlp);
+                }
             }
         }
 
@@ -1494,6 +1646,36 @@ public final class MainActivity extends Activity {
         }
     }
 
+    private void showScrollTopPill() {
+        if (scrollTopPill == null || isDestroyed() || onHome || fullscreen != null) return;
+        handler.removeCallbacks(hideScrollTopTask);
+        if (scrollTopPill.getVisibility() != View.VISIBLE) {
+            scrollTopPill.animate().cancel();
+            scrollTopPill.setAlpha(0f);
+            scrollTopPill.setScaleX(0.86f);
+            scrollTopPill.setScaleY(0.86f);
+            scrollTopPill.setVisibility(View.VISIBLE);
+            scrollTopPill.animate()
+                    .alpha(1f).scaleX(1f).scaleY(1f)
+                    .setDuration(140)
+                    .start();
+        }
+        handler.postDelayed(hideScrollTopTask, 2200L);
+    }
+
+    private void hideScrollTopPill() {
+        handler.removeCallbacks(hideScrollTopTask);
+        if (scrollTopPill == null || scrollTopPill.getVisibility() != View.VISIBLE) return;
+        scrollTopPill.animate().cancel();
+        scrollTopPill.animate()
+                .alpha(0f).scaleX(0.86f).scaleY(0.86f)
+                .setDuration(110)
+                .withEndAction(() -> {
+                    if (scrollTopPill != null) scrollTopPill.setVisibility(View.GONE);
+                })
+                .start();
+    }
+
     private void applyAutoNightSchedule() {
         if (startPageConfig == null || !startPageConfig.isAutoThemeByTime()) return;
         int hour = Calendar.getInstance().get(Calendar.HOUR_OF_DAY);
@@ -1555,6 +1737,7 @@ public final class MainActivity extends Activity {
 
     private void showTab(Tab tab, boolean keepKeyboard) {
         clearCrashOverlay();
+        hideScrollTopPill();
         if (elementPicker != null && elementPicker.isActive()) elementPicker.stop();
         if (current != tab) closeFind();
         hideOmniboxOverlay();
@@ -2541,10 +2724,11 @@ public final class MainActivity extends Activity {
             }
 
             @Override public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
-                Uri reqUri = request == null ? null : request.getUrl();
-                String reqStr = reqUri == null ? null : reqUri.toString();
-                if (reqStr != null && reqStr.startsWith(CUSTOM_FONT_URL_PREFIX)) {
-                    return interceptCustomFontRequest(reqStr);
+                if (request != null && startPageConfig != null && !startPageConfig.getCustomFontFile().isEmpty()) {
+                    Uri reqUri = request.getUrl();
+                    if (reqUri != null && "aiko-font.local".equals(reqUri.getHost())) {
+                        return interceptCustomFontRequest(reqUri.toString());
+                    }
                 }
                 Tab tab = web.owner;
                 return tab != null && filter.blocks(tab.filterPage, request) ? SiteFilter.blocked() : null;
@@ -2605,24 +2789,27 @@ public final class MainActivity extends Activity {
                 restoreScroll(tab, view, url);
                 filter.applyCss(view, tab.cachedHost, url);
                 if (HttpUrlUtil.isHttp(url)) {
+                    // Coalesce secondary helper scripts into a single idle-deferred batch so FCP/LCP & first scroll stay unblocked
+                    StringBuilder idleBatch = new StringBuilder(4096);
+                    idleBatch.append("(function(){var __run=function(){try{");
                     if (isEffectiveUltraScroll(tab.cachedHost)) {
-                        view.evaluateJavascript(SiteExtras.ultraScrollJs(true), null);
+                        idleBatch.append(SiteExtras.ultraScrollJs(true)).append(';');
                     }
+                    idleBatch.append(VideoBooster.fullscreenGestureScript()).append(';');
+                    idleBatch.append(PageToolkit.sniffMediaScript()).append(';');
+                    boolean trackDraft = startPageConfig != null && startPageConfig.isFormDraftProtection();
+                    if (trackDraft) {
+                        idleBatch.append(PageToolkit.formDraftHookScript()).append(';');
+                        String draft = tab.pendingDraftJson != null ? tab.pendingDraftJson : savedFormDrafts.get(url);
+                        tab.pendingDraftJson = null;
+                        if (draft != null && !draft.isEmpty()) {
+                            idleBatch.append("window.__aikoRestoreDraft&&window.__aikoRestoreDraft(")
+                                    .append(JSONObject.quote(draft)).append(");");
+                        }
+                    }
+                    idleBatch.append("}catch(_){}};if(window.requestIdleCallback){requestIdleCallback(__run,{timeout:300});}else{setTimeout(__run,90);}})();");
                     applyPageToolkitStyles(tab, view);
-                    view.evaluateJavascript(VideoBooster.fullscreenGestureScript(), null);
-                    view.evaluateJavascript(PageToolkit.sniffMediaScript(), null);
-                    if (startPageConfig != null && startPageConfig.isFormDraftProtection()) {
-                        view.evaluateJavascript(PageToolkit.formDraftHookScript(), r -> {
-                            if (isDestroyed() || tab.view != view) return;
-                            String draft = tab.pendingDraftJson != null ? tab.pendingDraftJson : savedFormDrafts.get(url);
-                            tab.pendingDraftJson = null;
-                            if (draft != null && !draft.isEmpty()) {
-                                view.evaluateJavascript(
-                                        "window.__aikoRestoreDraft && window.__aikoRestoreDraft("
-                                                + JSONObject.quote(draft) + ");", null);
-                            }
-                        });
-                    }
+                    view.evaluateJavascript(idleBatch.toString(), null);
                     if (babelUi != null) babelUi.onPageFinished(view, url);
                 }
                 userScripts.pageFinished(view, url);
@@ -3423,6 +3610,12 @@ public final class MainActivity extends Activity {
                     && imeBottom <= insetBottom && !legacyImeOpen
                     && !isAnyOmniboxFocused()) {
                 gestures.onPageScroll(t, oldt, maxScrollY());
+                int vh = getHeight();
+                if (vh > 0 && t > vh * 2 && oldt - t > dp(10)) {
+                    showScrollTopPill();
+                } else if (t < vh || t - oldt > dp(24)) {
+                    hideScrollTopPill();
+                }
             }
         }
     }
@@ -4481,7 +4674,7 @@ public final class MainActivity extends Activity {
         parent.addView(hsv, new LinearLayout.LayoutParams(-1, -2));
     }
 
-    // ==================== TOOLS SHEET ====================
+    // ==================== CLEAN 2-TIER CUSTOMIZABLE MENU ====================
 
     private void showTools() {
         Tab tab = current;
@@ -4490,218 +4683,238 @@ public final class MainActivity extends Activity {
 
         Dialog dialog = new Dialog(this);
         dialog.requestWindowFeature(Window.FEATURE_NO_TITLE);
-        LinearLayout panel = AikoTheme.sheetContainer(this, density, "浏览工具", dialog::dismiss);
+        LinearLayout panel = AikoTheme.sheetContainer(this, density, "快捷菜单", dialog::dismiss);
 
-        ScrollView scroll = new ScrollView(this);
-        scroll.setVerticalScrollBarEnabled(false);
-        int maxH = Math.min(500, Math.max(240, getResources().getConfiguration().screenHeightDp - 132));
-        panel.addView(scroll, new LinearLayout.LayoutParams(-1, dp(maxH)));
+        int maxH = Math.min(540, Math.max(240, getResources().getConfiguration().screenHeightDp - 132));
+        ScrollView scroll = AikoTheme.maxHeightScrollView(this, dp(maxH));
+        panel.addView(scroll, new LinearLayout.LayoutParams(-1, -2));
 
         LinearLayout body = stack();
         scroll.addView(body, new ScrollView.LayoutParams(-1, -2));
 
-        // 1. Quick Row
+        // 1. Fixed Essential Dock: New Tab | Private | Downloads | Settings Center (2nd-tier hub)
         LinearLayout quick = sheetRow(body);
         sheetAction(dialog, quick, ADD, "新建标签", true, () -> openNewTabDefault(false));
         sheetAction(dialog, quick, PRIVATE, "无痕", true, () -> startActivity(new Intent(this, PrivateActivity.class)));
         sheetAction(dialog, quick, DOWNLOAD, "下载", true, this::showDownloads);
-        sheetAction(dialog, quick, CODE, "油猴脚本", true, this::showUserScriptsSheet);
+        sheetAction(dialog, quick, SETTINGS, "设置中心", true, () -> SettingsCenterUi.showSettingsCenter(settingsHost));
 
-        // 1b. Flagship v0.4.0 Spotlight: Babel Immersive Translation + Homepage & Pro Customization
-        body.addView(AikoTheme.sectionHeader(this, density, "巴别塔与旗舰定制"));
-        boolean babelOn = pageOpen && babelUi != null && babelUi.isTranslating(tab.view);
-        String babelSub = babelOn ? "翻译中 · " + babelConfig.activeEngineDisplayName()
-                : babelConfig.activeEngineDisplayName();
-        String customHomeSub = startPageConfig.resolveHomeUrl() == null ? "原生极速 · 护眼/字体/防跳" : "自定义主页 · 高级定制";
-        addTwoColRow(body,
-                AikoTheme.toggleTile(this, density, TRANSLATE, "巴别塔翻译", babelSub,
-                        babelOn, true, AikoTheme.ACCENT, () -> {
-                            dialog.dismiss();
-                            babelUi.showSheet(pageOpen ? tab.view : null, pageOpen ? url : null);
-                        }),
-                AikoTheme.toggleTile(this, density, SUN_MOON, "主页与定制", customHomeSub,
-                        startPageConfig.isNightFilterEnabled() || startPageConfig.resolveHomeUrl() != null,
-                        true, AikoTheme.ACCENT_CYAN, () -> {
-                            dialog.dismiss();
-                            AikoV040Ui.showCustomizationSheet(v040Host);
-                        }));
+        // 2. User-Customizable 1st-Tier Quick Tools (clean 6 defaults + live Edit pill)
+        LinearLayout customHead = new LinearLayout(this);
+        customHead.setOrientation(LinearLayout.HORIZONTAL);
+        customHead.setGravity(Gravity.CENTER_VERTICAL);
+        LinearLayout.LayoutParams chlp = new LinearLayout.LayoutParams(-1, -2);
+        chlp.topMargin = dp(8);
+        chlp.bottomMargin = dp(8);
+        body.addView(customHead, chlp);
 
-        // 2. Current Page (2-column sleek grid)
-        body.addView(AikoTheme.sectionHeader(this, density, "当前页面"));
-        boolean bookmarked = pageOpen && library.isBookmarked(url);
-        boolean pinnedHome = pageOpen && library.isPinned(url);
-        boolean onShelf = pageOpen && readingShelf.has(url);
-        boolean muted = pageOpen && tab.muted;
-        boolean cleanLinks = PerfProfiles.isCleanLinksEnabled(this);
+        TextView headTitle = label("一级常用工具", 12, AikoTheme.TEXT_MUTED);
+        headTitle.setTypeface(AikoTheme.MEDIUM);
+        customHead.addView(headTitle, new LinearLayout.LayoutParams(0, -2, 1f));
 
-        addTwoColRow(body,
-                AikoTheme.toggleTile(this, density, READER, "阅读模式", "沉浸去干扰",
-                        false, pageOpen, AikoTheme.ACCENT_CYAN, () -> {
-                            dialog.dismiss();
-                            if (tab != null && tab.view != null) {
-                                ReaderMode.toggle(this, tab.view, state -> {
-                                    if ("empty".equals(state)) toast("当前页面暂不适合阅读模式");
-                                    else if ("unavailable".equals(state)) toast("无法启动阅读模式");
-                                });
-                            }
-                        }),
-                AikoTheme.toggleTile(this, density, SPEAKER, "网页朗读", "TTS 语音听书 0.8–2x",
-                        false, pageOpen, AikoTheme.EMERALD, () -> {
-                            dialog.dismiss();
-                            if (tab != null && tab.view != null && readAloud != null) {
-                                readAloud.showReadAloudSheet(this, tab.view, displayMode, density);
-                            }
-                        }));
+        TextView editPill = AikoTheme.badge(this, density, "编辑顺序", AikoTheme.ACCENT, AikoTheme.HIGHLIGHT, AikoTheme.STROKE_ACCENT);
+        editPill.setOnClickListener(v -> {
+            dialog.dismiss();
+            SettingsCenterUi.showMenuCustomizer(settingsHost, this::showTools);
+        });
+        customHead.addView(editPill, new LinearLayout.LayoutParams(-2, dp(26)));
 
-        addTwoColRow(body,
-                AikoTheme.toggleTile(this, density, GALLERY, "沉浸看图", "高清原图画廊/批量保存",
-                        false, pageOpen, AikoTheme.ACCENT, () -> {
-                            dialog.dismiss();
-                            openGalleryForCurrent();
-                        }),
-                AikoTheme.toggleTile(this, density, IMAGE, "网页长截图", "全页拼接含分享码",
-                        false, pageOpen, AikoTheme.ACCENT_CYAN, () -> {
-                            dialog.dismiss();
-                            captureLongShotForCurrent();
-                        }));
+        List<MenuConfig.ActionId> primary = menuConfig.getPrimaryActions();
+        for (int i = 0; i < primary.size(); i += 2) {
+            MenuConfig.ActionId left = primary.get(i);
+            MenuConfig.ActionId right = (i + 1 < primary.size()) ? primary.get(i + 1) : null;
+            View lv = SettingsCenterUi.buildMenuTile(dialog, settingsHost, left, pageOpen);
+            View rv = right != null ? SettingsCenterUi.buildMenuTile(dialog, settingsHost, right, pageOpen) : new View(this);
+            addTwoColRow(body, lv, rv);
+        }
 
-        addTwoColRow(body,
-                AikoTheme.toggleTile(this, density, VIDEO, "视频倍速/后台",
-                        bgAudioEnabled && tab == bgAudioTab ? "后台音频播放中" : (pageOpen ? "倍速 / 后台锁屏 / PiP" : "仅网页可用"),
-                        bgAudioEnabled && tab == bgAudioTab, pageOpen, AikoTheme.ACCENT_CYAN, () -> {
-                            dialog.dismiss();
-                            if (tab != null && tab.view != null && pageOpen) showVideoBoosterSheet(tab);
-                        }),
-                AikoTheme.toggleTile(this, density, SNIFF, "媒体嗅探",
-                        cachedSniffedCount > 0 ? ("发现 " + cachedSniffedCount + " 条流媒体") : "嗅探 MP4 / M3U8 / 音频",
-                        cachedSniffedCount > 0, pageOpen, AikoTheme.EMERALD, () -> {
-                            dialog.dismiss();
-                            openMediaSnifferForCurrent();
-                        }));
-
-        addTwoColRow(body,
-                AikoTheme.toggleTile(this, density, DEVTOOLS, "网页调试台", "离线 Console / Network",
-                        false, pageOpen, AikoTheme.AMBER, () -> {
-                            dialog.dismiss();
-                            if (tab != null && tab.view != null) {
-                                WebDevTools.toggle(tab.view);
-                                toast("已切换网页开发者调试台");
-                            }
-                        }),
-                AikoTheme.toggleTile(this, density, PWA, "添加到桌面", "独立全屏 PWA 应用",
-                        false, pageOpen, AikoTheme.ACCENT, () -> {
-                            dialog.dismiss();
-                            pinCurrentPagePwa();
-                        }));
-
-        addTwoColRow(body,
-                AikoTheme.toggleTile(this, density, PIN, onShelf ? "已在稍后读" : "稍后读 · 0MB",
-                        onShelf ? "点按移除" : "保存位置/离线",
-                        onShelf, pageOpen, AikoTheme.EMERALD, () -> {
-                            dialog.dismiss();
-                            if (tab != null && pageOpen) handleReadingShelfAction(tab, onShelf);
-                        }),
-                AikoTheme.toggleTile(this, density, STAR, bookmarked ? "取消收藏" : "收藏书签",
-                        pinnedHome ? "已固定首页" : "点按收藏",
-                        bookmarked, pageOpen, AikoTheme.ACCENT, () -> {
-                            dialog.dismiss();
-                            if (tab != null && pageOpen) toggleBookmark(tab, url);
-                        }));
-
-        addTwoColRow(body,
-                AikoTheme.toggleTile(this, density, muted ? MUTE : UNMUTE, muted ? "取消静音" : "标签静音",
-                        muted ? "当前静音" : "声音开启",
-                        muted, pageOpen, AikoTheme.AMBER, () -> {
-                            dialog.dismiss();
-                            if (tab != null && tab.view != null) {
-                                boolean next = !tab.muted;
-                                tab.muted = next;
-                                WebViewPerf.setAudioMuted(tab.view, next);
-                                toast(next ? "当前标签已静音" : "已恢复标签声音");
-                            }
-                        }),
-                AikoTheme.toggleTile(this, density, CHECK, "链接净化", cleanLinks ? "分享/复制去追踪" : "已关闭",
-                        cleanLinks, true, AikoTheme.EMERALD, () -> {
-                            boolean next = !cleanLinks;
-                            PerfProfiles.setCleanLinksEnabled(this, next);
-                            dialog.dismiss();
-                            toast(next ? "已开启分享/复制链接自动净化" : "已关闭链接自动净化");
-                        }));
-
+        // 3. Compact Page Utility & More Tools Bar
         LinearLayout pageRow = sheetRow(body);
         sheetAction(dialog, pageRow, FIND, "页内查找", pageOpen, () -> { if (tab != null && tab.view != null) openFind(tab.view); });
         sheetAction(dialog, pageRow, QR, pageOpen ? "二维码" : "扫码", true, () -> {
             if (pageOpen) QrSheet.showGenerator(this, tab.title, url, () -> copyUrl("网址", url), qrScanCallback);
             else QrSheet.showScannerHintOrImageDecode(this, qrScanCallback);
         });
-        sheetAction(dialog, pageRow, HOME, pinnedHome ? "取消固定" : "固定首页", pageOpen, () -> {
-            if (tab != null && pageOpen) {
-                library.togglePin(url, tab.title);
-                toast(pinnedHome ? "已从首页移除" : "已固定到首页快捷访问");
-            }
-        });
-        sheetAction(dialog, pageRow, PDF, "打印/PDF", pageOpen, () -> { if (tab != null && tab.view != null) printCurrentPage(tab); });
         sheetAction(dialog, pageRow, SHARE, "分享", pageOpen, () -> shareLink(url));
-
-        // 3. Flagship Performance & Appearance
-        body.addView(AikoTheme.sectionHeader(this, density, "旗舰性能与外观"));
-        float hz = displayMode != null ? displayMode.activeRefreshRate() : 0f;
-        String hzPart = hz > 0 ? String.format(Locale.ROOT, "%.0fHz", hz) : "高刷";
-        String perfSub = activeProfile.name + " · " + hzPart + (hudEnabled ? " · HUD" : "");
-        String themeSub = AikoTheme.modeShortLabel(AikoTheme.loadMode(this));
-        String engineSub = SearchEngines.engineName(SearchEngines.currentId(this));
-        boolean globalDark = siteExtras.isGlobalDarkWeb();
-        boolean gesturesOn = siteExtras.isAutoHideBar() || siteExtras.isEdgeGestures();
-
-        addTwoColRow(body,
-                AikoTheme.toggleTile(this, density, BOLT, "性能引擎", perfSub,
-                        PerfProfiles.ID_RAMPAGE.equals(activeProfile.id), true, AikoTheme.ACCENT_CYAN, () -> {
-                            dialog.dismiss();
-                            showPerformanceCenter();
-                        }),
-                AikoTheme.toggleTile(this, density, PALETTE, "外观主题", themeSub,
-                        !AikoTheme.MODE_OBSIDIAN.equals(AikoTheme.loadMode(this)), true, AikoTheme.ACCENT, () -> {
-                            dialog.dismiss();
-                            showThemeStudio();
-                        }));
-
-        addTwoColRow(body,
-                AikoTheme.toggleTile(this, density, ENGINE, "搜索引擎", engineSub,
-                        false, true, AikoTheme.ACCENT, () -> {
-                            dialog.dismiss();
-                            showSearchEnginePicker();
-                        }),
-                AikoTheme.toggleTile(this, density, DARK, "全局网页暗黑", globalDark ? "已开启" : "已关闭",
-                        globalDark, true, AikoTheme.ACCENT, () -> {
-                            dialog.dismiss();
-                            boolean next = !globalDark;
-                            siteExtras.setGlobalDarkWeb(next);
-                            refreshAllTabsDarkMode();
-                            toast(next ? "已开启全局网页深色模式" : "已关闭全局网页深色模式");
-                        }));
-
-        addTwoColRow(body,
-                AikoTheme.toggleTile(this, density, GESTURE, "手势与隐栏", gesturesOn ? "已开启" : "已关闭",
-                        gesturesOn, true, AikoTheme.EMERALD, () -> {
-                            dialog.dismiss();
-                            showGestureSettings();
-                        }),
-                AikoTheme.toggleTile(this, density, INFO, "关于 Aiko", "v" + appVersionName() + " · Alzar",
-                        false, true, AikoTheme.ACCENT, () -> {
-                            dialog.dismiss();
-                            showAboutSheet();
-                        }));
-
-        // 4. Library & Diagnostics
-        body.addView(AikoTheme.sectionHeader(this, density, "记录、备份与规则"));
-        LinearLayout saved = sheetRow(body);
-        sheetAction(dialog, saved, STAR, "书签", true, () -> showLibrary(true));
-        sheetAction(dialog, saved, HISTORY, "历史", true, () -> showLibrary(false));
-        sheetAction(dialog, saved, SHIELD, "广告过滤", true, this::showFilterRules);
-        sheetAction(dialog, saved, BACKUP, "备份恢复", true, () -> AikoV040Ui.showBackupSheet(v040Host));
-        sheetAction(dialog, saved, SPEED, "诊断", true, this::showPerformance);
+        sheetAction(dialog, pageRow, GRID, "更多工具", true, () -> SettingsCenterUi.showMoreTools(settingsHost));
 
         showSheet(dialog, panel);
+    }
+
+    private void executeMenuAction(MenuConfig.ActionId action) {
+        if (action == null) return;
+        Tab tab = current;
+        String url = tab == null ? null : tab.url;
+        boolean pageOpen = tab != null && tab.view != null && HttpUrlUtil.isHttp(url);
+        switch (action) {
+            case BABEL:
+                babelUi.showSheet(pageOpen ? tab.view : null, pageOpen ? url : null);
+                break;
+            case USERSCRIPTS:
+                showUserScriptsSheet();
+                break;
+            case ADBLOCK:
+                showFilterRules();
+                break;
+            case BOOKMARKS:
+                showLibrary(true);
+                break;
+            case HISTORY:
+                showLibrary(false);
+                break;
+            case READER:
+                if (tab != null && tab.view != null && pageOpen) {
+                    ReaderMode.toggle(this, tab.view, state -> {
+                        if ("empty".equals(state)) toast("当前页面暂不适合阅读模式");
+                        else if ("unavailable".equals(state)) toast("无法启动阅读模式");
+                    });
+                }
+                break;
+            case BOOKMARK_TOGGLE:
+                if (tab != null && pageOpen) toggleBookmark(tab, url);
+                break;
+            case READING_SHELF:
+                if (tab != null && pageOpen) handleReadingShelfAction(tab, readingShelf.has(url));
+                break;
+            case GALLERY:
+                if (pageOpen) openGalleryForCurrent();
+                break;
+            case LONGSHOT:
+                if (pageOpen) captureLongShotForCurrent();
+                break;
+            case VIDEO_BOOSTER:
+                if (tab != null && tab.view != null && pageOpen) showVideoBoosterSheet(tab);
+                break;
+            case MEDIA_SNIFF:
+                if (pageOpen) openMediaSnifferForCurrent();
+                break;
+            case READ_ALOUD:
+                if (tab != null && tab.view != null && pageOpen && readAloud != null) {
+                    readAloud.showReadAloudSheet(this, tab.view, displayMode, density);
+                }
+                break;
+            case DEVTOOLS:
+                if (tab != null && tab.view != null && pageOpen) {
+                    WebDevTools.toggle(tab.view);
+                    toast("已切换网页开发者调试台");
+                }
+                break;
+            case PWA_PIN:
+                if (pageOpen) pinCurrentPagePwa();
+                break;
+            case TAB_MUTE:
+                if (tab != null && tab.view != null && pageOpen) {
+                    boolean next = !tab.muted;
+                    tab.muted = next;
+                    WebViewPerf.setAudioMuted(tab.view, next);
+                    toast(next ? "当前标签已静音" : "已恢复标签声音");
+                }
+                break;
+            case DARK_WEB:
+                boolean nextDark = !siteExtras.isGlobalDarkWeb();
+                siteExtras.setGlobalDarkWeb(nextDark);
+                refreshAllTabsDarkMode();
+                toast(nextDark ? "已开启全局网页深色模式" : "已关闭全局网页深色模式");
+                break;
+            case PERF_ENGINE:
+                showPerformanceCenter();
+                break;
+            case THEME_STUDIO:
+                showThemeStudio();
+                break;
+            case CUSTOM_HOME:
+                AikoV040Ui.showCustomizationSheet(v040Host);
+                break;
+            case BACKUP:
+                AikoV040Ui.showBackupSheet(v040Host);
+                break;
+            case CLEAN_CACHE:
+                SettingsCenterUi.showStorageCleaner(settingsHost);
+                break;
+        }
+    }
+
+    private String actionDynamicSubtitle(MenuConfig.ActionId action) {
+        Tab tab = current;
+        String url = tab == null ? null : tab.url;
+        boolean pageOpen = tab != null && tab.view != null && HttpUrlUtil.isHttp(url);
+        switch (action) {
+            case BABEL: {
+                boolean on = pageOpen && babelUi != null && babelUi.isTranslating(tab.view);
+                return on ? ("翻译中 · " + babelConfig.activeEngineDisplayName()) : babelConfig.activeEngineDisplayName();
+            }
+            case USERSCRIPTS: {
+                int total = userScripts != null ? userScripts.items().size() : 0;
+                return total > 0 ? ("已安装 " + total + " 个脚本") : action.defaultSub;
+            }
+            case ADBLOCK: {
+                int count = filter().totalRuleCount();
+                return count > 0 ? String.format(Locale.ROOT, "%,d 条规则护航", count) : action.defaultSub;
+            }
+            case BOOKMARK_TOGGLE:
+                return pageOpen && library.isBookmarked(url) ? "已收藏 · 点按取消" : "点按收藏此页";
+            case READING_SHELF:
+                return pageOpen && readingShelf.has(url) ? "已在稍后读 · 移除" : "保存位置/离线";
+            case VIDEO_BOOSTER:
+                return (bgAudioEnabled && tab == bgAudioTab) ? "后台音频播放中" : action.defaultSub;
+            case MEDIA_SNIFF:
+                return cachedSniffedCount > 0 ? ("发现 " + cachedSniffedCount + " 条流媒体") : action.defaultSub;
+            case TAB_MUTE:
+                return (pageOpen && tab.muted) ? "当前已静音" : "声音开启";
+            case DARK_WEB:
+                return siteExtras.isGlobalDarkWeb() ? "已开启" : "已关闭";
+            case PERF_ENGINE: {
+                float hz = displayMode != null ? displayMode.activeRefreshRate() : 0f;
+                return activeProfile.name + (hz > 0 ? String.format(Locale.ROOT, " · %.0fHz", hz) : "");
+            }
+            case THEME_STUDIO:
+                return AikoTheme.modeShortLabel(AikoTheme.loadMode(this));
+            case CUSTOM_HOME:
+                return startPageConfig.resolveHomeUrl() == null ? "原生主页 · 护眼/字体" : "自定义主页";
+            default:
+                return action.defaultSub;
+        }
+    }
+
+    private boolean actionIsActive(MenuConfig.ActionId action) {
+        Tab tab = current;
+        String url = tab == null ? null : tab.url;
+        boolean pageOpen = tab != null && tab.view != null && HttpUrlUtil.isHttp(url);
+        switch (action) {
+            case BABEL: return pageOpen && babelUi != null && babelUi.isTranslating(tab.view);
+            case BOOKMARK_TOGGLE: return pageOpen && library.isBookmarked(url);
+            case READING_SHELF: return pageOpen && readingShelf.has(url);
+            case VIDEO_BOOSTER: return bgAudioEnabled && tab == bgAudioTab;
+            case MEDIA_SNIFF: return cachedSniffedCount > 0;
+            case TAB_MUTE: return pageOpen && tab.muted;
+            case DARK_WEB: return siteExtras.isGlobalDarkWeb();
+            case PERF_ENGINE: return PerfProfiles.ID_RAMPAGE.equals(activeProfile.id);
+            case THEME_STUDIO: return !AikoTheme.MODE_OBSIDIAN.equals(AikoTheme.loadMode(this));
+            case CUSTOM_HOME: return startPageConfig.isNightFilterEnabled() || startPageConfig.resolveHomeUrl() != null;
+            default: return false;
+        }
+    }
+
+    private int actionAccentColor(MenuConfig.ActionId action) {
+        switch (action) {
+            case ADBLOCK:
+            case READING_SHELF:
+            case MEDIA_SNIFF:
+            case READ_ALOUD:
+                return AikoTheme.EMERALD;
+            case READER:
+            case LONGSHOT:
+            case VIDEO_BOOSTER:
+            case PERF_ENGINE:
+            case CUSTOM_HOME:
+                return AikoTheme.ACCENT_CYAN;
+            case DEVTOOLS:
+            case TAB_MUTE:
+            case CLEAN_CACHE:
+                return AikoTheme.AMBER;
+            default:
+                return AikoTheme.ACCENT;
+        }
     }
 
     private void addTwoColRow(LinearLayout parent, View left, View right) {
@@ -4725,13 +4938,28 @@ public final class MainActivity extends Activity {
         }
         int sx = tab.view != null ? tab.view.getScrollX() : 0;
         int sy = tab.view != null ? tab.view.getScrollY() : 0;
-        String[] choices = {"仅保存链接与阅读位置（瞬时）", "保存并生成离线快照（MHTML）"};
-        new AlertDialog.Builder(this).setTitle("加入稍后读 · 0MB 内存")
-                .setItems(choices, (d, which) -> {
-                    if (which == 0) {
-                        readingShelf.pin(tab.url, tab.title, sx, sy, null);
-                        toast("已加入首页稍后读");
-                    } else if (tab.view != null) {
+        Dialog dialog = new Dialog(this);
+        dialog.requestWindowFeature(Window.FEATURE_NO_TITLE);
+        LinearLayout panel = AikoTheme.sheetContainer(this, density, "加入稍后读 · 0MB 内存", dialog::dismiss);
+
+        TextView sub = label("不常驻后台标签内存，随时从主页一键继续阅读", 12, AikoTheme.TEXT_MUTED);
+        sub.setPadding(dp(4), 0, dp(4), dp(12));
+        panel.addView(sub);
+
+        View optFast = buildSheetOptionCard(BrowserIcon.Kind.PIN, AikoTheme.ACCENT,
+                "仅保存链接与阅读位置（瞬时）", "极速写入当前滚动进度，0 磁盘占用", () -> {
+                    dialog.dismiss();
+                    readingShelf.pin(tab.url, tab.title, sx, sy, null);
+                    toast("已加入首页稍后读");
+                });
+        LinearLayout.LayoutParams lp1 = new LinearLayout.LayoutParams(-1, -2);
+        lp1.bottomMargin = dp(8);
+        panel.addView(optFast, lp1);
+
+        View optOffline = buildSheetOptionCard(BrowserIcon.Kind.DOWNLOAD, AikoTheme.ACCENT_CYAN,
+                "保存并生成离线快照（MHTML）", "无网、断网或原文失效时依然可完整阅读", () -> {
+                    dialog.dismiss();
+                    if (tab.view != null) {
                         readingShelf.pin(tab.url, tab.title, sx, sy, null);
                         readingShelf.saveArchiveFor(tab.view, tab.url, path -> {
                             if (isDestroyed()) return;
@@ -4743,7 +4971,38 @@ public final class MainActivity extends Activity {
                             }
                         });
                     }
-                }).show();
+                });
+        panel.addView(optOffline, new LinearLayout.LayoutParams(-1, -2));
+        showSheet(dialog, panel);
+    }
+
+    private View buildSheetOptionCard(BrowserIcon.Kind kind, int iconColor, String title, String subtitle, Runnable onClick) {
+        LinearLayout card = new LinearLayout(this);
+        card.setGravity(Gravity.CENTER_VERTICAL);
+        card.setPadding(dp(14), dp(12), dp(14), dp(12));
+        card.setBackground(AikoTheme.card(AikoTheme.CARD, AikoTheme.STROKE, density, dp(15)));
+        card.setForeground(AikoTheme.ripple(AikoTheme.RIPPLE_ACCENT, dp(15)));
+        AikoTheme.attachPressFeedback(card, 0.97f);
+        card.setOnClickListener(v -> onClick.run());
+
+        FrameLayout badge = new FrameLayout(this);
+        badge.setBackground(AikoTheme.card(AikoTheme.PILL, AikoTheme.STROKE, density, dp(11)));
+        BrowserIcon ico = new BrowserIcon(this, kind);
+        ico.tint(iconColor);
+        badge.addView(ico, new FrameLayout.LayoutParams(dp(19), dp(19), Gravity.CENTER));
+        LinearLayout.LayoutParams blp = new LinearLayout.LayoutParams(dp(38), dp(38));
+        blp.rightMargin = dp(12);
+        card.addView(badge, blp);
+
+        LinearLayout textCol = stack();
+        TextView t = label(title, 14, AikoTheme.TEXT);
+        t.setTypeface(AikoTheme.BOLD);
+        TextView s = label(subtitle, 11, AikoTheme.TEXT_MUTED);
+        s.setPadding(0, dp(2), 0, 0);
+        textCol.addView(t);
+        textCol.addView(s);
+        card.addView(textCol, new LinearLayout.LayoutParams(0, -2, 1f));
+        return card;
     }
 
     private void printCurrentPage(Tab tab) {
@@ -5238,8 +5497,7 @@ public final class MainActivity extends Activity {
         previewBtn.setPadding(dp(14), 0, dp(14), 0);
         previewBar.addView(previewBtn, new LinearLayout.LayoutParams(-2, dp(36)));
 
-        // 8 Preset cards in 2-column grid (7 curated flagship presets + Custom)
-        body.addView(AikoTheme.sectionHeader(this, density, "精选主题预设"));
+        // Categorized 17 curated flagship presets + Custom studio
         LinearLayout[] presetCards = new LinearLayout[AikoTheme.ALL_MODES.length];
         TextView[] presetTitles = new TextView[AikoTheme.ALL_MODES.length];
         View[] presetDots = new View[AikoTheme.ALL_MODES.length];
@@ -5248,9 +5506,10 @@ public final class MainActivity extends Activity {
         TextView hueLabel = label("", 12, AikoTheme.TEXT_MUTED);
         TextView satLabel = label("", 12, AikoTheme.TEXT_MUTED);
         TextView tintLabel = label("", 12, AikoTheme.TEXT_MUTED);
-        EditText hexInput = input("#7C9BFF");
+        EditText hexInput = input("#39C5BB");
         final LinearLayout[] customCardRef = new LinearLayout[1];
         final TextView[] applyHexBtnRef = new TextView[1];
+        final SeekBar[] studioSeeks = new SeekBar[3];
 
         final Runnable[] refreshPreviewRef = new Runnable[1];
         refreshPreviewRef[0] = () -> {
@@ -5288,6 +5547,13 @@ public final class MainActivity extends Activity {
                 applyHexBtnRef[0].setBackground(AikoTheme.card(AikoTheme.ACCENT, 0, density, dp(12)));
                 applyHexBtnRef[0].setTextColor(AikoTheme.onAccentColor());
             }
+            android.content.res.ColorStateList accentTint = android.content.res.ColorStateList.valueOf(pal.accent);
+            for (SeekBar sb : studioSeeks) {
+                if (sb != null) {
+                    sb.setThumbTintList(accentTint);
+                    sb.setProgressTintList(accentTint);
+                }
+            }
 
             for (int i = 0; i < AikoTheme.ALL_MODES.length; i++) {
                 if (presetCards[i] == null) continue;
@@ -5309,63 +5575,78 @@ public final class MainActivity extends Activity {
             tintLabel.setText(String.format(Locale.ROOT, "底色浸染 Surface Tint · %d%%", Math.round(surfaceTint[0] * 100f)));
         };
 
-        for (int i = 0; i < AikoTheme.ALL_MODES.length; i += 2) {
-            LinearLayout row = new LinearLayout(this);
-            row.setOrientation(LinearLayout.HORIZONTAL);
-            LinearLayout.LayoutParams rlp = new LinearLayout.LayoutParams(-1, -2);
-            rlp.bottomMargin = dp(8);
-            body.addView(row, rlp);
+        String[][] groups = {AikoTheme.ICONIC_MODES, AikoTheme.LUXURY_MODES, AikoTheme.CLASSIC_MODES};
+        String[] groupTitles = {"标志与潮流精选", "公认高级典藏色", "经典暗夜与系统取色"};
+        for (int g = 0; g < groups.length; g++) {
+            body.addView(AikoTheme.sectionHeader(this, density, groupTitles[g]));
+            String[] list = groups[g];
+            for (int i = 0; i < list.length; i += 2) {
+                LinearLayout row = new LinearLayout(this);
+                row.setOrientation(LinearLayout.HORIZONTAL);
+                LinearLayout.LayoutParams rlp = new LinearLayout.LayoutParams(-1, -2);
+                rlp.bottomMargin = dp(8);
+                body.addView(row, rlp);
 
-            for (int col = 0; col < 2; col++) {
-                int idx = i + col;
-                if (idx >= AikoTheme.ALL_MODES.length) break;
-                final String mode = AikoTheme.ALL_MODES[idx];
-
-                LinearLayout tile = new LinearLayout(this);
-                tile.setOrientation(LinearLayout.HORIZONTAL);
-                tile.setGravity(Gravity.CENTER_VERTICAL);
-                tile.setPadding(dp(11), dp(10), dp(10), dp(10));
-                tile.setForeground(AikoTheme.ripple(AikoTheme.RIPPLE_ACCENT, dp(14)));
-
-                View dot = new View(this);
-                LinearLayout.LayoutParams dlp = new LinearLayout.LayoutParams(dp(22), dp(22));
-                dlp.rightMargin = dp(9);
-                tile.addView(dot, dlp);
-
-                LinearLayout textCol = stack();
-                tile.addView(textCol, new LinearLayout.LayoutParams(0, -2, 1));
-
-                TextView t = label(AikoTheme.modeShortLabel(mode), 13, AikoTheme.TEXT);
-                t.setTypeface(AikoTheme.MEDIUM);
-                t.setSingleLine(true);
-                textCol.addView(t);
-
-                TextView sub = label(AikoTheme.modeDescription(this, mode), 10, AikoTheme.TEXT_DIM);
-                sub.setSingleLine(true);
-                sub.setEllipsize(TextUtils.TruncateAt.END);
-                textCol.addView(sub);
-
-                presetCards[idx] = tile;
-                presetTitles[idx] = t;
-                presetDots[idx] = dot;
-
-                AikoTheme.attachPressFeedback(tile, 0.96f);
-                tile.setOnClickListener(v -> {
-                    selectedMode[0] = mode;
-                    if (!AikoTheme.MODE_CUSTOM.equals(mode)) {
-                        AikoTheme.saveAndApply(this, mode, customSeed[0], surfaceTint[0]);
-                        applyLiveTheme();
-                        toast("已切换主题：" + AikoTheme.modeLabel(mode));
-                    } else {
-                        AikoTheme.saveAndApply(this, AikoTheme.MODE_CUSTOM, customSeed[0], surfaceTint[0]);
-                        applyLiveTheme();
+                for (int col = 0; col < 2; col++) {
+                    int li = i + col;
+                    if (li >= list.length) {
+                        row.addView(new View(this), new LinearLayout.LayoutParams(0, 1, 1));
+                        break;
                     }
-                    refreshPreviewRef[0].run();
-                });
+                    final String mode = list[li];
+                    int allIdx = -1;
+                    for (int k = 0; k < AikoTheme.ALL_MODES.length; k++) {
+                        if (AikoTheme.ALL_MODES[k].equals(mode)) { allIdx = k; break; }
+                    }
 
-                LinearLayout.LayoutParams tlp = new LinearLayout.LayoutParams(0, dp(56), 1);
-                if (col == 0) tlp.rightMargin = dp(8);
-                row.addView(tile, tlp);
+                    LinearLayout tile = new LinearLayout(this);
+                    tile.setOrientation(LinearLayout.HORIZONTAL);
+                    tile.setGravity(Gravity.CENTER_VERTICAL);
+                    tile.setPadding(dp(11), dp(10), dp(10), dp(10));
+                    tile.setForeground(AikoTheme.ripple(AikoTheme.RIPPLE_ACCENT, dp(14)));
+
+                    View dot = new View(this);
+                    LinearLayout.LayoutParams dlp = new LinearLayout.LayoutParams(dp(22), dp(22));
+                    dlp.rightMargin = dp(9);
+                    tile.addView(dot, dlp);
+
+                    LinearLayout textCol = stack();
+                    tile.addView(textCol, new LinearLayout.LayoutParams(0, -2, 1));
+
+                    TextView t = label(AikoTheme.modeShortLabel(mode), 13, AikoTheme.TEXT);
+                    t.setTypeface(AikoTheme.MEDIUM);
+                    t.setSingleLine(true);
+                    textCol.addView(t);
+
+                    TextView sub = label(AikoTheme.modeDescription(this, mode), 10, AikoTheme.TEXT_DIM);
+                    sub.setSingleLine(true);
+                    sub.setEllipsize(TextUtils.TruncateAt.END);
+                    textCol.addView(sub);
+
+                    if (allIdx >= 0) {
+                        presetCards[allIdx] = tile;
+                        presetTitles[allIdx] = t;
+                        presetDots[allIdx] = dot;
+                    }
+
+                    AikoTheme.attachPressFeedback(tile, 0.96f);
+                    tile.setOnClickListener(v -> {
+                        selectedMode[0] = mode;
+                        if (!AikoTheme.MODE_CUSTOM.equals(mode)) {
+                            AikoTheme.saveAndApply(this, mode, customSeed[0], surfaceTint[0]);
+                            applyLiveTheme();
+                            toast("已切换主题：" + AikoTheme.modeLabel(mode));
+                        } else {
+                            AikoTheme.saveAndApply(this, AikoTheme.MODE_CUSTOM, customSeed[0], surfaceTint[0]);
+                            applyLiveTheme();
+                        }
+                        refreshPreviewRef[0].run();
+                    });
+
+                    LinearLayout.LayoutParams tlp = new LinearLayout.LayoutParams(0, dp(56), 1);
+                    if (col == 0) tlp.rightMargin = dp(8);
+                    row.addView(tile, tlp);
+                }
             }
         }
 
@@ -5380,14 +5661,17 @@ public final class MainActivity extends Activity {
         SeekBar hueSeek = new SeekBar(this);
         hueSeek.setMax(360);
         hueSeek.setProgress(Math.round(hsv[0]));
+        studioSeeks[0] = hueSeek;
 
         SeekBar satSeek = new SeekBar(this);
         satSeek.setMax(100);
         satSeek.setProgress(Math.round(hsv[1] * 100f));
+        studioSeeks[1] = satSeek;
 
         SeekBar tintSeek = new SeekBar(this);
         tintSeek.setMax(150);
         tintSeek.setProgress(Math.round(surfaceTint[0] * 100f));
+        studioSeeks[2] = tintSeek;
 
         final boolean[] syncingHex = {false};
         Runnable commitCustomLive = () -> {
@@ -5484,26 +5768,38 @@ public final class MainActivity extends Activity {
         String currentId = SearchEngines.currentId(this);
         String currentCustom = SearchEngines.customTemplate(this);
         String[] ids = SearchEngines.engineIds();
-        CharSequence[] names = new CharSequence[ids.length];
-        int selected = 0;
-        for (int i = 0; i < ids.length; i++) {
-            names[i] = SearchEngines.engineName(ids[i]);
-            if (ids[i].equals(currentId)) selected = i;
+        Dialog dialog = new Dialog(this);
+        dialog.requestWindowFeature(Window.FEATURE_NO_TITLE);
+        LinearLayout panel = AikoTheme.sheetContainer(this, density, "选择搜索引擎", dialog::dismiss);
+        int maxEngineH = Math.min(460, Math.max(220, getResources().getConfiguration().screenHeightDp - 180));
+        ScrollView scroll = AikoTheme.maxHeightScrollView(this, dp(maxEngineH));
+        panel.addView(scroll, new LinearLayout.LayoutParams(-1, -2));
+        LinearLayout body = stack();
+        scroll.addView(body, new ScrollView.LayoutParams(-1, -2));
+
+        for (String id : ids) {
+            boolean active = id.equals(currentId);
+            String name = SearchEngines.engineName(id);
+            String sub = "custom".equals(id)
+                    ? (currentCustom == null || currentCustom.isEmpty() ? "支持自定义含 %s 搜索模板" : currentCustom)
+                    : (active ? "当前默认搜索引擎" : "点按切换为默认");
+            View tile = AikoTheme.toggleTile(this, density, ENGINE, name, sub,
+                    active, true, AikoTheme.ACCENT, () -> {
+                        dialog.dismiss();
+                        if ("custom".equals(id)) {
+                            showCustomSearchEngineDialog(currentCustom);
+                        } else {
+                            SearchEngines.save(this, id, currentCustom);
+                            WebViewPerf.warmUpQuicHints(collectQuicHosts());
+                            if (onHome) refreshHomeContent();
+                            toast("已切换搜索引擎：" + name);
+                        }
+                    });
+            LinearLayout.LayoutParams tlp = new LinearLayout.LayoutParams(-1, -2);
+            tlp.bottomMargin = dp(8);
+            body.addView(tile, tlp);
         }
-        new AlertDialog.Builder(this).setTitle("选择搜索引擎")
-                .setSingleChoiceItems(names, selected, (dialog, which) -> {
-                    String chosen = ids[which];
-                    dialog.dismiss();
-                    if ("custom".equals(chosen)) {
-                        showCustomSearchEngineDialog(currentCustom);
-                    } else {
-                        SearchEngines.save(this, chosen, currentCustom);
-                        if (onHome) refreshHomeContent();
-                        toast("已切换搜索引擎：" + SearchEngines.engineName(chosen));
-                    }
-                })
-                .setNegativeButton("取消", null)
-                .show();
+        showSheet(dialog, panel);
     }
 
     private void showCustomSearchEngineDialog(String existing) {
@@ -5580,10 +5876,8 @@ public final class MainActivity extends Activity {
                 + "\n\n导航到 WebView 可绘制，含网络等待。"
                 + "\n\n" + (timings.isEmpty() ? "打开一个网页后查看记录。" : String.join("\n", timings));
 
-        new AlertDialog.Builder(this).setTitle("性能诊断报告").setMessage(stats)
-                .setNegativeButton("性能引擎 / HUD", (d, w) -> showPerformanceCenter())
-                .setNeutralButton("复制", (d, w) -> copyText("Aiko Browser 性能记录", stats, "已复制性能记录"))
-                .setPositiveButton("关闭", null).show();
+        SettingsCenterUi.showTextReportSheet(this, density, displayMode,
+                "性能诊断报告", stats, "性能引擎 / HUD", this::showPerformanceCenter);
     }
 
     private void showLibrary(boolean bookmarks) {
@@ -7710,9 +8004,12 @@ public final class MainActivity extends Activity {
         AikoTheme.applyTheme(this);
         applyLiveTheme();
         if (startPageConfig != null) startPageConfig.reload();
+        if (menuConfig != null) menuConfig.reload();
         if (bangCatalog != null) bangCatalog.reload();
+        BabelEngine oldBabel = babelEngine;
         babelConfig = new BabelConfig(this);
         babelEngine = new BabelEngine(babelConfig);
+        if (oldBabel != null) oldBabel.shutdown();
         babelUi = new BabelUi(this, babelConfig, babelEngine, new BabelUi.HostCallbacks() {
             @Override public void toast(String msg) { MainActivity.this.toast(msg); }
             @Override public void speakText(String text, String lang) {
@@ -7749,7 +8046,14 @@ public final class MainActivity extends Activity {
             dismissOmnibox();
             return;
         }
-        if (!goBack()) super.onBackPressed();
+        if (goBack()) return;
+        long now = SystemClock.uptimeMillis();
+        if (now - lastBackPressMs > 1800L) {
+            lastBackPressMs = now;
+            toast("再按一次返回退出 Aiko");
+            return;
+        }
+        super.onBackPressed();
     }
 
     private boolean goBack() {
@@ -8033,8 +8337,10 @@ public final class MainActivity extends Activity {
         if (root != null) root.removeCallbacks(reapplyInsetsTask);
         detachHud();
         hideClipboardCapsule();
+        hideScrollTopPill();
         releasePreloadedNewTab();
         if (readAloud != null) readAloud.shutdown();
+        if (babelEngine != null) babelEngine.shutdown();
         MediaPlaybackService.clearPlaybackListener(mediaPlaybackListener);
         if (bgAudioEnabled) MediaPlaybackService.stop(this);
         if (elementPicker != null) elementPicker.stop();

@@ -49,13 +49,27 @@ public final class BabelEngine {
     public static final int MAX_CACHE_ENTRIES = 4096;
     private static final int MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
     private static final long BING_TOKEN_TTL_MS = 8L * 60L * 1000L;
+    private static final long GOOGLE_CIRCUIT_BREAKER_MS = 3L * 60L * 1000L;
     private static final String USER_AGENT =
-            "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36";
+            "Mozilla/5.0 (Linux; Android 15; Pixel 9 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Mobile Safari/537.36";
 
+    private static final String DEFAULT_GOOGLE_CLIENTS5_ENDPOINT = "https://clients5.google.com/translate_a/t";
     private static final String DEFAULT_GOOGLE_ENDPOINT = "https://translate.googleapis.com/translate_a/single";
+    private static final String DEFAULT_BING_CN_PAGE = "https://cn.bing.com/translator";
+    private static final String DEFAULT_BING_CN_TRANSLATE = "https://cn.bing.com/ttranslatev3";
     private static final String DEFAULT_BING_AUTH_ENDPOINT = "https://edge.microsoft.com/translate/auth";
     private static final String DEFAULT_BING_TRANSLATE_ENDPOINT = "https://api-edge.cognitive.microsofttranslator.com/translate";
-    private static final String DEFAULT_YOUDAO_ENDPOINT = "https://fanyi.youdao.com/translate";
+    private static final String DEFAULT_YOUDAO_ENDPOINT = "https://m.youdao.com/translate";
+    private static final String DEFAULT_MYMEMORY_ENDPOINT = "https://api.mymemory.translated.net/get";
+
+    private static final Pattern BING_IG_PATTERN = Pattern.compile("IG:\"([A-Za-z0-9_-]+)\"");
+    private static final Pattern BING_IID_PATTERN = Pattern.compile("data-iid=\"(translator\\.\\d+)\"");
+    private static final Pattern BING_ABUSE_PATTERN = Pattern.compile(
+            "params_AbusePreventionHelper\\s*=\\s*\\[\\s*(\\d+)\\s*,\\s*\"([^\"]+)\"");
+    private static final Pattern YOUDAO_MOBILE_UL_PATTERN = Pattern.compile(
+            "(?is)<ul[^>]*id=[\"']translateResult[\"'][^>]*>(.*?)</ul>");
+    private static final Pattern HTML_LI_PATTERN = Pattern.compile("(?is)<li[^>]*>(.*?)</li>");
+    private static final Pattern HTML_TAG_PATTERN = Pattern.compile("(?is)<[^>]+>");
 
     private static final Pattern THINK_BLOCK_PATTERN = Pattern.compile(
             "(?is)<(?:think|thinking|reasoning)>.*?</(?:think|thinking|reasoning)>");
@@ -269,15 +283,37 @@ public final class BabelEngine {
     private static final class HttpResponse {
         final int code;
         final String body;
+        final String cookies;
 
-        HttpResponse(int code, String body) {
+        HttpResponse(int code, String body, String cookies) {
             this.code = code;
             this.body = body == null ? "" : body;
+            this.cookies = cookies == null ? "" : cookies;
+        }
+    }
+
+    static final class BingCnSession {
+        final String ig;
+        final String iid;
+        final String key;
+        final String token;
+        final String cookie;
+        final long expiresAt;
+        final AtomicInteger seq = new AtomicInteger(1);
+
+        BingCnSession(String ig, String iid, String key, String token, String cookie, long expiresAt) {
+            this.ig = ig;
+            this.iid = iid;
+            this.key = key;
+            this.token = token;
+            this.cookie = cookie == null ? "" : cookie;
+            this.expiresAt = expiresAt;
         }
     }
 
     private final BabelConfig config;
     private final ExecutorService executor;
+    private final ExecutorService subBatchExecutor;
     private final ConcurrencyGate gate = new ConcurrencyGate();
 
     private final Map<String, String> cache = new LinkedHashMap<String, String>(256, 0.75f, true) {
@@ -300,6 +336,8 @@ public final class BabelEngine {
     private final Object bingTokenLock = new Object();
     private volatile String bingToken = null;
     private volatile long bingTokenExpiresAt = 0L;
+    private volatile BingCnSession bingCnSession = null;
+    private volatile long googleUnreachableUntilMs = 0L;
 
     // Configurable endpoints (production defaults; overridable in host unit tests)
     private volatile String googleEndpoint = DEFAULT_GOOGLE_ENDPOINT;
@@ -324,6 +362,21 @@ public final class BabelEngine {
                 factory);
         pool.allowCoreThreadTimeOut(true);
         this.executor = pool;
+
+        AtomicInteger subId = new AtomicInteger(1);
+        ThreadPoolExecutor subPool = new ThreadPoolExecutor(
+                BabelConfig.MAX_CONCURRENCY,
+                BabelConfig.MAX_CONCURRENCY,
+                45L,
+                TimeUnit.SECONDS,
+                new LinkedBlockingQueue<>(),
+                r -> {
+                    Thread t = new Thread(r, "aiko-babel-sub-" + subId.getAndIncrement());
+                    t.setDaemon(true);
+                    return t;
+                });
+        subPool.allowCoreThreadTimeOut(true);
+        this.subBatchExecutor = subPool;
     }
 
     /** Test-only endpoint overrides for offline loopback HTTP verification. */
@@ -339,7 +392,13 @@ public final class BabelEngine {
         synchronized (bingTokenLock) {
             bingToken = null;
             bingTokenExpiresAt = 0L;
+            bingCnSession = null;
         }
+        googleUnreachableUntilMs = 0L;
+    }
+
+    public void resetGoogleCircuitBreaker() {
+        googleUnreachableUntilMs = 0L;
     }
 
     public BabelConfig getConfig() {
@@ -386,6 +445,7 @@ public final class BabelEngine {
         synchronized (cache) {
             cache.clear();
         }
+        googleUnreachableUntilMs = 0L;
     }
 
     public void resetStats() {
@@ -416,6 +476,7 @@ public final class BabelEngine {
     public void shutdown() {
         for (ActiveRequest req : activeRequests) req.abort();
         executor.shutdownNow();
+        subBatchExecutor.shutdownNow();
     }
 
     // ---- Public Translation APIs ----
@@ -571,39 +632,41 @@ public final class BabelEngine {
         boolean fellBack = false;
 
         try {
-            for (List<Integer> sub : subBatches) {
-                if (cancelled.isCancelled()) throw new CancelledException();
-                List<String> subInput = new ArrayList<>(sub.size());
-                for (int idx : sub) subInput.add(missTexts.get(idx));
-
-                boolean acquired = false;
-                try {
-                    acquired = gate.acquire(maxConcurrency, cancelled);
-                    if (!acquired || cancelled.isCancelled()) throw new CancelledException();
-
-                    BatchNetworkOutcome outcome = executeWithFallback(
+            if (subBatches.size() <= 1 || maxConcurrency <= 1) {
+                for (List<Integer> sub : subBatches) {
+                    BatchNetworkOutcome outcome = runSingleSubBatch(
                             scopeKey, generation, configuredEngine, activeProfile,
-                            subInput, target, timeoutMs, cancelled);
-
+                            sub, missTexts, missIndices, cacheKeys, texts, results,
+                            target, timeoutMs, maxConcurrency, cancelled);
                     usedEngine = outcome.usedEngine;
                     if (outcome.fellBackToCn) fellBack = true;
-
-                    for (int k = 0; k < sub.size(); k++) {
-                        int origIdx = missIndices.get(sub.get(k));
-                        String translated = k < outcome.translations.size() ? outcome.translations.get(k) : "";
-                        results[origIdx] = translated;
-                        if (translated != null && !translated.isEmpty()) {
-                            synchronized (cache) {
-                                cache.put(cacheKeys[origIdx], translated);
-                                if (outcome.usedEngine != configuredEngine) {
-                                    String altKey = cacheKey(outcome.usedEngine, "", target, "", texts.get(origIdx));
-                                    cache.put(altKey, translated);
-                                }
-                            }
+                }
+            } else {
+                // Parallel sub-batch dispatch respecting maxConcurrency (huge speedup on long pages & custom AI!)
+                List<java.util.concurrent.Future<BatchNetworkOutcome>> futures = new ArrayList<>(subBatches.size());
+                for (List<Integer> sub : subBatches) {
+                    futures.add(subBatchExecutor.submit(() -> runSingleSubBatch(
+                            scopeKey, generation, configuredEngine, activeProfile,
+                            sub, missTexts, missIndices, cacheKeys, texts, results,
+                            target, timeoutMs, maxConcurrency, cancelled)));
+                }
+                Throwable firstError = null;
+                for (java.util.concurrent.Future<BatchNetworkOutcome> f : futures) {
+                    try {
+                        BatchNetworkOutcome outcome = f.get();
+                        if (outcome != null) {
+                            usedEngine = outcome.usedEngine;
+                            if (outcome.fellBackToCn) fellBack = true;
                         }
+                    } catch (java.util.concurrent.ExecutionException ee) {
+                        if (firstError == null) firstError = ee.getCause();
                     }
-                } finally {
-                    if (acquired) gate.release();
+                }
+                if (firstError != null) {
+                    if (firstError instanceof CancelledException) throw (CancelledException) firstError;
+                    if (firstError instanceof IOException) throw (IOException) firstError;
+                    if (firstError instanceof InterruptedException) throw (InterruptedException) firstError;
+                    throw new IOException(firstError.getMessage(), firstError);
                 }
             }
         } catch (CancelledException ce) {
@@ -647,6 +710,55 @@ public final class BabelEngine {
         }
     }
 
+    private BatchNetworkOutcome runSingleSubBatch(
+            String scopeKey,
+            long generation,
+            BabelConfig.EngineKind configuredEngine,
+            BabelConfig.AiProfile activeProfile,
+            List<Integer> sub,
+            List<String> missTexts,
+            List<Integer> missIndices,
+            String[] cacheKeys,
+            List<String> texts,
+            String[] results,
+            String target,
+            int timeoutMs,
+            int maxConcurrency,
+            CancellationCheck cancelled
+    ) throws IOException, InterruptedException {
+        if (cancelled.isCancelled()) throw new CancelledException();
+        List<String> subInput = new ArrayList<>(sub.size());
+        for (int idx : sub) subInput.add(missTexts.get(idx));
+
+        boolean acquired = false;
+        try {
+            acquired = gate.acquire(maxConcurrency, cancelled);
+            if (!acquired || cancelled.isCancelled()) throw new CancelledException();
+
+            BatchNetworkOutcome outcome = executeWithFallback(
+                    scopeKey, generation, configuredEngine, activeProfile,
+                    subInput, target, timeoutMs, cancelled);
+
+            for (int k = 0; k < sub.size(); k++) {
+                int origIdx = missIndices.get(sub.get(k));
+                String translated = k < outcome.translations.size() ? outcome.translations.get(k) : "";
+                results[origIdx] = translated;
+                if (translated != null && !translated.isEmpty()) {
+                    synchronized (cache) {
+                        cache.put(cacheKeys[origIdx], translated);
+                        if (outcome.usedEngine != configuredEngine) {
+                            String altKey = cacheKey(outcome.usedEngine, "", target, "", texts.get(origIdx));
+                            cache.put(altKey, translated);
+                        }
+                    }
+                }
+            }
+            return outcome;
+        } finally {
+            if (acquired) gate.release();
+        }
+    }
+
     private BatchNetworkOutcome executeWithFallback(
             String scopeKey,
             long generation,
@@ -661,20 +773,86 @@ public final class BabelEngine {
         for (String s : items) promptChars += s.length();
         statPromptChars.addAndGet(promptChars);
 
+        boolean isProdGoogle = engine == BabelConfig.EngineKind.GOOGLE_FREE
+                && DEFAULT_GOOGLE_ENDPOINT.equals(googleEndpoint);
+        boolean allowCnFailover = engine == BabelConfig.EngineKind.GOOGLE_FREE && config.isAutoFallbackToCn();
+
+        // Fast circuit-breaker: if Google was recently unreachable on this network, skip straight to CN engines (0ms wasted!)
+        if (isProdGoogle && allowCnFailover && System.currentTimeMillis() < googleUnreachableUntilMs) {
+            return executeCnFailoverChain(scopeKey, generation, items, targetLang, timeoutMs, cancelled);
+        }
+
+        int attemptTimeoutMs = (isProdGoogle && allowCnFailover) ? Math.min(timeoutMs, 4500) : timeoutMs;
         try {
-            List<String> out = dispatchEngine(scopeKey, generation, engine, profile, items, targetLang, timeoutMs, cancelled);
+            List<String> out = dispatchEngine(scopeKey, generation, engine, profile, items, targetLang, attemptTimeoutMs, cancelled);
+            if (isProdGoogle) googleUnreachableUntilMs = 0L;
             recordOutputChars(out);
             return new BatchNetworkOutcome(out, engine, false);
         } catch (CancelledException ce) {
             throw ce;
         } catch (IOException ioe) {
-            if (engine == BabelConfig.EngineKind.GOOGLE_FREE && config.isAutoFallbackToCn() && !cancelled.isCancelled()) {
-                List<String> cnOut = translateViaBingCn(scopeKey, generation, items, targetLang, timeoutMs, cancelled);
-                recordOutputChars(cnOut);
-                return new BatchNetworkOutcome(cnOut, BabelConfig.EngineKind.BING_CN, true);
+            if (allowCnFailover && !cancelled.isCancelled()) {
+                if (isProdGoogle && isTransportError(ioe)) {
+                    googleUnreachableUntilMs = System.currentTimeMillis() + GOOGLE_CIRCUIT_BREAKER_MS;
+                }
+                return executeCnFailoverChain(scopeKey, generation, items, targetLang, timeoutMs, cancelled);
+            }
+            if (engine == BabelConfig.EngineKind.BING_CN && !cancelled.isCancelled()) {
+                try {
+                    List<String> ydOut = translateViaYoudaoCn(scopeKey, generation, items, targetLang, timeoutMs, cancelled);
+                    recordOutputChars(ydOut);
+                    return new BatchNetworkOutcome(ydOut, BabelConfig.EngineKind.YOUDAO_CN, true);
+                } catch (CancelledException ce) {
+                    throw ce;
+                } catch (IOException ignored) { }
             }
             throw ioe;
         }
+    }
+
+    private BatchNetworkOutcome executeCnFailoverChain(
+            String scopeKey,
+            long generation,
+            List<String> items,
+            String targetLang,
+            int timeoutMs,
+            CancellationCheck cancelled
+    ) throws IOException {
+        try {
+            List<String> cnOut = translateViaBingCn(scopeKey, generation, items, targetLang, timeoutMs, cancelled);
+            recordOutputChars(cnOut);
+            return new BatchNetworkOutcome(cnOut, BabelConfig.EngineKind.BING_CN, true);
+        } catch (CancelledException ce) {
+            throw ce;
+        } catch (IOException bingErr) {
+            if (!cancelled.isCancelled()) {
+                try {
+                    List<String> ydOut = translateViaYoudaoCn(scopeKey, generation, items, targetLang, timeoutMs, cancelled);
+                    recordOutputChars(ydOut);
+                    return new BatchNetworkOutcome(ydOut, BabelConfig.EngineKind.YOUDAO_CN, true);
+                } catch (CancelledException ce2) {
+                    throw ce2;
+                } catch (IOException ydErr) {
+                    throw new IOException("Google/必应/有道均失败：" + bingErr.getMessage(), bingErr);
+                }
+            }
+            throw bingErr;
+        }
+    }
+
+    private static boolean isTransportError(IOException ioe) {
+        Throwable t = ioe;
+        while (t != null) {
+            if (t instanceof java.net.SocketTimeoutException
+                    || t instanceof java.net.ConnectException
+                    || t instanceof java.net.UnknownHostException
+                    || t instanceof java.net.NoRouteToHostException
+                    || t instanceof javax.net.ssl.SSLException) {
+                return true;
+            }
+            t = t.getCause();
+        }
+        return false;
     }
 
     private void recordOutputChars(List<String> out) {
@@ -708,7 +886,7 @@ public final class BabelEngine {
         }
     }
 
-    // ---- Engine 1: Google Free Translate ----
+    // ---- Engine 1: Google Free Translate (clients5 native multi-q + dict-chrome-ex + at) ----
 
     private List<String> translateViaGoogleFree(
             String scopeKey,
@@ -719,23 +897,78 @@ public final class BabelEngine {
             CancellationCheck cancelled
     ) throws IOException {
         String gl = mapGoogleLang(targetLang);
-        if (items.size() == 1) {
-            String single = callGoogleOnce(scopeKey, generation, items.get(0), gl, timeoutMs, cancelled);
-            return Collections.singletonList(single);
+        boolean isDefaultProd = DEFAULT_GOOGLE_ENDPOINT.equals(googleEndpoint);
+        if (isDefaultProd) {
+            // 1. Primary: clients5.google.com/translate_a/t?client=dict-chrome-ex (native multi-q array, immune to gtx 429)
+            try {
+                List<String> c5 = callGoogleClients5Batch(scopeKey, generation, items, gl, timeoutMs, cancelled);
+                if (c5 != null && c5.size() == items.size()) return c5;
+            } catch (CancelledException ce) {
+                throw ce;
+            } catch (IOException ioe) {
+                // If network/TLS cannot reach Google at all, fail fast so CN failover kicks in immediately
+                if (isTransportError(ioe)) throw ioe;
+                // Otherwise (e.g. HTTP 429/403/parse quirk), fall through to translate.googleapis.com clients
+            }
         }
-        String joined = joinWithGoogleDelimiters(items);
-        String combined = callGoogleOnce(scopeKey, generation, joined, gl, timeoutMs, cancelled);
-        List<String> split = splitGoogleDelimited(combined, items.size());
-        if (split != null && split.size() == items.size()) {
-            return split;
-        }
-        // Delimiter mangled -> safe single-item fallback so alignment never breaks
-        List<String> fallback = new ArrayList<>(items.size());
-        for (String item : items) {
+
+        String[] clients = isDefaultProd ? new String[]{"dict-chrome-ex", "at"} : new String[]{"gtx"};
+        IOException lastErr = null;
+        for (String client : clients) {
             if (cancelled.isCancelled()) throw new CancelledException();
-            fallback.add(callGoogleOnce(scopeKey, generation, item, gl, timeoutMs, cancelled));
+            try {
+                if (items.size() == 1) {
+                    String single = callGoogleOnce(scopeKey, generation, items.get(0), gl, client, timeoutMs, cancelled);
+                    return Collections.singletonList(single);
+                }
+                String joined = joinWithGoogleDelimiters(items);
+                String combined = callGoogleOnce(scopeKey, generation, joined, gl, client, timeoutMs, cancelled);
+                List<String> split = splitGoogleDelimited(combined, items.size());
+                if (split != null && split.size() == items.size()) {
+                    return split;
+                }
+                List<String> fallback = new ArrayList<>(items.size());
+                for (String item : items) {
+                    if (cancelled.isCancelled()) throw new CancelledException();
+                    fallback.add(callGoogleOnce(scopeKey, generation, item, gl, client, timeoutMs, cancelled));
+                }
+                return fallback;
+            } catch (CancelledException ce) {
+                throw ce;
+            } catch (IOException ioe) {
+                lastErr = ioe;
+            }
         }
-        return fallback;
+        throw lastErr != null ? lastErr : new IOException("Google 翻译请求失败");
+    }
+
+    private List<String> callGoogleClients5Batch(
+            String scopeKey,
+            long generation,
+            List<String> items,
+            String googleLang,
+            int timeoutMs,
+            CancellationCheck cancelled
+    ) throws IOException {
+        statNetworkCalls.incrementAndGet();
+        String url = DEFAULT_GOOGLE_CLIENTS5_ENDPOINT + "?client=dict-chrome-ex&sl=auto&tl=" + urlEncode(googleLang);
+        StringBuilder form = new StringBuilder(256);
+        for (int i = 0; i < items.size(); i++) {
+            if (i > 0) form.append('&');
+            form.append("q=").append(urlEncode(items.get(i)));
+        }
+        Map<String, String> headers = new LinkedHashMap<>();
+        headers.put("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8");
+        headers.put("Accept", "application/json, text/plain, */*");
+        HttpResponse resp = executeHttp(scopeKey, generation, "POST", url, headers, form.toString(), timeoutMs, cancelled);
+        if (resp.code < 200 || resp.code >= 300) {
+            throw new IOException("Google clients5 返回 HTTP " + resp.code);
+        }
+        try {
+            return parseGoogleClients5Json(resp.body, items.size());
+        } catch (JSONException je) {
+            throw new IOException("Google clients5 响应解析失败", je);
+        }
     }
 
     private String callGoogleOnce(
@@ -743,13 +976,14 @@ public final class BabelEngine {
             long generation,
             String text,
             String googleLang,
+            String clientParam,
             int timeoutMs,
             CancellationCheck cancelled
     ) throws IOException {
         statNetworkCalls.incrementAndGet();
         String base = googleEndpoint;
         String sep = base.contains("?") ? "&" : "?";
-        String queryMeta = "client=gtx&sl=auto&tl=" + urlEncode(googleLang) + "&dt=t";
+        String queryMeta = "client=" + urlEncode(clientParam) + "&sl=auto&tl=" + urlEncode(googleLang) + "&dt=t";
         String encodedQ = urlEncode(text);
         HttpResponse resp;
         if (encodedQ.length() <= 1600) {
@@ -771,7 +1005,7 @@ public final class BabelEngine {
         }
     }
 
-    // ---- Engine 2: Bing CN Direct (Edge Free Token) ----
+    // ---- Engine 2: Bing CN Direct (cn.bing.com LLM-backed ttranslatev3 + test JWT mode) ----
 
     private List<String> translateViaBingCn(
             String scopeKey,
@@ -781,12 +1015,142 @@ public final class BabelEngine {
             int timeoutMs,
             CancellationCheck cancelled
     ) throws IOException {
+        boolean isDefaultProd = DEFAULT_BING_AUTH_ENDPOINT.equals(bingAuthEndpoint)
+                && DEFAULT_BING_TRANSLATE_ENDPOINT.equals(bingTranslateEndpoint);
+        if (isDefaultProd) {
+            return translateViaBingCnWeb(scopeKey, generation, items, targetLang, timeoutMs, cancelled);
+        }
         String token = obtainBingToken(scopeKey, generation, timeoutMs, cancelled, false);
         try {
             return callBingTranslate(scopeKey, generation, items, targetLang, token, timeoutMs, cancelled);
         } catch (BingAuthExpiredException expired) {
             String refreshed = obtainBingToken(scopeKey, generation, timeoutMs, cancelled, true);
             return callBingTranslate(scopeKey, generation, items, targetLang, refreshed, timeoutMs, cancelled);
+        }
+    }
+
+    private List<String> translateViaBingCnWeb(
+            String scopeKey,
+            long generation,
+            List<String> items,
+            String targetLang,
+            int timeoutMs,
+            CancellationCheck cancelled
+    ) throws IOException {
+        BingCnSession session = obtainBingCnSession(scopeKey, generation, timeoutMs, cancelled, false);
+        try {
+            return executeBingCnWebBatch(scopeKey, generation, session, items, targetLang, timeoutMs, cancelled);
+        } catch (BingAuthExpiredException expired) {
+            BingCnSession refreshed = obtainBingCnSession(scopeKey, generation, timeoutMs, cancelled, true);
+            return executeBingCnWebBatch(scopeKey, generation, refreshed, items, targetLang, timeoutMs, cancelled);
+        }
+    }
+
+    private BingCnSession obtainBingCnSession(
+            String scopeKey,
+            long generation,
+            int timeoutMs,
+            CancellationCheck cancelled,
+            boolean forceRefresh
+    ) throws IOException {
+        long now = System.currentTimeMillis();
+        BingCnSession existing = bingCnSession;
+        if (!forceRefresh && existing != null && now < existing.expiresAt) {
+            return existing;
+        }
+        synchronized (bingTokenLock) {
+            now = System.currentTimeMillis();
+            if (!forceRefresh && bingCnSession != null && now < bingCnSession.expiresAt) {
+                return bingCnSession;
+            }
+            Map<String, String> headers = new LinkedHashMap<>();
+            headers.put("Accept", "text/html,application/xhtml+xml");
+            headers.put("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8");
+            HttpResponse resp = executeHttp(
+                    scopeKey, generation, "GET", DEFAULT_BING_CN_PAGE, headers, null, timeoutMs, cancelled);
+            if (resp.code < 200 || resp.code >= 300 || resp.body.isEmpty()) {
+                throw new IOException("微软必应国内会话初始化失败 HTTP " + resp.code);
+            }
+            BingCnSession parsed = parseBingCnSessionHtml(resp.body, resp.cookies,
+                    System.currentTimeMillis() + BING_TOKEN_TTL_MS);
+            if (parsed == null) {
+                throw new IOException("微软必应会话令牌解析失败");
+            }
+            bingCnSession = parsed;
+            return parsed;
+        }
+    }
+
+    private List<String> executeBingCnWebBatch(
+            String scopeKey,
+            long generation,
+            BingCnSession session,
+            List<String> items,
+            String targetLang,
+            int timeoutMs,
+            CancellationCheck cancelled
+    ) throws IOException {
+        String bl = mapBingLang(targetLang);
+        if (items.size() == 1) {
+            String tr = callBingCnWebOnce(scopeKey, generation, session, items.get(0), bl, timeoutMs, cancelled);
+            return Collections.singletonList(tr);
+        }
+        String joined = joinWithGoogleDelimiters(items);
+        if (joined.length() <= 950) {
+            String combined = callBingCnWebOnce(scopeKey, generation, session, joined, bl, timeoutMs, cancelled);
+            List<String> split = splitGoogleDelimited(combined, items.size());
+            if (split != null && split.size() == items.size()) {
+                return split;
+            }
+        }
+        List<String> out = new ArrayList<>(items.size());
+        for (String item : items) {
+            if (cancelled.isCancelled()) throw new CancelledException();
+            out.add(callBingCnWebOnce(scopeKey, generation, session, item, bl, timeoutMs, cancelled));
+        }
+        return out;
+    }
+
+    private String callBingCnWebOnce(
+            String scopeKey,
+            long generation,
+            BingCnSession session,
+            String text,
+            String bingLang,
+            int timeoutMs,
+            CancellationCheck cancelled
+    ) throws IOException {
+        statNetworkCalls.incrementAndGet();
+        int seq = session.seq.getAndIncrement();
+        String url = DEFAULT_BING_CN_TRANSLATE + "?isVertical=1&IG=" + urlEncode(session.ig)
+                + "&IID=" + urlEncode(session.iid) + "." + seq;
+        String form = "&fromLang=auto-detect&text=" + urlEncode(text)
+                + "&to=" + urlEncode(bingLang)
+                + "&token=" + urlEncode(session.token)
+                + "&key=" + urlEncode(session.key);
+        Map<String, String> headers = new LinkedHashMap<>();
+        headers.put("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8");
+        headers.put("Referer", DEFAULT_BING_CN_PAGE);
+        headers.put("Origin", "https://cn.bing.com");
+        if (!session.cookie.isEmpty()) {
+            headers.put("Cookie", session.cookie);
+        }
+        HttpResponse resp = executeHttp(scopeKey, generation, "POST", url, headers, form, timeoutMs, cancelled);
+        if (resp.code == 401 || resp.code == 403 || resp.code == 429) {
+            throw new BingAuthExpiredException("Bing CN session expired: HTTP " + resp.code);
+        }
+        if (resp.code < 200 || resp.code >= 300) {
+            throw new IOException("微软必应国内翻译返回 HTTP " + resp.code);
+        }
+        String trimmed = resp.body.trim();
+        if (trimmed.isEmpty() || trimmed.startsWith("{\"statusCode\":") || trimmed.contains("\"ShowCaptcha\"")) {
+            throw new BingAuthExpiredException("Bing CN session challenged/expired");
+        }
+        try {
+            List<String> parsed = parseBingTranslateJson(trimmed, 1);
+            return parsed.isEmpty() ? "" : parsed.get(0);
+        } catch (JSONException je) {
+            throw new IOException("微软必应国内响应解析失败", je);
         }
     }
 
@@ -862,7 +1226,7 @@ public final class BabelEngine {
         }
     }
 
-    // ---- Engine 3: Youdao CN Direct Backup ----
+    // ---- Engine 3: Youdao Mobile CN Direct (+ MyMemory Backup) ----
 
     private List<String> translateViaYoudaoCn(
             String scopeKey,
@@ -872,29 +1236,120 @@ public final class BabelEngine {
             int timeoutMs,
             CancellationCheck cancelled
     ) throws IOException {
+        boolean isDefaultProd = DEFAULT_YOUDAO_ENDPOINT.equals(youdaoEndpoint);
         String ydType = mapYoudaoType(targetLang);
         List<String> out = new ArrayList<>(items.size());
         for (String item : items) {
             if (cancelled.isCancelled()) throw new CancelledException();
             statNetworkCalls.incrementAndGet();
-            String sep = youdaoEndpoint.contains("?") ? "&" : "?";
-            String url = youdaoEndpoint + sep + "doctype=json&type=" + urlEncode(ydType);
-            Map<String, String> headers = new LinkedHashMap<>();
-            headers.put("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8");
-            headers.put("Referer", "https://fanyi.youdao.com/");
-            String form = "i=" + urlEncode(item);
-            HttpResponse resp = executeHttp(scopeKey, generation, "POST", url, headers, form, timeoutMs, cancelled);
-            if (resp.code < 200 || resp.code >= 300) {
-                throw new IOException("有道翻译返回 HTTP " + resp.code);
-            }
-            try {
-                String parsed = parseYoudaoJson(resp.body);
-                out.add(parsed);
-            } catch (JSONException je) {
-                throw new IOException("有道翻译响应解析失败", je);
+            if (isDefaultProd) {
+                try {
+                    Map<String, String> headers = new LinkedHashMap<>();
+                    headers.put("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8");
+                    headers.put("Referer", DEFAULT_YOUDAO_ENDPOINT);
+                    String form = "inputtext=" + urlEncode(item) + "&type=" + urlEncode(ydType);
+                    HttpResponse resp = executeHttp(scopeKey, generation, "POST", DEFAULT_YOUDAO_ENDPOINT, headers, form, timeoutMs, cancelled);
+                    if (resp.code >= 200 && resp.code < 300) {
+                        String parsed = parseYoudaoMobileHtml(resp.body);
+                        if (!parsed.isEmpty()) {
+                            out.add(parsed);
+                            continue;
+                        }
+                    }
+                } catch (CancelledException ce) {
+                    throw ce;
+                } catch (IOException ignored) { }
+                // Fallback to Bing CN LLM first (CN-direct, 5000-char limit), then chunked MyMemory last resort
+                String fallbackOut = null;
+                try {
+                    List<String> bingSingle = translateViaBingCn(
+                            scopeKey, generation, Collections.singletonList(item), targetLang, timeoutMs, cancelled);
+                    if (!bingSingle.isEmpty() && !bingSingle.get(0).isEmpty()) {
+                        fallbackOut = bingSingle.get(0);
+                    }
+                } catch (CancelledException ce) {
+                    throw ce;
+                } catch (IOException ignored) { }
+                if (fallbackOut != null) {
+                    out.add(fallbackOut);
+                } else {
+                    out.add(callMyMemoryChunked(scopeKey, generation, item, targetLang, timeoutMs, cancelled));
+                }
+            } else {
+                String sep = youdaoEndpoint.contains("?") ? "&" : "?";
+                String url = youdaoEndpoint + sep + "doctype=json&type=" + urlEncode(ydType);
+                Map<String, String> headers = new LinkedHashMap<>();
+                headers.put("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8");
+                headers.put("Referer", "https://fanyi.youdao.com/");
+                String form = "i=" + urlEncode(item);
+                HttpResponse resp = executeHttp(scopeKey, generation, "POST", url, headers, form, timeoutMs, cancelled);
+                if (resp.code < 200 || resp.code >= 300) {
+                    throw new IOException("有道翻译返回 HTTP " + resp.code);
+                }
+                try {
+                    String parsed = parseYoudaoJson(resp.body);
+                    out.add(parsed);
+                } catch (JSONException je) {
+                    throw new IOException("有道翻译响应解析失败", je);
+                }
             }
         }
         return out;
+    }
+
+    private String callMyMemoryChunked(
+            String scopeKey,
+            long generation,
+            String text,
+            String targetLang,
+            int timeoutMs,
+            CancellationCheck cancelled
+    ) throws IOException {
+        if (text.length() <= 450) {
+            return callMyMemoryOnce(scopeKey, generation, text, targetLang, timeoutMs, cancelled);
+        }
+        StringBuilder sb = new StringBuilder(text.length());
+        int pos = 0;
+        int len = text.length();
+        while (pos < len) {
+            if (cancelled.isCancelled()) throw new CancelledException();
+            int end = Math.min(len, pos + 440);
+            if (end < len) {
+                int cut = Math.max(text.lastIndexOf(". ", end), Math.max(text.lastIndexOf('\n', end), text.lastIndexOf(' ', end)));
+                if (cut > pos + 120) end = cut + 1;
+            }
+            String part = text.substring(pos, end).trim();
+            if (!part.isEmpty()) {
+                if (sb.length() > 0) sb.append(' ');
+                sb.append(callMyMemoryOnce(scopeKey, generation, part, targetLang, timeoutMs, cancelled));
+            }
+            pos = end;
+        }
+        return sb.toString();
+    }
+
+    private String callMyMemoryOnce(
+            String scopeKey,
+            long generation,
+            String text,
+            String targetLang,
+            int timeoutMs,
+            CancellationCheck cancelled
+    ) throws IOException {
+        String tl = BabelConfig.normalizeLang(targetLang, "zh-CN");
+        String sl = "en".equals(tl) ? "zh-CN" : "en";
+        String url = DEFAULT_MYMEMORY_ENDPOINT + "?q=" + urlEncode(text) + "&langpair=" + urlEncode(sl + "|" + tl);
+        HttpResponse resp = executeHttp(scopeKey, generation, "GET", url, null, null, timeoutMs, cancelled);
+        if (resp.code < 200 || resp.code >= 300) {
+            throw new IOException("备用翻译返回 HTTP " + resp.code);
+        }
+        try {
+            String parsed = parseMyMemoryJson(resp.body);
+            if (parsed.isEmpty()) throw new IOException("备用翻译返回空内容或触发限额");
+            return parsed;
+        } catch (JSONException je) {
+            throw new IOException("备用翻译响应解析失败", je);
+        }
     }
 
     // ---- Engine 4: Custom AI API (OpenAI-Compatible & Gemini) ----
@@ -1131,8 +1586,11 @@ public final class BabelEngine {
             if (cancelled != null && cancelled.isCancelled()) throw new CancelledException();
 
             conn.setRequestMethod(method);
-            conn.setConnectTimeout(Math.max(3000, Math.min(timeoutMs, 20000)));
-            conn.setReadTimeout(Math.max(4000, timeoutMs));
+            int connectMs = timeoutMs <= 5000
+                    ? Math.max(2000, Math.min(timeoutMs, 2600))
+                    : Math.max(3000, Math.min(timeoutMs, 15000));
+            conn.setConnectTimeout(connectMs);
+            conn.setReadTimeout(Math.max(3000, timeoutMs));
             conn.setInstanceFollowRedirects(true);
             conn.setRequestProperty("User-Agent", USER_AGENT);
             conn.setRequestProperty("Accept-Charset", "UTF-8");
@@ -1151,9 +1609,10 @@ public final class BabelEngine {
             }
             int code = conn.getResponseCode();
             if (cancelled != null && cancelled.isCancelled()) throw new CancelledException();
+            String cookies = extractResponseCookies(conn);
             InputStream stream = (code >= 200 && code < 400) ? conn.getInputStream() : conn.getErrorStream();
             String respBody = stream == null ? "" : readBoundedUtf8(stream, MAX_RESPONSE_BYTES);
-            return new HttpResponse(code, respBody);
+            return new HttpResponse(code, respBody, cookies);
         } catch (IOException ioe) {
             if (cancelled != null && cancelled.isCancelled()) throw new CancelledException();
             throw ioe;
@@ -1163,6 +1622,26 @@ public final class BabelEngine {
                 try { conn.disconnect(); } catch (RuntimeException ignored) { }
             }
         }
+    }
+
+    private static String extractResponseCookies(HttpURLConnection conn) {
+        Map<String, List<String>> hdrs = conn.getHeaderFields();
+        if (hdrs == null || hdrs.isEmpty()) return "";
+        StringBuilder sb = new StringBuilder();
+        for (Map.Entry<String, List<String>> e : hdrs.entrySet()) {
+            if (e.getKey() == null || !"Set-Cookie".equalsIgnoreCase(e.getKey())) continue;
+            List<String> vals = e.getValue();
+            if (vals == null) continue;
+            for (String raw : vals) {
+                if (raw == null || raw.isEmpty()) continue;
+                int semi = raw.indexOf(';');
+                String pair = (semi >= 0 ? raw.substring(0, semi) : raw).trim();
+                if (pair.isEmpty()) continue;
+                if (sb.length() > 0) sb.append("; ");
+                sb.append(pair);
+            }
+        }
+        return sb.toString();
     }
 
     private static String readBoundedUtf8(InputStream in, int maxBytes) throws IOException {
@@ -1338,6 +1817,90 @@ public final class BabelEngine {
             }
         }
         return sb.toString();
+    }
+
+    /** Parses clients5.google.com/translate_a/t JSON response (supports both [[text,lang],...] and [text,...]). */
+    public static List<String> parseGoogleClients5Json(String json, int expectedCount) throws JSONException {
+        JSONArray root = new JSONArray(json);
+        List<String> out = new ArrayList<>(Math.max(expectedCount, root.length()));
+        for (int i = 0; i < root.length(); i++) {
+            Object item = root.opt(i);
+            if (item instanceof JSONArray) {
+                JSONArray pair = (JSONArray) item;
+                out.add(pair.length() > 0 && !pair.isNull(0) ? pair.optString(0, "").trim() : "");
+            } else if (item instanceof String) {
+                out.add(((String) item).trim());
+            } else {
+                out.add("");
+            }
+        }
+        return out;
+    }
+
+    /** Parses IG, IID, and params_AbusePreventionHelper [key, token] from cn.bing.com/translator HTML. */
+    static BingCnSession parseBingCnSessionHtml(String html, String cookies, long expiresAt) {
+        if (html == null || html.isEmpty()) return null;
+        Matcher mIg = BING_IG_PATTERN.matcher(html);
+        Matcher mAbuse = BING_ABUSE_PATTERN.matcher(html);
+        if (!mIg.find() || !mAbuse.find()) return null;
+        Matcher mIid = BING_IID_PATTERN.matcher(html);
+        String iid = mIid.find() ? mIid.group(1) : "translator.5026";
+        String ig = mIg.group(1);
+        String key = mAbuse.group(1);
+        String token = mAbuse.group(2);
+        if (ig.isEmpty() || key.isEmpty() || token.isEmpty()) return null;
+        return new BingCnSession(ig, iid, key, token, cookies, expiresAt);
+    }
+
+    /** Parses m.youdao.com/translate HTML result cleanly without external HTML parser deps. */
+    public static String parseYoudaoMobileHtml(String html) {
+        if (html == null || html.isEmpty()) return "";
+        Matcher ul = YOUDAO_MOBILE_UL_PATTERN.matcher(html);
+        if (!ul.find()) return "";
+        Matcher li = HTML_LI_PATTERN.matcher(ul.group(1));
+        StringBuilder sb = new StringBuilder();
+        while (li.find()) {
+            String text = HTML_TAG_PATTERN.matcher(li.group(1)).replaceAll("");
+            text = unescapeBasicHtml(text).trim();
+            if (text.isEmpty()) continue;
+            if (sb.length() > 0) sb.append('\n');
+            sb.append(text);
+        }
+        return sb.toString().trim();
+    }
+
+    public static String parseMyMemoryJson(String json) throws JSONException {
+        JSONObject root = new JSONObject(json);
+        int status = root.optInt("responseStatus", 200);
+        if (status != 200) return "";
+        JSONObject data = root.optJSONObject("responseData");
+        if (data == null) return "";
+        String txt = unescapeBasicHtml(data.optString("translatedText", "")).trim();
+        if (txt.isEmpty()) return "";
+        String upper = txt.toUpperCase(Locale.ROOT);
+        if (upper.contains("QUERY LENGTH LIMIT EXCEEDED")
+                || upper.startsWith("MYMEMORY WARNING")
+                || upper.contains("PLEASE SELECT TWO DISTINCT LANGUAGES")) {
+            return "";
+        }
+        return txt;
+    }
+
+    private static String unescapeBasicHtml(String s) {
+        if (s == null || s.isEmpty() || s.indexOf('&') < 0) return s == null ? "" : s;
+        String out = s;
+        for (int pass = 0; pass < 2 && out.indexOf('&') >= 0; pass++) {
+            out = out.replace("&quot;", "\"")
+                    .replace("&#34;", "\"")
+                    .replace("&#39;", "'")
+                    .replace("&#x27;", "'")
+                    .replace("&apos;", "'")
+                    .replace("&lt;", "<")
+                    .replace("&gt;", ">")
+                    .replace("&nbsp;", " ")
+                    .replace("&amp;", "&");
+        }
+        return out;
     }
 
     public static List<String> parseBingTranslateJson(String json, int expectedCount) throws JSONException {

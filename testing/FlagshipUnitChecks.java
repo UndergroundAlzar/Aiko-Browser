@@ -15,6 +15,7 @@ import java.lang.reflect.Proxy;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -50,6 +51,7 @@ public final class FlagshipUnitChecks {
         checkChromeLayoutEngine();
         checkFilterRulesBinaryRoundTrip(args.length > 0 ? Path.of(args[0]) : null);
         checkBrowserLibrary();
+        checkMenuConfig();
     }
 
     private static void checkHttpUrlUtil() {
@@ -264,16 +266,22 @@ public final class FlagshipUnitChecks {
     }
 
     private static void checkAikoThemePalette() {
-        // Verify all built-in curated presets & OLED mode
-        String[] presets = {
-                AikoTheme.MODE_OBSIDIAN, AikoTheme.MODE_EMERALD, AikoTheme.MODE_SAKURA,
-                AikoTheme.MODE_AMBER, AikoTheme.MODE_VIOLET, AikoTheme.MODE_OLED
-        };
-        for (String mode : presets) {
+        // Verify ALL 18 theme modes (4 Iconic + 6 Luxury + 8 Classic/Dynamic/OLED/Custom)
+        check(AikoTheme.ALL_MODES.length == 18, "expected 18 theme modes, got " + AikoTheme.ALL_MODES.length);
+        check(AikoTheme.ICONIC_MODES.length + AikoTheme.LUXURY_MODES.length + AikoTheme.CLASSIC_MODES.length
+                == AikoTheme.ALL_MODES.length, "theme groups partition ALL_MODES cleanly");
+        for (String mode : AikoTheme.ALL_MODES) {
             AikoTheme.Palette p = AikoTheme.Palette.preset(mode);
             verifyPaletteContrast(p, "preset:" + mode);
+            check(!AikoTheme.modeLabel(mode).isEmpty(), "non-empty modeLabel for " + mode);
+            check(!AikoTheme.modeShortLabel(mode).isEmpty(), "non-empty modeShortLabel for " + mode);
+            check(!AikoTheme.modeDescription(null, mode).isEmpty(), "non-empty modeDescription for " + mode);
+            check((AikoTheme.modePreviewColor(null, mode) >>> 24) == 0xFF, "opaque preview color for " + mode);
         }
         check(AikoTheme.Palette.OLED.bg == 0xFF000000, "OLED preset has true #000000 canvas");
+        check(AikoTheme.modePreviewColor(null, AikoTheme.MODE_MIKU) == 0xFF39C5BB, "Miku Teal exact signature #39C5BB");
+        AikoTheme.Palette miku = AikoTheme.Palette.preset(AikoTheme.MODE_MIKU);
+        check(AikoTheme.Palette.contrastRatio(miku.accent, miku.card) >= 5.0, "Miku Teal accent contrast >= 5.0:1");
 
         // Full 360-degree hue sweep across multiple surface tints (including extreme 0.0 and 1.5)
         float[] tints = {0.0f, 0.5f, 1.0f, 1.5f, Float.NaN, -1.0f, 5.0f};
@@ -640,6 +648,55 @@ public final class FlagshipUnitChecks {
         check(foundTitle, "HTML tags stripped & entities unescaped in imported title");
         check(reopened.isPinned("https://janitorai.com/?a=1&b=2"), "reopened preserves Speed Dial pin");
         System.out.println("PASS BrowserLibrary legacy compat, search, Speed Dial pins, and Netscape HTML import/export");
+    }
+
+    private static void checkMenuConfig() {
+        Map<String, String> store = new ConcurrentHashMap<>();
+        SharedPreferences prefs = (SharedPreferences) Proxy.newProxyInstance(
+                SharedPreferences.class.getClassLoader(), new Class<?>[]{SharedPreferences.class},
+                (proxy, method, values) -> {
+                    String name = method.getName();
+                    if ("getString".equals(name)) return store.getOrDefault(values[0], (String) values[1]);
+                    if ("edit".equals(name)) {
+                        return Proxy.newProxyInstance(SharedPreferences.Editor.class.getClassLoader(),
+                                new Class<?>[]{SharedPreferences.Editor.class}, (editor, action, params) -> {
+                                    if ("putString".equals(action.getName())) {
+                                        store.put((String) params[0], (String) params[1]);
+                                    }
+                                    return editor;
+                                });
+                    }
+                    return null;
+                });
+
+        MenuConfig cfg = new MenuConfig(prefs);
+        check(cfg.getPrimaryActions().equals(MenuConfig.DEFAULT_PRIMARY), "default 1st-tier equals DEFAULT_PRIMARY");
+        check(cfg.getPrimaryActions().size() == 6, "crisp 6-item default 1st-tier");
+        check(cfg.getPrimaryActions().size() + cfg.getSecondaryActions().size() == MenuConfig.ActionId.values().length,
+                "primary + secondary partitions all 22 actions");
+
+        // Toggle add, reorder, reload persistence
+        check(cfg.togglePrimary(MenuConfig.ActionId.GALLERY), "pin GALLERY to 1st-tier");
+        check(cfg.isPrimary(MenuConfig.ActionId.GALLERY), "GALLERY now primary");
+        check(cfg.movePrimary(MenuConfig.ActionId.GALLERY, -1), "move GALLERY up");
+        int idxAfter = cfg.getPrimaryActions().indexOf(MenuConfig.ActionId.GALLERY);
+        check(idxAfter == 5, "GALLERY moved to index 5, got " + idxAfter);
+
+        MenuConfig reloaded = new MenuConfig(prefs);
+        check(reloaded.getPrimaryActions().equals(cfg.getPrimaryActions()), "MenuConfig persisted round-trip");
+
+        // Min-2 guard & resetDefaults
+        List<MenuConfig.ActionId> cur = new ArrayList<>(reloaded.getPrimaryActions());
+        for (MenuConfig.ActionId a : cur) reloaded.togglePrimary(a);
+        check(reloaded.getPrimaryActions().size() == 2, "min-2 primary guard holds");
+        reloaded.resetDefaults();
+        check(reloaded.getPrimaryActions().equals(MenuConfig.DEFAULT_PRIMARY), "resetDefaults restores 6 items");
+
+        // Decode deduplication & invalid id resilience
+        List<MenuConfig.ActionId> decoded = MenuConfig.decodeIds("[\"babel\",\"babel\",\"unknown\",\"gallery\"]");
+        check(decoded.size() == 2 && decoded.get(0) == MenuConfig.ActionId.BABEL
+                && decoded.get(1) == MenuConfig.ActionId.GALLERY, "decodeIds deduplicates & ignores unknown");
+        System.out.println("PASS MenuConfig 2-tier partitioning, toggle/reorder/min-2 guard, and persistence");
     }
 
     private static Reader gzip(Path folder, String id) throws Exception {

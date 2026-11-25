@@ -40,11 +40,38 @@ final class AikoTheme {
     static final String MODE_AMBER = "amber";
     static final String MODE_VIOLET = "violet";
     static final String MODE_OLED = "oled";
+    static final String MODE_MIKU = "miku";
+    static final String MODE_AIKO_CRIMSON = "aiko_crimson";
+    static final String MODE_TIFFANY = "tiffany";
+    static final String MODE_HERMES = "hermes";
+    static final String MODE_KLEIN = "klein";
+    static final String MODE_MARRS = "marrs";
+    static final String MODE_TITANIUM = "titanium";
+    static final String MODE_MORANDI = "morandi";
+    static final String MODE_BURGUNDY = "burgundy";
+    static final String MODE_CELADON = "celadon";
     static final String MODE_CUSTOM = "custom";
 
+    static final String[] CLASSIC_MODES = {
+            MODE_OBSIDIAN, MODE_DYNAMIC, MODE_OLED, MODE_EMERALD,
+            MODE_SAKURA, MODE_AMBER, MODE_VIOLET, MODE_CUSTOM
+    };
+
+    static final String[] ICONIC_MODES = {
+            MODE_MIKU, MODE_AIKO_CRIMSON, MODE_TIFFANY, MODE_HERMES
+    };
+
+    static final String[] LUXURY_MODES = {
+            MODE_KLEIN, MODE_MARRS, MODE_TITANIUM, MODE_MORANDI,
+            MODE_BURGUNDY, MODE_CELADON
+    };
+
     static final String[] ALL_MODES = {
-            MODE_OBSIDIAN, MODE_DYNAMIC, MODE_EMERALD, MODE_SAKURA,
-            MODE_AMBER, MODE_VIOLET, MODE_OLED, MODE_CUSTOM
+            MODE_OBSIDIAN, MODE_DYNAMIC, MODE_OLED, MODE_MIKU,
+            MODE_AIKO_CRIMSON, MODE_TIFFANY, MODE_HERMES, MODE_KLEIN,
+            MODE_MARRS, MODE_TITANIUM, MODE_MORANDI, MODE_BURGUNDY,
+            MODE_CELADON, MODE_EMERALD, MODE_SAKURA, MODE_AMBER,
+            MODE_VIOLET, MODE_CUSTOM
     };
 
     static final int SEED_OBSIDIAN = 0xFF7C9BFF;
@@ -53,6 +80,16 @@ final class AikoTheme {
     static final int SEED_AMBER = 0xFFFB923C;
     static final int SEED_VIOLET = 0xFFA78BFA;
     static final int SEED_OLED = 0xFFE2E8F0;
+    static final int SEED_MIKU = 0xFF39C5BB;
+    static final int SEED_AIKO_CRIMSON = 0xFFE84F79;
+    static final int SEED_TIFFANY = 0xFF81D8D0;
+    static final int SEED_HERMES = 0xFFF37021;
+    static final int SEED_KLEIN = 0xFF4D7CFF;
+    static final int SEED_MARRS = 0xFF18B5AE;
+    static final int SEED_TITANIUM = 0xFFD4AF7A;
+    static final int SEED_MORANDI = 0xFF8CA6BE;
+    static final int SEED_BURGUNDY = 0xFFD65A7A;
+    static final int SEED_CELADON = 0xFF7EC8A6;
 
     // Live dynamic palette tokens (Obsidian Indigo defaults at class init for zero-config callers)
     static int BG = 0xFF0B0D12;             // Deep tinted obsidian canvas
@@ -265,6 +302,16 @@ final class AikoTheme {
             if (MODE_SAKURA.equals(mode)) return derive(SEED_SAKURA, 1.0f, false);
             if (MODE_AMBER.equals(mode)) return derive(SEED_AMBER, 1.0f, false);
             if (MODE_VIOLET.equals(mode)) return derive(SEED_VIOLET, 1.0f, false);
+            if (MODE_MIKU.equals(mode)) return derive(SEED_MIKU, 1.05f, false);
+            if (MODE_AIKO_CRIMSON.equals(mode)) return derive(SEED_AIKO_CRIMSON, 0.95f, false);
+            if (MODE_TIFFANY.equals(mode)) return derive(SEED_TIFFANY, 0.92f, false);
+            if (MODE_HERMES.equals(mode)) return derive(SEED_HERMES, 0.90f, false);
+            if (MODE_KLEIN.equals(mode)) return derive(SEED_KLEIN, 1.08f, false);
+            if (MODE_MARRS.equals(mode)) return derive(SEED_MARRS, 1.0f, false);
+            if (MODE_TITANIUM.equals(mode)) return derive(SEED_TITANIUM, 0.72f, false);
+            if (MODE_MORANDI.equals(mode)) return derive(SEED_MORANDI, 0.78f, false);
+            if (MODE_BURGUNDY.equals(mode)) return derive(SEED_BURGUNDY, 0.88f, false);
+            if (MODE_CELADON.equals(mode)) return derive(SEED_CELADON, 0.85f, false);
             return OBSIDIAN;
         }
 
@@ -493,6 +540,16 @@ final class AikoTheme {
         if (MODE_AMBER.equals(mode)) return "熔岩琥珀";
         if (MODE_VIOLET.equals(mode)) return "极光紫罗兰";
         if (MODE_OLED.equals(mode)) return "纯黑 OLED 极简";
+        if (MODE_MIKU.equals(mode)) return "初音未来绿 · Miku";
+        if (MODE_AIKO_CRIMSON.equals(mode)) return "Aiko 绯红 · Crimson";
+        if (MODE_TIFFANY.equals(mode)) return "蒂芙尼蓝 · Tiffany";
+        if (MODE_HERMES.equals(mode)) return "爱马仕橙 · Hermès";
+        if (MODE_KLEIN.equals(mode)) return "克莱因蓝 · Klein";
+        if (MODE_MARRS.equals(mode)) return "马尔斯绿 · Marrs";
+        if (MODE_TITANIUM.equals(mode)) return "香槟钛金 · Titanium";
+        if (MODE_MORANDI.equals(mode)) return "莫兰迪雾蓝 · Morandi";
+        if (MODE_BURGUNDY.equals(mode)) return "勃艮第酒红 · Burgundy";
+        if (MODE_CELADON.equals(mode)) return "宋瓷天青 · Celadon";
         if (MODE_CUSTOM.equals(mode)) return "自定义调色";
         return "黑曜靛蓝";
     }
@@ -504,6 +561,16 @@ final class AikoTheme {
         if (MODE_AMBER.equals(mode)) return "熔岩琥珀";
         if (MODE_VIOLET.equals(mode)) return "极光紫罗兰";
         if (MODE_OLED.equals(mode)) return "纯黑 OLED";
+        if (MODE_MIKU.equals(mode)) return "初音未来绿";
+        if (MODE_AIKO_CRIMSON.equals(mode)) return "Aiko 绯红";
+        if (MODE_TIFFANY.equals(mode)) return "蒂芙尼蓝";
+        if (MODE_HERMES.equals(mode)) return "爱马仕橙";
+        if (MODE_KLEIN.equals(mode)) return "克莱因蓝";
+        if (MODE_MARRS.equals(mode)) return "马尔斯绿";
+        if (MODE_TITANIUM.equals(mode)) return "香槟钛金";
+        if (MODE_MORANDI.equals(mode)) return "莫兰迪雾蓝";
+        if (MODE_BURGUNDY.equals(mode)) return "勃艮第酒红";
+        if (MODE_CELADON.equals(mode)) return "宋瓷天青";
         if (MODE_CUSTOM.equals(mode)) return "自定义";
         return "黑曜靛蓝";
     }
@@ -517,6 +584,16 @@ final class AikoTheme {
         if (MODE_AMBER.equals(mode)) return "熔岩琥珀金 · 温暖明快";
         if (MODE_VIOLET.equals(mode)) return "极光紫罗兰 · 深邃灵动";
         if (MODE_OLED.equals(mode)) return "纯黑 #000000 画布 · 极简省电";
+        if (MODE_MIKU.equals(mode)) return "#39C5BB · 经典苍绿清透";
+        if (MODE_AIKO_CRIMSON.equals(mode)) return "#E84F79 · Aiko 宝石缎带红";
+        if (MODE_TIFFANY.equals(mode)) return "#81D8D0 · 经典高雅知更鸟蓝";
+        if (MODE_HERMES.equals(mode)) return "#F37021 · 典藏暖橘高级质感";
+        if (MODE_KLEIN.equals(mode)) return "#4D7CFF · 艺术馆电光钴蓝";
+        if (MODE_MARRS.equals(mode)) return "#18B5AE · 公认高级蓝绿调";
+        if (MODE_TITANIUM.equals(mode)) return "#D4AF7A · 沙漠拉丝钛金属";
+        if (MODE_MORANDI.equals(mode)) return "#8CA6BE · 低饱和耐看雾蓝";
+        if (MODE_BURGUNDY.equals(mode)) return "#D65A7A · 深邃醇厚丝绒酒红";
+        if (MODE_CELADON.equals(mode)) return "#7EC8A6 · 东方青瓷温润玉色";
         if (MODE_CUSTOM.equals(mode)) return "色相 / 饱和度 / 底色浸染自由定制";
         return "旗舰默认 · 深邃黑曜靛蓝";
     }
@@ -528,6 +605,16 @@ final class AikoTheme {
         if (MODE_AMBER.equals(mode)) return SEED_AMBER;
         if (MODE_VIOLET.equals(mode)) return SEED_VIOLET;
         if (MODE_OLED.equals(mode)) return SEED_OLED;
+        if (MODE_MIKU.equals(mode)) return SEED_MIKU;
+        if (MODE_AIKO_CRIMSON.equals(mode)) return SEED_AIKO_CRIMSON;
+        if (MODE_TIFFANY.equals(mode)) return SEED_TIFFANY;
+        if (MODE_HERMES.equals(mode)) return SEED_HERMES;
+        if (MODE_KLEIN.equals(mode)) return SEED_KLEIN;
+        if (MODE_MARRS.equals(mode)) return SEED_MARRS;
+        if (MODE_TITANIUM.equals(mode)) return SEED_TITANIUM;
+        if (MODE_MORANDI.equals(mode)) return SEED_MORANDI;
+        if (MODE_BURGUNDY.equals(mode)) return SEED_BURGUNDY;
+        if (MODE_CELADON.equals(mode)) return SEED_CELADON;
         if (MODE_CUSTOM.equals(mode)) return loadCustomSeed(ctx);
         return SEED_OBSIDIAN;
     }
@@ -827,5 +914,18 @@ final class AikoTheme {
         attachPressFeedback(tile, 0.96f);
         tile.setOnClickListener(v -> onClick.run());
         return tile;
+    }
+
+    /** ScrollView that wraps short content snugly (zero dead blank space) while capping tall sheets at maxHeightPx. */
+    static android.widget.ScrollView maxHeightScrollView(Context ctx, int maxHeightPx) {
+        android.widget.ScrollView sv = new android.widget.ScrollView(ctx) {
+            @Override
+            protected void onMeasure(int widthMeasureSpec, int heightMeasureSpec) {
+                int capped = View.MeasureSpec.makeMeasureSpec(maxHeightPx, View.MeasureSpec.AT_MOST);
+                super.onMeasure(widthMeasureSpec, capped);
+            }
+        };
+        sv.setVerticalScrollBarEnabled(false);
+        return sv;
     }
 }

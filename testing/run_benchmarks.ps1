@@ -89,6 +89,7 @@ try {
     $themeSrc = Join-Path $src 'AikoTheme.java'
     $iconSrc = Join-Path $src 'BrowserIcon.java'
     $gestureSrc = Join-Path $src 'GestureChrome.java'
+    $menuCfgSrc = Join-Path $src 'MenuConfig.java'
     $parentDir = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..\..')).Path
     $androidJar = Join-Path $ToolchainRoot 'platform-36_r02/android-36/android.jar'
     $jsonJar = Join-Path $parentDir 'work/aiko-test-json.jar'
@@ -101,8 +102,12 @@ try {
         $flagshipClasses = Join-Path $ClassesDir 'flagship'
         New-Item -ItemType Directory -Path $flagshipClasses -Force | Out-Null
         $flagCp = "$ClassesDir;$jsonJar;$androidJar"
+        $flagshipSources = [System.Collections.Generic.List[string]]@(
+            $catalogSrc, $displaySrc, $perfSrc, $libSrc, $themeSrc, $iconSrc, $gestureSrc, $flagshipTest
+        )
+        if (Test-Path -LiteralPath $menuCfgSrc) { $flagshipSources.Add($menuCfgSrc) }
         Run-Timed "javac FlagshipUnitChecks" {
-            & $javac -encoding UTF-8 -cp $flagCp -d $flagshipClasses $catalogSrc $displaySrc $perfSrc $libSrc $themeSrc $iconSrc $gestureSrc $flagshipTest
+            & $javac -encoding UTF-8 -cp $flagCp -d $flagshipClasses @flagshipSources
         }
         Run-Timed "FlagshipUnitChecks" {
             & $java -cp "$flagshipClasses;$flagCp" app.aikobrowser.FlagshipUnitChecks (Join-Path $RepoRoot 'app/src/main/assets/filters')

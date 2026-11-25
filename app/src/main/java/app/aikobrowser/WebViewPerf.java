@@ -16,9 +16,13 @@ import android.webkit.WebViewRenderProcess;
 import android.webkit.WebViewRenderProcessClient;
 
 import androidx.webkit.BackForwardCacheSettings;
+import androidx.webkit.HttpCache;
 import androidx.webkit.PrefetchException;
 import androidx.webkit.Profile;
 import androidx.webkit.ProfileStore;
+import androidx.webkit.ServiceWorkerClientCompat;
+import androidx.webkit.ServiceWorkerControllerCompat;
+import androidx.webkit.SpeculativeLoadingConfig;
 import androidx.webkit.WebSettingsCompat;
 import androidx.webkit.WebViewCompat;
 import androidx.webkit.WebViewFeature;
@@ -32,14 +36,19 @@ import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * AndroidX WebKit 1.18.0 flagship performance pipeline:
@@ -102,6 +111,18 @@ public final class WebViewPerf {
     private static boolean starting;
     private static volatile boolean usedAsyncStartup;
     private static volatile Long startupUiMs;
+    private static volatile boolean quicHintsActive;
+    private static volatile boolean speculativeConfigActive;
+    private static volatile boolean serviceWorkerFilterActive;
+    private static volatile long httpCacheQuotaMb;
+    private static final AtomicLong SW_BLOCKED_COUNT = new AtomicLong();
+
+    private static final Set<String> BASE_QUIC_HOSTS = Collections.unmodifiableSet(new LinkedHashSet<>(Arrays.asList(
+            "www.google.com", "clients5.google.com", "translate.googleapis.com",
+            "www.youtube.com", "github.com", "www.cloudflare.com",
+            "www.bilibili.com", "zh.wikipedia.org", "linux.do",
+            "greasyfork.org", "go.itab.link", "janitorai.com"
+    )));
 
     // UI-thread-only origin/URL dedup ring buffers (zero allocation on hot path).
     private static final String[] recentOrigins = new String[RECENT_ORIGINS_CAP];
@@ -144,9 +165,13 @@ public final class WebViewPerf {
         try {
             if (WebViewFeature.isStartupFeatureSupported(
                     ctx, WebViewFeature.STARTUP_FEATURE_SET_UI_THREAD_STARTUP_MODE_V2)) {
-                WebViewStartUpConfig config = new WebViewStartUpConfig.Builder(STARTUP_EXEC)
-                        .setShouldRunUiThreadStartUpTasks(true)
-                        .build();
+                WebViewStartUpConfig.Builder builder = new WebViewStartUpConfig.Builder(STARTUP_EXEC)
+                        .setShouldRunUiThreadStartUpTasks(true);
+                if (WebViewFeature.isStartupFeatureSupported(
+                        ctx, WebViewFeature.STARTUP_FEATURE_SET_PROFILES_TO_LOAD)) {
+                    builder.setProfilesToLoadDuringStartup(Collections.singleton(Profile.DEFAULT_PROFILE_NAME));
+                }
+                WebViewStartUpConfig config = builder.build();
                 WebViewCompat.startUpWebView(ctx, config,
                         new WebViewOutcomeReceiver<WebViewStartUpResult, WebViewStartupException>() {
                             @Override public void onResult(WebViewStartUpResult result) {
@@ -191,19 +216,144 @@ public final class WebViewPerf {
     private static void warmUpAfterStart(Context appContext) {
         try {
             if (!isLowRam(appContext)
-                    && WebViewFeature.isFeatureSupported(WebViewFeature.WARM_UP_RENDERER_PROCESS)
                     && WebViewFeature.isFeatureSupported(WebViewFeature.MULTI_PROFILE)
                     && WebViewCompat.isMultiProcessEnabled()) {
                 // Always use getOrCreateProfile("Default"); getProfile() can block on native startup.
                 Profile profile = ProfileStore.getInstance().getOrCreateProfile(Profile.DEFAULT_PROFILE_NAME);
-                if (profile != null) profile.warmUpRendererProcess();
+                if (profile != null) {
+                    if (WebViewFeature.isFeatureSupported(WebViewFeature.WARM_UP_RENDERER_PROCESS)) {
+                        profile.warmUpRendererProcess();
+                    }
+                    applyQuicHintsLocked(profile, BASE_QUIC_HOSTS);
+                }
             }
         } catch (Throwable ignored) { }
+        // Intentionally omit startSafeBrowsing IPC during cold start: eliminates non-GMS China ROM
+        // startup IPC stalls and SafeBrowsing.API error noise while keeping cold start sub-170ms.
+    }
+
+    /** Registers HTTP/3 QUIC 0-RTT hints for top modern hosts + user Speed Dial / search engine hosts. */
+    public static void warmUpQuicHints(Set<String> extraHosts) {
+        if (!started) return;
+        postOnMain(() -> {
+            try {
+                if (!WebViewFeature.isFeatureSupported(WebViewFeature.MULTI_PROFILE)
+                        || !WebViewCompat.isMultiProcessEnabled()) return;
+                Profile profile = ProfileStore.getInstance().getOrCreateProfile(Profile.DEFAULT_PROFILE_NAME);
+                if (profile == null) return;
+                LinkedHashSet<String> merged = new LinkedHashSet<>(BASE_QUIC_HOSTS);
+                if (extraHosts != null) {
+                    for (String h : extraHosts) {
+                        if (h != null && !h.trim().isEmpty()) merged.add(h.trim().toLowerCase(java.util.Locale.ROOT));
+                    }
+                }
+                applyQuicHintsLocked(profile, merged);
+            } catch (Throwable ignored) { }
+        });
+    }
+
+    private static void applyQuicHintsLocked(Profile profile, Set<String> hosts) {
+        if (profile == null || hosts == null || hosts.isEmpty()) return;
         try {
-            if (WebViewFeature.isFeatureSupported(WebViewFeature.START_SAFE_BROWSING)) {
-                WebViewCompat.startSafeBrowsing(appContext, null);
+            if (WebViewFeature.isFeatureSupported(WebViewFeature.ADD_QUIC_HINTS_V1)) {
+                LinkedHashSet<String> urls = new LinkedHashSet<>(hosts.size());
+                for (String raw : hosts) {
+                    if (raw == null) continue;
+                    String s = raw.trim();
+                    if (s.isEmpty()) continue;
+                    if (s.startsWith("https://")) {
+                        urls.add(s);
+                    } else if (!s.contains("://") && !s.contains(" ") && !s.contains("/")) {
+                        urls.add("https://" + s);
+                    }
+                }
+                if (!urls.isEmpty()) {
+                    profile.preferQuicFor(urls);
+                    quicHintsActive = true;
+                }
             }
         } catch (Throwable ignored) { }
+    }
+
+    /**
+     * Tunes Chromium's native Speculative Loading Cache (maxPrefetches, TTL, maxPrerenders)
+     * and HTTP Disk Cache Quota (512 MiB Rampage / 256 MiB Balanced / default Eco) for flagship UFS chips.
+     */
+    public static void applyFlagshipProfileTuning(PerfProfiles.Profile profile, boolean isLowRam) {
+        if (!started) return;
+        PerfProfiles.Profile p = profile != null ? profile : PerfProfiles.preset(PerfProfiles.ID_BALANCED);
+        postOnMain(() -> {
+            try {
+                if (!WebViewFeature.isFeatureSupported(WebViewFeature.MULTI_PROFILE)
+                        || !WebViewCompat.isMultiProcessEnabled()) return;
+                Profile wvProfile = ProfileStore.getInstance().getOrCreateProfile(Profile.DEFAULT_PROFILE_NAME);
+                if (wvProfile == null) return;
+
+                boolean aggressive = !isLowRam && p.preloadLevel == PerfProfiles.PRELOAD_AGGRESSIVE;
+                boolean balanced = !isLowRam && p.preloadLevel == PerfProfiles.PRELOAD_PRECONNECT;
+                int maxPrefetches = aggressive ? 8 : (balanced ? 4 : 0);
+                int maxPrerenders = aggressive ? 3 : (balanced ? 1 : 0);
+                int ttlSec = aggressive ? 300 : 180;
+
+                if (WebViewFeature.isFeatureSupported(WebViewFeature.SPECULATIVE_LOADING_CONFIG)) {
+                    SpeculativeLoadingConfig cfg = new SpeculativeLoadingConfig.Builder()
+                            .setMaxPrefetches(maxPrefetches)
+                            .setPrefetchTtlSeconds(ttlSec)
+                            .setMaxPrerenders(maxPrerenders)
+                            .build();
+                    wvProfile.setSpeculativeLoadingConfig(cfg);
+                    speculativeConfigActive = maxPrefetches > 0 || maxPrerenders > 0;
+                } else if (WebViewFeature.isFeatureSupported(WebViewFeature.SET_MAX_PRERENDERS_V1)) {
+                    wvProfile.setMaxPrerenders(maxPrerenders);
+                    speculativeConfigActive = maxPrerenders > 0;
+                }
+
+                if (WebViewFeature.isFeatureSupported(WebViewFeature.HTTP_CACHE_MANAGER)) {
+                    HttpCache httpCache = wvProfile.getHttpCache();
+                    if (httpCache != null) {
+                        if (isLowRam || PerfProfiles.ID_ECO.equals(p.id)) {
+                            httpCache.useDefaultQuota();
+                            httpCacheQuotaMb = Math.max(0L, httpCache.getDefaultQuotaBytes() / (1024L * 1024L));
+                        } else {
+                            long mb = PerfProfiles.ID_RAMPAGE.equals(p.id) ? 512L : 256L;
+                            httpCache.setQuotaBytes(mb * 1024L * 1024L);
+                            httpCacheQuotaMb = mb;
+                        }
+                    }
+                }
+            } catch (Throwable ignored) { }
+        });
+    }
+
+    /**
+     * Installs Service Worker ad/tracker interception so PWAs & modern sites (YouTube, X, Bilibili)
+     * cannot bypass WebViewClient.shouldInterceptRequest via background Service Workers.
+     */
+    public static void installServiceWorkerFilter(SiteFilter filter) {
+        if (filter == null) return;
+        postOnMain(() -> {
+            try {
+                if (!WebViewFeature.isFeatureSupported(WebViewFeature.SERVICE_WORKER_BASIC_USAGE)
+                        || !WebViewFeature.isFeatureSupported(WebViewFeature.SERVICE_WORKER_SHOULD_INTERCEPT_REQUEST)) {
+                    return;
+                }
+                ServiceWorkerControllerCompat.getInstance().setServiceWorkerClient(new ServiceWorkerClientCompat() {
+                    @Override
+                    public android.webkit.WebResourceResponse shouldInterceptRequest(android.webkit.WebResourceRequest request) {
+                        if (request != null && filter.blocksServiceWorker(request)) {
+                            SW_BLOCKED_COUNT.incrementAndGet();
+                            return SiteFilter.blocked();
+                        }
+                        return null;
+                    }
+                });
+                serviceWorkerFilterActive = true;
+            } catch (Throwable ignored) { }
+        });
+    }
+
+    public static long serviceWorkerBlockedCount() {
+        return SW_BLOCKED_COUNT.get();
     }
 
     public static boolean isStarted() { return started; }
@@ -212,6 +362,27 @@ public final class WebViewPerf {
         if (web == null) return;
         WebSettings settings = web.getSettings();
         settings.setOffscreenPreRaster(false);
+
+        // Privacy + Speed triple-combo:
+        // 1. Strip X-Requested-With: app.aikobrowser header so sites treat Aiko like genuine Chrome
+        // 2. Disable background ad-attribution pings
+        // 3. Disable SafeBrowsing IPC overhead on non-GMS / China ROMs
+        try {
+            if (WebViewFeature.isFeatureSupported(WebViewFeature.REQUESTED_WITH_HEADER_ALLOW_LIST)) {
+                WebSettingsCompat.setRequestedWithHeaderOriginAllowList(settings, Collections.emptySet());
+            }
+        } catch (Throwable ignored) { }
+        try {
+            if (WebViewFeature.isFeatureSupported(WebViewFeature.ATTRIBUTION_REGISTRATION_BEHAVIOR)) {
+                WebSettingsCompat.setAttributionRegistrationBehavior(
+                        settings, WebSettingsCompat.ATTRIBUTION_BEHAVIOR_DISABLED);
+            }
+        } catch (Throwable ignored) { }
+        try {
+            if (WebViewFeature.isFeatureSupported(WebViewFeature.SAFE_BROWSING_ENABLE)) {
+                WebSettingsCompat.setSafeBrowsingEnabled(settings, false);
+            }
+        } catch (Throwable ignored) { }
 
         if (!isLowRam) {
             try {
@@ -593,11 +764,38 @@ public final class WebViewPerf {
         catch (Throwable ignored) { return false; }
     }
 
+    public static String flagshipFeatureSummary() {
+        StringBuilder sb = new StringBuilder(64);
+        if (quicHintsActive) sb.append("HTTP/3 QUIC");
+        if (serviceWorkerFilterActive) {
+            if (sb.length() > 0) sb.append(" · ");
+            sb.append("SW过滤");
+        }
+        if (httpCacheQuotaMb > 0) {
+            if (sb.length() > 0) sb.append(" · ");
+            sb.append(httpCacheQuotaMb).append("MB缓存");
+        }
+        if (isBfCacheSupported()) {
+            if (sb.length() > 0) sb.append(" · ");
+            sb.append("BFCache");
+        }
+        return sb.length() > 0 ? sb.toString() : "Chromium 旗舰内核";
+    }
+
     public static String diagnosticSummary() {
         String mode = usedAsyncStartup
                 ? ("异步启动" + (startupUiMs != null ? " (UI " + startupUiMs + "ms)" : ""))
                 : "标准启动";
-        return mode + " · BFCache " + (isBfCacheSupported() ? "开" : "不支持");
+        StringBuilder sb = new StringBuilder(128);
+        sb.append(mode)
+                .append(" · BFCache ").append(isBfCacheSupported() ? "开" : "不支持")
+                .append(" · HTTP/3 QUIC ").append(quicHintsActive ? "已预热" : "待机")
+                .append(" · 预渲染 ").append(speculativeConfigActive ? "开" : "默认")
+                .append(" · SW拦截 ").append(serviceWorkerFilterActive ? ("开(" + SW_BLOCKED_COUNT.get() + ")") : "未启用");
+        if (httpCacheQuotaMb > 0) {
+            sb.append(" · 磁盘缓存 ").append(httpCacheQuotaMb).append("MB");
+        }
+        return sb.toString();
     }
 
     private static boolean isNetworkMetered(Context ctx) {

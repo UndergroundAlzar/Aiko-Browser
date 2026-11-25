@@ -40,7 +40,7 @@ import java.util.zip.ZipOutputStream;
  */
 public final class BackupManager {
     public static final int FORMAT_VERSION = 1;
-    public static final String APP_VERSION = "0.4.0";
+    public static final String APP_VERSION = "0.5.0";
     public static final String MANIFEST_ENTRY = "manifest.json";
     public static final long MAX_ENTRY_BYTES = 20L * 1024 * 1024;  // 20 MiB per entry
     public static final long MAX_TOTAL_BYTES = 64L * 1024 * 1024;  // 64 MiB total uncompressed
@@ -62,7 +62,8 @@ public final class BackupManager {
             "reader_prefs.xml",
             "babel_config.xml",
             "start_page_config.xml",
-            "aiko_bangs.xml"
+            "aiko_bangs.xml",
+            "menu_config.xml"
     };
 
     private static final Set<String> ALLOWED_PREFS = Collections.unmodifiableSet(

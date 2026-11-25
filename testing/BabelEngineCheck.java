@@ -217,11 +217,46 @@ public final class BabelEngineCheck {
         String k3 = BabelEngine.cacheKey(BabelConfig.EngineKind.CUSTOM_AI, "gpt-4o", "zh-CN", "p1", "Hello");
         check(k1.equals(k3) && !k1.equals(k2), "cacheKey stable & sensitive to prompt hash");
 
-        System.out.println("PASS BabelEngine pure parsers, URL normalizers, delimiter split, and batching");
+        // v0.5.0 live-endpoint parsers (Google clients5, Bing CN web session, Youdao Mobile HTML, MyMemory JSON)
+        List<String> c5 = BabelEngine.parseGoogleClients5Json(
+                "[[\"你好世界\",\"en\"],[\"快速的安卓浏览器\",\"en\"]]", 2);
+        check(Arrays.asList("你好世界", "快速的安卓浏览器").equals(c5), "parseGoogleClients5Json pairs: " + c5);
+        List<String> c5Flat = BabelEngine.parseGoogleClients5Json("[\"单条结果\"]", 1);
+        check(Collections.singletonList("单条结果").equals(c5Flat), "parseGoogleClients5Json flat: " + c5Flat);
+
+        String sampleBingHtml = "<html><script>var _G={IG:\"ABC123XYZ\"};</script>"
+                + "<div data-iid=\"translator.5028\"></div>"
+                + "<script>var params_AbusePreventionHelper = [1764000000000,\"tok_98765_abc\",3600000];</script></html>";
+        BabelEngine.BingCnSession sess = BabelEngine.parseBingCnSessionHtml(sampleBingHtml, "MUID=1", 9999999999999L);
+        check(sess != null && "ABC123XYZ".equals(sess.ig) && "translator.5028".equals(sess.iid)
+                && "1764000000000".equals(sess.key) && "tok_98765_abc".equals(sess.token),
+                "parseBingCnSessionHtml extracts IG/IID/key/token");
+        check(BabelEngine.parseBingCnSessionHtml("<html>no tokens</html>", "", 1L) == null,
+                "parseBingCnSessionHtml rejects invalid html");
+
+        String sampleYoudaoHtml = "<div class=\"generate\"><ul id=\"translateResult\">"
+                + "<li>你好 &amp; <b>世界</b></li><li>第二行 &lt;ok&gt;</li></ul></div>";
+        check("你好 & 世界\n第二行 <ok>".equals(BabelEngine.parseYoudaoMobileHtml(sampleYoudaoHtml)),
+                "parseYoudaoMobileHtml strips tags & unescapes entities");
+        check("你好世界".equals(BabelEngine.parseMyMemoryJson(
+                "{\"responseData\":{\"translatedText\":\"你好世界\"},\"responseStatus\":200}")),
+                "parseMyMemoryJson extracts translatedText");
+        check("在文章中搜索\"Aiko\"".equals(BabelEngine.parseMyMemoryJson(
+                "{\"responseData\":{\"translatedText\":\"在文章中搜索&amp;quot;Aiko&quot;\"},\"responseStatus\":200}")),
+                "parseMyMemoryJson unescapes double-encoded HTML entities");
+        check("".equals(BabelEngine.parseMyMemoryJson(
+                "{\"responseData\":{\"translatedText\":\"QUERY LENGTH LIMIT EXCEEDED. MAX ALLOWED QUERY : 500 CHARS\"},\"responseStatus\":200}")),
+                "parseMyMemoryJson rejects 500-char quota error message");
+        check("".equals(BabelEngine.parseMyMemoryJson(
+                "{\"responseData\":{\"translatedText\":\"MYMEMORY WARNING: YOU USED ALL AVAILABLE FREE TRANSLATIONS\"},\"responseStatus\":200}")),
+                "parseMyMemoryJson rejects quota warning");
+
+        System.out.println("PASS BabelEngine pure parsers, URL normalizers, delimiter split, v0.5.0 live parsers, and batching");
     }
 
     private static void checkLocalHttpEnginesFallbackCacheAndConcurrency() throws Exception {
         AtomicBoolean failGoogle = new AtomicBoolean(false);
+        AtomicBoolean failBing = new AtomicBoolean(false);
         AtomicBoolean mangleGoogle = new AtomicBoolean(false);
         AtomicInteger bingAuthCalls = new AtomicInteger(0);
         AtomicBoolean expireBingOnce = new AtomicBoolean(false);
@@ -262,10 +297,18 @@ public final class BabelEngineCheck {
 
         // 2. Mock Bing Auth + Bing Translate
         server.createContext("/bing-auth", ex -> {
+            if (failBing.get()) {
+                respond(ex, 503, "Bing Unavailable");
+                return;
+            }
             int n = bingAuthCalls.incrementAndGet();
             respond(ex, 200, "mock-bing-jwt-" + n);
         });
         server.createContext("/bing-tr", ex -> {
+            if (failBing.get()) {
+                respond(ex, 503, "Bing Unavailable");
+                return;
+            }
             String auth = ex.getRequestHeaders().getFirst("Authorization");
             if (expireBingOnce.compareAndSet(true, false)) {
                 respond(ex, 401, "token expired");
@@ -404,16 +447,27 @@ public final class BabelEngineCheck {
             check(b3.isSuccess() && "BING:RefreshToken".equals(b3.translated), "Bing auto-refreshes expired token");
             check(bingAuthCalls.get() == 2, "Bing auth refreshed once on 401");
 
-            // D. Youdao CN
+            // D. Youdao CN + 3-tier automatic failover (GOOGLE_FREE -> BING_CN [503] -> YOUDAO_CN)
             cfg.setEngineKind(BabelConfig.EngineKind.YOUDAO_CN);
             BabelEngine.SingleResult yd = engine.translateSingle("Hello Youdao", "zh-CN");
             check(yd.isSuccess() && "YD:Hello Youdao".equals(yd.translated), "Youdao CN single: " + yd.translated);
 
-            // E. Custom AI: OpenAI-compat batch + extra header + model fetch
+            cfg.setEngineKind(BabelConfig.EngineKind.GOOGLE_FREE);
+            failGoogle.set(true);
+            failBing.set(true);
+            BabelEngine.TranslationResult tier3 = engine.translateBatch(Arrays.asList("Tier3A", "Tier3B"), "zh-CN");
+            check(tier3.isSuccess() && tier3.fellBackToCn && tier3.usedEngine == BabelConfig.EngineKind.YOUDAO_CN,
+                    "3-tier failover GOOGLE -> BING(503) -> YOUDAO_CN");
+            check(Arrays.asList("YD:Tier3A", "YD:Tier3B").equals(tier3.translations),
+                    "3-tier failover output: " + tier3.translations);
+            failBing.set(false);
+            failGoogle.set(false);
+
+            // E. Custom AI: OpenAI-compat batch + extra header + model fetch + parallel sub-batch execution
             BabelConfig.AiProfile oaiProf = new BabelConfig.AiProfile(
                     "oai-local", "Local OpenAI", BabelConfig.ApiFormat.OPENAI_COMPAT,
                     base + "/openai", "sk-local", "gpt-4o-mini", Collections.emptyList(),
-                    2, 1024, 0.3f, 2400, 8, 15,
+                    2, 1024, 0.3f, 2400, 2, 15,
                     BabelConfig.DEFAULT_SYSTEM_PROMPT, "{\"X-Aiko-Test\":\"v040\"}"
             );
             cfg.upsertProfile(oaiProf);
@@ -424,9 +478,15 @@ public final class BabelEngineCheck {
             check(oaiModels.isSuccess() && oaiModels.models.size() == 2
                     && oaiModels.models.contains("deepseek-v3"), "fetchModels OpenAI: " + oaiModels.models);
 
-            BabelEngine.TranslationResult oaiRes = engine.translateBatch(Arrays.asList("Hi AI", "Second"), "zh-CN");
-            check(oaiRes.isSuccess() && Arrays.asList("OAI:Hi AI", "OAI:Second").equals(oaiRes.translations),
-                    "OpenAI batch + <think>/fence strip: " + oaiRes.translations);
+            slowPeak.set(0);
+            aiDelayMs.set(45);
+            BabelEngine.TranslationResult oaiRes = engine.translateBatch(
+                    Arrays.asList("Hi AI", "Second", "Third", "Fourth"), "zh-CN");
+            aiDelayMs.set(0);
+            check(oaiRes.isSuccess()
+                    && Arrays.asList("OAI:Hi AI", "OAI:Second", "OAI:Third", "OAI:Fourth").equals(oaiRes.translations),
+                    "OpenAI parallel sub-batch + <think>/fence strip: " + oaiRes.translations);
+            check(slowPeak.get() >= 2, "sub-batches executed in parallel (expected peak>=2, got " + slowPeak.get() + ")");
             check("v040".equals(seenCustomHeader.get()), "extraHeadersJson sent on request");
 
             // F. Custom AI: Gemini single + model fetch + thought filtering

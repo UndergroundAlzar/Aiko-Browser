@@ -6,19 +6,19 @@
 
 # Aiko Browser
 
-**2.53 MB Pure Java. Up to 185Hz. A flagship high-refresh Android browser built for power users.**
+**2.56 MB Pure Java. 140 ms Cold Start. Up to 185Hz. Built for flagship Android silicon.**
 
-[![Latest Release](https://img.shields.io/github/v/release/UndergroundAlzar/Aiko-Browser?style=flat-square&color=7C9BFF&label=Release)](https://github.com/UndergroundAlzar/Aiko-Browser/releases/latest)
-[![APK Size](https://img.shields.io/badge/APK-2.53%20MB-2DD4BF?style=flat-square)](https://github.com/UndergroundAlzar/Aiko-Browser/releases/download/v0.4.0/Aiko-Browser-0.4.0.apk)
+[![Latest Release](https://img.shields.io/github/v/release/UndergroundAlzar/Aiko-Browser?style=flat-square&color=39C5BB&label=Release)](https://github.com/UndergroundAlzar/Aiko-Browser/releases/latest)
+[![APK Size](https://img.shields.io/badge/APK-2.56%20MB-2DD4BF?style=flat-square)](https://github.com/UndergroundAlzar/Aiko-Browser/releases/download/v0.5.0/Aiko-Browser-0.5.0.apk)
 [![Android](https://img.shields.io/badge/Android-10%2B%20(API%2029–36)-3DDC84?style=flat-square&logo=android&logoColor=white)](https://github.com/UndergroundAlzar/Aiko-Browser/releases/latest)
 [![Refresh Rate](https://img.shields.io/badge/Display-Up%20to%20185Hz-F472B6?style=flat-square)](#real-device--host-benchmarks)
 [![Pure Java](https://img.shields.io/badge/Stack-Pure%20Java%20·%20Zero%20Bloat-FBBF24?style=flat-square)](#build--verification)
 [![Tests](https://img.shields.io/badge/Checks-13%2F13%20PASS-34D399?style=flat-square)](BUILD.md)
 
 <p>
-  <a href="https://github.com/UndergroundAlzar/Aiko-Browser/releases/download/v0.4.0/Aiko-Browser-0.4.0.apk"><strong>Download v0.4.0 APK</strong></a>
+  <a href="https://github.com/UndergroundAlzar/Aiko-Browser/releases/download/v0.5.0/Aiko-Browser-0.5.0.apk"><strong>Download v0.5.0 APK</strong></a>
   &nbsp;·&nbsp;
-  <a href="https://github.com/UndergroundAlzar/Aiko-Browser/releases/tag/v0.4.0">Release Notes &amp; SHA-256</a>
+  <a href="https://github.com/UndergroundAlzar/Aiko-Browser/releases/tag/v0.5.0">Release Notes &amp; SHA-256</a>
   &nbsp;·&nbsp;
   <a href="../README.md">简体中文</a>
   &nbsp;·&nbsp;
@@ -35,12 +35,12 @@
 
 ## Why Aiko Browser?
 
-Created by **Alzar**, **Aiko Browser** is a lightweight, zero-telemetry Android browser crafted directly in pure Java, native Android views, and the system WebView (Android 10+ / API 29–36; UI currently in Chinese). Inside a **2.53 MB** single-DEX APK, it delivers desktop-caliber extensibility and obsessive 185Hz smoothness without any framework bloat.
+Created by **Alzar**, **Aiko Browser** is a lightweight, zero-telemetry Android browser crafted directly in pure Java, native Android views, and the system WebView (Android 10+ / API 29–36; UI currently in Chinese). Inside a **2.56 MB** single-DEX APK, it delivers flagship-silicon WebView acceleration, a clean customizable 2-tier menu + Settings Center, 18 curated luxury themes, and desktop-caliber extensibility with zero framework bloat.
 
-- **Real Hardware 185Hz Pacing**: Verified on a OnePlus 185Hz flagship at **159–166 ms** cold start, **943** fast-scroll frames with **0 missed VSyncs** (`0.42%` jank), and **23.2 MB** Java heap.
-- **Babel (巴别塔) Immersive Translator**: Free zero-key Google Translate, seamless CN-direct Microsoft/Edge fallback, and fully tunable custom OpenAI-compatible / Gemini AI APIs with automatic model-list fetching and triple-space input back-translation.
-- **Complete Tampermonkey Runtime**: Isolated-world execution with `GM_xmlhttpRequest` (`@connect`), `@require`/`@resource` local caching, live `GM_registerMenuCommand` entries, cross-tab `GM_addValueChangeListener`, and 1-tap Greasy Fork installation.
-- **Sovereign Customization & Data Ownership**: Custom Homepage/New Tab (with instant iTab preload), dynamic Material You + `#000000` OLED theming, isolated `:private` process, and 1-tap `.aiko` full backup & restore.
+- **Flagship Silicon Performance**: Verified on a OnePlus 185Hz (`SM8850`) flagship at **140 ms** cold start (`15 ms` async WebView UI), live **HTTP/3 QUIC 0-RTT hints**, **512 MB UFS HTTP cache**, **Chromium speculative prefetch/prerender**, **Service Worker adblock**, and **943** fast-scroll frames with **0 missed VSyncs** (`0.42%` jank).
+- **Babel (巴别塔) Immersive Translator**: Rebuilt 3-tier engine pipeline (Google `clients5` native batching → CN-direct `cn.bing.com` LLM → Youdao Mobile CN) with 0ms circuit-breaker failover, parallel sub-batching, SPA route auto-rescan, and fully tunable custom OpenAI-compatible / Gemini AI APIs.
+- **2-Tier Customizable Menu & 18 Luxury Themes**: Clean 6-item 1st-tier quick menu (pin & reorder up to 12 of 22 actions), dedicated 5-section **Settings Center** + login-preserving cache cleaner, and 18 WCAG AA+ themes including **Miku Teal (`#39C5BB`)**, Tiffany Blue, Hermès Orange, Klein Blue, Desert Titanium, and `#000000` OLED.
+- **Complete Tampermonkey Runtime & Sovereign Data**: Isolated-world execution (`GM_xmlhttpRequest`, `@require`/`@resource`, `GM_registerMenuCommand`, 1-tap Greasy Fork install), isolated `:private` process, and 1-tap `.aiko` full backup & restore.
 
 ---
 
@@ -75,17 +75,17 @@ Created by **Alzar**, **Aiko Browser** is a lightweight, zero-telemetry Android 
 ### Physical 185Hz Device (OnePlus PMS110 · SM8850 · Android 17 · WebView Canary 160)
 | Metric | Result | Notes |
 | :--- | :---: | :--- |
-| **Cold Start** (`am start -W`) | **`159–166 ms`** | With full 7-list binary filter cache |
+| **Cold Start** (`am start -W`) | **`140 ms`** | `15 ms` async WebView UI + full 7-list binary filter cache |
+| **Flagship WebView Pipeline** | **All Active** | `BFCache` · `HTTP/3 QUIC` · `Prerender` · `SW Adblock` · `512 MB Cache` |
 | **185Hz Fast Scroll** (`dumpsys gfxinfo`) | **`943` frames · `0` missed VSyncs** | Only 4 janky frames (**`0.42%`**) at `5.405 ms` VSync |
 | **Frame Pacing** (CPU / GPU) | **p95 `5 ms` · p99 `6 ms`** | GPU `p95 = 2 ms` / `p99 = 3 ms` |
-| **Memory** (`dumpsys meminfo`) | **`23.2 MB` Java Heap** | Native `25.8 MB` · Total PSS `193.6 MB` |
-| **Live Adblock** (7 bundled + `anti-AD`) | **`172,031` active rules** | Zero ads on Greasy Fork; zero app errors |
+| **Live Adblock** (7 bundled + `anti-AD`) | **`172,031` active rules** | Includes Service Worker interception; zero crashes/ANRs |
 
-### Host Benchmarks & Verification (`v0.4.0` · JDK 21 / Node.js / Headless Chromium)
+### Host Benchmarks & Verification (`v0.5.0` · JDK 21 / Node.js / Headless Chromium)
 All **13/13** automated test & benchmark suites pass:
 - **7-list network rule match** (151,979 rules): **`0.400 µs/req`** p50 (**30×+** vs `v0.1.9`)
-- **Cosmetic CSS lookup**: **`0.200 µs`** p50 · Binary cache **`8.34 MB`** (warm load `22.42 ms`)
-- **URL check (`HttpUrlUtil`)**: **`43.4 ns`** (**71.9×**) · **Userscript 10-iframe guard**: **`7.0 µs`** p50 (**5.5×**)
+- **Cosmetic CSS lookup**: **`0.200 µs`** p50 · Binary cache **`8.34 MB`** (warm load `20.89 ms`)
+- **URL check (`HttpUrlUtil`)**: **`39.6 ns`** (**73×+**) · **Userscript 10-iframe guard**: **`7.1 µs`** p50 (**5.5×**)
 
 ---
 
@@ -99,7 +99,7 @@ pwsh -NoProfile -File ./testing/run_benchmarks.ps1 -IncludeChromiumSmoke
 ```
 
 ```text
-APK SHA-256   d23cb60d3e7f694e27390a6597e6804bfca113a86f3e86020b74cdb8b6c765b8
+APK SHA-256   6bf07c9a716ad52805c117c94029d47492fd0fa20e87030e653c866822695b81
 CERT SHA-256  ae71c82831309c76ebf55c407d91afbba16776e97389bd73c5e8400fe9397fe4
 ```
 

@@ -66,6 +66,8 @@ public final class BabelUi {
         long generation;
         boolean translating;
         boolean bridgeBound;
+        boolean notifiedFallback;
+        boolean notifiedError;
         String currentUrl = "";
 
         TabState(String scopeKey) {
@@ -154,6 +156,8 @@ public final class BabelUi {
         if (state == null) return;
         state.currentUrl = url == null ? "" : url;
         state.translating = false;
+        state.notifiedFallback = false;
+        state.notifiedError = false;
         state.generation = engine.nextSessionGeneration(state.scopeKey);
         notifyStateChanged();
 
@@ -202,9 +206,12 @@ public final class BabelUi {
                 return;
             }
             state.translating = true;
+            state.notifiedFallback = false;
+            state.notifiedError = false;
             state.generation = engine.nextSessionGeneration(state.scopeKey);
             injectAndConfigure(view, true);
             notifyStateChanged();
+            toast("巴别塔已开启 · " + config.activeEngineDisplayName());
         }
     }
 
@@ -1254,13 +1261,22 @@ public final class BabelUi {
             TabState cur = tabs.get(view);
             if (cur == null || cur.generation != gen || isUiGone()) return;
             if (res.isSuccess()) {
+                if (res.fellBackToCn && !cur.notifiedFallback) {
+                    cur.notifiedFallback = true;
+                    toast("Google 暂不可达，已自动切换至 " + res.usedEngine.label);
+                }
                 JSONArray out = new JSONArray();
                 for (String t : res.translations) out.put(t);
                 evalJs(view, "window.__aikoBabel && window.__aikoBabel.applyBatchResult("
                         + JSONObject.quote(reqId) + "," + out.toString() + ");");
             } else {
+                String errText = res.error == null ? "请检查网络或切换翻译引擎" : res.error;
+                if (!cur.notifiedError && !"已取消".equals(errText)) {
+                    cur.notifiedError = true;
+                    toast("巴别塔翻译失败：" + errText);
+                }
                 evalJs(view, "window.__aikoBabel && window.__aikoBabel.applyBatchError("
-                        + JSONObject.quote(reqId) + "," + JSONObject.quote(res.error == null ? "翻译失败" : res.error) + ");");
+                        + JSONObject.quote(reqId) + "," + JSONObject.quote(errText) + ");");
             }
         }));
     }

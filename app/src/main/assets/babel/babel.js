@@ -1,7 +1,7 @@
 (() => {
     'use strict';
 
-    if (window.__aikoBabel && window.__aikoBabel.__version === '0.4.0') {
+    if (window.__aikoBabel && window.__aikoBabel.__version === '0.5.0') {
         return;
     }
 
@@ -1145,10 +1145,47 @@
         syncFab();
     }
 
+    let spaHooked = false;
+    let spaTimer = 0;
+    function hookSpaRoutes() {
+        if (spaHooked) return;
+        spaHooked = true;
+        const scheduleRescan = () => {
+            if (!config.enabled) return;
+            if (spaTimer) clearTimeout(spaTimer);
+            spaTimer = setTimeout(() => {
+                spaTimer = 0;
+                if (config.enabled && document.body) {
+                    discoverAndObserve(document.body);
+                }
+            }, 350);
+        };
+        try {
+            const origPush = history.pushState;
+            if (typeof origPush === 'function') {
+                history.pushState = function () {
+                    const ret = origPush.apply(this, arguments);
+                    scheduleRescan();
+                    return ret;
+                };
+            }
+            const origReplace = history.replaceState;
+            if (typeof origReplace === 'function') {
+                history.replaceState = function () {
+                    const ret = origReplace.apply(this, arguments);
+                    scheduleRescan();
+                    return ret;
+                };
+            }
+            window.addEventListener('popstate', scheduleRescan, true);
+        } catch (_) { }
+    }
+
     window.__aikoBabel = {
-        __version: '0.4.0',
+        __version: '0.5.0',
 
         configure(opts) {
+            hookSpaRoutes();
             const wasEnabled = config.enabled;
             const prevTargetLang = config.targetLang;
             applyConfig(opts);
@@ -1214,14 +1251,19 @@
                     removeTranslationNode(entry.el);
                 }
             }
+            if (fabEl && fabEl.isConnected) fabEl.textContent = '译 · 双语';
         },
 
-        applyBatchError(reqId) {
+        applyBatchError(reqId, message) {
             const job = pendingBatches.get(reqId);
             if (!job) return;
             pendingBatches.delete(reqId);
             for (let i = 0; i < job.entries.length; i++) {
                 removeTranslationNode(job.entries[i].el);
+            }
+            if (fabEl && fabEl.isConnected) {
+                fabEl.textContent = '译 · 点按重试';
+                fabEl.title = message || '翻译失败';
             }
         },
 

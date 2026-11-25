@@ -131,12 +131,8 @@ public final class V040EnginesCheck {
         }
         check(threw, "QrEngine rejects payload exceeding MAX_UTF8_BYTES");
 
-        // 5. Verify styled QR finder ring contrast across ALL AikoTheme presets (including bright OLED #E2E8F0!)
-        String[] themeModes = {
-                AikoTheme.MODE_OBSIDIAN, AikoTheme.MODE_EMERALD, AikoTheme.MODE_SAKURA,
-                AikoTheme.MODE_AMBER, AikoTheme.MODE_VIOLET, AikoTheme.MODE_OLED
-        };
-        for (String mode : themeModes) {
+        // 5. Verify styled QR finder ring contrast across ALL 17 AikoTheme presets (including Miku Teal, Tiffany Blue, OLED!)
+        for (String mode : AikoTheme.ALL_MODES) {
             int accent = AikoTheme.Palette.preset(mode).accent;
             int finderColor = QrEngine.resolveContrastFinderColor(accent, 0xFF101318, 0xFFFFFFFF);
             int luma = QrEngine.perceivedLuma(finderColor);
@@ -424,8 +420,9 @@ public final class V040EnginesCheck {
             File fontsDir = new File(filesDir, "fonts");
             check(prefsDir.mkdirs() && fontsDir.mkdirs(), "Create test dirs");
 
-            Files.writeString(new File(prefsDir, "aiko_theme.xml").toPath(), "<map><string name=\"mode\">emerald</string></map>");
+            Files.writeString(new File(prefsDir, "aiko_theme.xml").toPath(), "<map><string name=\"mode\">miku</string></map>");
             Files.writeString(new File(prefsDir, "start_page_config.xml").toPath(), "<map><string name=\"home_url\">https://go.itab.link/</string></map>");
+            Files.writeString(new File(prefsDir, "menu_config.xml").toPath(), "<map><string name=\"primary_ids_json\">[\"babel\",\"gallery\"]</string></map>");
             Files.writeString(new File(prefsDir, "babel_config.xml").toPath(), "<map><string name=\"engine\">GOOGLE_FREE</string></map>");
             Files.writeString(new File(prefsDir, "userscript_values.xml").toPath(), "<map><string name=\"v\">ok</string></map>");
             Files.writeString(new File(prefsDir, "userscript_connects.xml").toPath(), "<map><string name=\"c\">ok</string></map>");
@@ -439,8 +436,8 @@ public final class V040EnginesCheck {
 
             ByteArrayOutputStream zipOut = new ByteArrayOutputStream();
             BackupManager.ExportReport exp = BackupManager.exportFromDir(srcDir, zipOut);
-            check(exp.prefsExported == 8 && exp.filesExported == 2,
-                    "Expected 8 prefs + 2 files exported, got " + exp.prefsExported + "/" + exp.filesExported);
+            check(exp.prefsExported == 9 && exp.filesExported == 2,
+                    "Expected 9 prefs + 2 files exported, got " + exp.prefsExported + "/" + exp.filesExported);
 
             // Inspect manifest & verify WebViewChromiumPrefs.xml was skipped
             byte[] archive = zipOut.toByteArray();
@@ -452,7 +449,7 @@ public final class V040EnginesCheck {
                     if ("manifest.json".equals(e.getName())) {
                         sawManifest = true;
                         JSONObject man = new JSONObject(new String(zis.readAllBytes(), StandardCharsets.UTF_8));
-                        check(man.getInt("formatVersion") == 1 && "0.4.0".equals(man.getString("appVersion")),
+                        check(man.getInt("formatVersion") == 1 && BackupManager.APP_VERSION.equals(man.getString("appVersion")),
                                 "Valid manifest metadata");
                     }
                     if (e.getName().contains("WebViewChromiumPrefs")) sawWebViewInternal = true;
@@ -464,10 +461,12 @@ public final class V040EnginesCheck {
             File dstDir = tmpRoot.resolve("dst").toFile();
             check(dstDir.mkdirs(), "Create restore dir");
             BackupManager.RestoreReport rep = BackupManager.importToDir(dstDir, new ByteArrayInputStream(archive));
-            check(rep.prefsRestored == 8 && rep.filesRestored == 2 && "0.4.0".equals(rep.appVersion),
+            check(rep.prefsRestored == 9 && rep.filesRestored == 2 && BackupManager.APP_VERSION.equals(rep.appVersion),
                     "RestoreReport counts & version match");
-            check(Files.readString(new File(dstDir, "shared_prefs/aiko_theme.xml").toPath()).contains("emerald"),
+            check(Files.readString(new File(dstDir, "shared_prefs/aiko_theme.xml").toPath()).contains("miku"),
                     "Restored theme prefs match");
+            check(Files.readString(new File(dstDir, "shared_prefs/menu_config.xml").toPath()).contains("gallery"),
+                    "Restored menu_config prefs match");
             check(Files.readString(new File(dstDir, "shared_prefs/userscript_values.xml").toPath()).contains("ok"),
                     "Restored userscript_values prefs match");
             check(Files.readString(new File(dstDir, "shared_prefs/reading_shelf.xml").toPath()).contains("[]"),
@@ -487,7 +486,7 @@ public final class V040EnginesCheck {
             assertImportRejected(dstDir, makeOversizedZip(), "oversized >20MiB entry");
             check(!new File(tmpRoot.toFile(), "evil.xml").exists(), "No traversal file written");
             // Existing restored files remain intact after rejected imports (two-phase staging)
-            check(Files.readString(new File(dstDir, "shared_prefs/aiko_theme.xml").toPath()).contains("emerald"),
+            check(Files.readString(new File(dstDir, "shared_prefs/aiko_theme.xml").toPath()).contains("miku"),
                     "Existing files preserved after rejected import");
 
             System.out.println("PASS BackupManager .aiko ZIP round-trip, WebView exclusion, and security rejection");

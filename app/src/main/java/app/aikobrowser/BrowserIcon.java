@@ -23,7 +23,8 @@ final class BrowserIcon extends View {
         DESKTOP, FONT, IMAGE, READER, MUTE, UNMUTE, PIN, ENGINE, PICKER, DARK,
         PDF, BOLT, GESTURE, CHECK, PALETTE, INFO, VIDEO,
         TRANSLATE, QR, GALLERY, BACKUP, UNLOCK, DEVTOOLS, PWA, SUN_MOON, GRID,
-        SNIFF, UNDO, FLASH_CMD, SPEAKER, PEEK, TIMER
+        SNIFF, UNDO, FLASH_CMD, SPEAKER, PEEK, TIMER,
+        SETTINGS, TRASH, EDIT, UP
     }
 
     static final float STROKE_WEIGHT = 1.85f;
@@ -586,5 +587,44 @@ final class BrowserIcon extends View {
         poly(timer, 17.0f, 8.25f, 18.75f, 6.5f);
         poly(timer, 12.0f, 13.25f, 15.0f, 10.25f);
         fill(Kind.TIMER).addCircle(12.0f, 13.25f, 1.15f, Path.Direction.CW);
+
+        // Settings: precision 6-tooth gear ring + optical center bore
+        Path settings = stroke(Kind.SETTINGS);
+        settings.addCircle(12.0f, 12.0f, 2.85f, Path.Direction.CW);
+        settings.addCircle(12.0f, 12.0f, 6.45f, Path.Direction.CW);
+        poly(settings, 12.0f, 3.35f, 12.0f, 5.55f);
+        poly(settings, 12.0f, 18.45f, 12.0f, 20.65f);
+        poly(settings, 3.35f, 12.0f, 5.55f, 12.0f);
+        poly(settings, 18.45f, 12.0f, 20.65f, 12.0f);
+        poly(settings, 5.9f, 5.9f, 7.45f, 7.45f);
+        poly(settings, 16.55f, 16.55f, 18.1f, 18.1f);
+        poly(settings, 18.1f, 5.9f, 16.55f, 7.45f);
+        poly(settings, 7.45f, 16.55f, 5.9f, 18.1f);
+
+        // Trash: clean bin silhouette + lid + twin interior flutes
+        Path trash = stroke(Kind.TRASH);
+        poly(trash, 4.75f, 6.75f, 19.25f, 6.75f);
+        poly(trash, 9.25f, 6.75f, 9.25f, 4.75f, 14.75f, 4.75f, 14.75f, 6.75f);
+        trash.moveTo(6.5f, 6.75f);
+        trash.lineTo(7.4f, 18.25f);
+        trash.quadTo(7.55f, 19.75f, 9.05f, 19.75f);
+        trash.lineTo(14.95f, 19.75f);
+        trash.quadTo(16.45f, 19.75f, 16.6f, 18.25f);
+        trash.lineTo(17.5f, 6.75f);
+        poly(trash, 10.25f, 10.25f, 10.25f, 16.25f);
+        poly(trash, 13.75f, 10.25f, 13.75f, 16.25f);
+
+        // Edit: diagonal pencil + crisp nib + baseline
+        Path edit = stroke(Kind.EDIT);
+        edit.moveTo(15.2f, 4.6f);
+        edit.lineTo(19.4f, 8.8f);
+        edit.lineTo(9.0f, 19.2f);
+        edit.lineTo(4.6f, 19.4f);
+        edit.lineTo(4.8f, 15.0f);
+        edit.close();
+        poly(edit, 13.2f, 6.6f, 17.4f, 10.8f);
+
+        // Up: optically balanced upward chevron
+        poly(stroke(Kind.UP), 6.0f, 14.75f, 12.0f, 8.75f, 18.0f, 14.75f);
     }
 }

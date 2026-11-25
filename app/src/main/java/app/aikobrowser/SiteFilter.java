@@ -391,6 +391,12 @@ public final class SiteFilter {
         return count == null ? 0 : count;
     }
 
+    /** Non-blocking count of active network + cosmetic rules currently loaded in RAM. */
+    public int totalRuleCount() {
+        FilterRules snap = rules;
+        return snap == null ? 0 : (snap.networkCount + snap.cosmeticCount);
+    }
+
     public long lastUpdatedAt() {
         ensurePrefsLoaded();
         return lastUpdatedAt;
@@ -1582,6 +1588,43 @@ public final class SiteFilter {
             return false;
         }
         return snapshot.blocksUrlFast(host, url);
+    }
+
+    /**
+     * Sub-microsecond Service Worker ad/tracker interception (used by ServiceWorkerControllerCompat).
+     * Never blocks main-frame navigations and respects per-site exclusions via Referer/Origin.
+     */
+    boolean blocksServiceWorker(android.webkit.WebResourceRequest request) {
+        if (request == null || request.isForMainFrame()) return false;
+        String method = request.getMethod();
+        if (!"GET".equals(method) && !"POST".equals(method) && !"HEAD".equals(method)) return false;
+        Uri uri = request.getUrl();
+        if (uri == null) return false;
+        String scheme = uri.getScheme();
+        if (!"https".equals(scheme) && !"http".equals(scheme)) return false;
+        String host = normal(uri.getHost());
+        if (host == null) return false;
+        Map<String, String> headers = request.getRequestHeaders();
+        String refHost = null;
+        if (headers != null && !headers.isEmpty()) {
+            for (Map.Entry<String, String> e : headers.entrySet()) {
+                String k = e.getKey();
+                if (k != null && ("Referer".equalsIgnoreCase(k) || "Origin".equalsIgnoreCase(k))) {
+                    String h = extractHostFast(e.getValue());
+                    if (h != null) { refHost = normal(h); break; }
+                }
+            }
+        }
+        if (refHost != null && !enabled(refHost)) return false;
+        if (!enabled(host)) return false;
+        FilterRules snapshot = rules;
+        if (snapshot == FilterRules.EMPTY) {
+            for (int i = 0; i < TRACKERS.length; i++) {
+                if (atDomain(host, TRACKERS[i])) return true;
+            }
+            return false;
+        }
+        return snapshot.blocksUrlFast(host, uri.toString());
     }
 
     private static String extractHostFast(String url) {
