@@ -64,6 +64,7 @@ public final class V040EnginesCheck {
         checkBangCatalog();
         checkBackupManager();
         checkStartPageConfig();
+        checkServiceWorkerRules();
         checkSiteProfile();
         checkSiteExtrasAndFilterHelpers();
         checkWebViewPerfAndVideoBooster();
@@ -489,10 +490,141 @@ public final class V040EnginesCheck {
             check(Files.readString(new File(dstDir, "shared_prefs/aiko_theme.xml").toPath()).contains("miku"),
                     "Existing files preserved after rejected import");
 
-            System.out.println("PASS BackupManager .aiko ZIP round-trip, WebView exclusion, and security rejection");
+            checkBackupMigration(srcDir, dstDir);
+            System.out.println("PASS BackupManager portable/legacy/encrypted migration, offline bodies, live prefs and failure isolation");
         } finally {
             deleteRecursive(tmpRoot.toFile());
         }
+    }
+
+    private static void checkBackupMigration(File src, File dst) throws Exception {
+        String babel = BackupPreferences.BABEL, shelf = BackupPreferences.SHELF;
+        String basename = "abcabcabcabcabcabcabcabcabcabcab.mht";
+        String bodyPath = BackupPreferences.BODIES + basename;
+        Path body = src.toPath().resolve(bodyPath);
+        Files.createDirectories(body.getParent());
+        byte[] offline = new byte[150000];
+        new java.util.Random(99).nextBytes(offline); // Incompressible; exercises multiple authenticated records.
+        Files.write(body, offline);
+        Files.writeString(body.resolveSibling("deadbeef.mht"), "unreferenced");
+        String endpoint = "https://example.invalid/v1";
+        byte[] sourceBabel = profileFixture(endpoint, "source-fixture", "source-header");
+        byte[] localBabel = profileFixture(endpoint, "destination-fixture", "local-header");
+        Path dstConfig = dst.toPath().resolve(babel);
+        Path dstShelf = dst.toPath().resolve(shelf);
+        Path dstBody = dst.toPath().resolve(bodyPath);
+        Files.write(src.toPath().resolve(babel), sourceBabel);
+        org.json.JSONArray pins = new org.json.JSONArray().put(new JSONObject().put("u", "https://example.invalid/a")
+                .put("t", "A & B").put("y", 72).put("a", body.toAbsolutePath().toString()))
+                .put(new JSONObject().put("u", "https://example.invalid/b").put("a", "/old/app/files/reading_shelf/badbad.mht"));
+        byte[] oldShelf = BackupPreferences.encode(Map.of("items", pins.toString()));
+        Files.write(src.toPath().resolve(shelf), oldShelf);
+        Files.write(dstConfig, localBabel);
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        BackupManager.ExportReport export = BackupManager.exportFromDir(src, out);
+        check(export.summary.contains("1 个离线正文"), "Reports skipped missing body");
+        byte[] portable = out.toByteArray();
+        try (ZipInputStream zip = new ZipInputStream(new ByteArrayInputStream(portable))) {
+            ZipEntry entry;
+            while ((entry = zip.getNextEntry()) != null) {
+                check(!entry.getName().endsWith("deadbeef.mht"), "Only referenced bodies travel");
+                String content = new String(zip.readAllBytes(), StandardCharsets.UTF_8);
+                check(!content.contains("source-fixture") && !content.contains("source-header"), "No credentials in any portable entry");
+                if (entry.getName().equals(shelf)) check(!content.contains("/old/app/") && !content.contains("aiko-backup-test"), "Portable shelf paths");
+            }
+        }
+        BackupManager.importToDir(dst, new ByteArrayInputStream(portable));
+        JSONObject imported = readFirstProfile(dstConfig);
+        check("destination-fixture".equals(imported.getString("apiKey")) && imported.getString("extraHeadersJson").contains("local-header"), "Matched local credentials");
+        check(imported.getString("model").equals("model-1") && imported.getString("baseUrl").equals(endpoint), "Preserve provider settings");
+        org.json.JSONArray restored = new org.json.JSONArray((String)BackupPreferences.read(Files.readAllBytes(dstShelf)).get("items"));
+        check(restored.getJSONObject(0).getString("a").equals(dstBody.toFile().getAbsolutePath())
+                && restored.getJSONObject(0).getInt("y") == 72 && Arrays.equals(Files.readAllBytes(dstBody), offline), "Rebased offline body and scroll position");
+        check(!restored.getJSONObject(1).has("a"), "Missing body falls back to URL");
+        Files.write(dstConfig, profileFixture("https://other.invalid/v1", "wrong-place", "wrong-header"));
+        BackupManager.importToDir(dst, new ByteArrayInputStream(portable));
+        check(!readFirstProfile(dstConfig).has("apiKey"), "A different endpoint never receives local credentials");
+
+        byte[] legacy = legacyZip(Map.of(babel, sourceBabel, shelf, oldShelf));
+        Files.write(dstConfig, localBabel);
+        BackupManager.importToDir(dst, new ByteArrayInputStream(legacy));
+        check("destination-fixture".equals(readFirstProfile(dstConfig).getString("apiKey")), "Legacy plain keys treated as untrusted");
+        check(!new org.json.JSONArray((String)BackupPreferences.read(Files.readAllBytes(dstShelf)).get("items")).getJSONObject(0).has("a"), "Legacy index-only restore drops stale absolute path");
+        byte[] before = Files.readAllBytes(dstConfig);
+        byte[] beforeShelf = Files.readAllBytes(dstShelf);
+        char[] password = "迁移 demo 123".toCharArray();
+        out.reset();
+        BackupManager.exportFromDir(src, out, password);
+        byte[] encrypted = out.toByteArray();
+        check(BackupEnvelope.encrypted(new java.io.BufferedInputStream(new ByteArrayInputStream(encrypted))), "Encrypted header detection");
+        byte[] corrupt = encrypted.clone();
+        corrupt[corrupt.length - 1] ^= 1;
+        for (byte[] bad : new byte[][]{encrypted, corrupt, Arrays.copyOf(encrypted, encrypted.length - 20)}) {
+            try {
+                BackupManager.importToDir(dst, new ByteArrayInputStream(bad), bad == encrypted ? "incorrect".toCharArray() : password);
+                throw new AssertionError("Expected authentication failure");
+            } catch (IOException expected) {
+                check(Arrays.equals(before, Files.readAllBytes(dstConfig)) && Arrays.equals(beforeShelf, Files.readAllBytes(dstShelf)), "Failed authentication preserves both prefs");
+                check(Arrays.equals(offline, Files.readAllBytes(dstBody)), "Failed authentication preserves body");
+            }
+        }
+        BackupManager.importToDir(dst, new ByteArrayInputStream(encrypted), password);
+        JSONObject secretProfile = readFirstProfile(dstConfig);
+        check("source-fixture".equals(secretProfile.getString("apiKey")) && secretProfile.getString("extraHeadersJson").contains("source-header"), "Authenticated export restores both secrets");
+        check(Arrays.equals(offline, Files.readAllBytes(dstBody)), "Encrypted multi-record body round-trip");
+        byte[] invalid = legacyZip(Map.of(babel, localBabel, shelf, "<map><int name='items' value='broken'/></map>".getBytes(StandardCharsets.UTF_8)));
+        assertImportRejected(dst, invalid, "invalid preference XML after valid entry");
+        check("source-fixture".equals(readFirstProfile(dstConfig).getString("apiKey")), "Invalid XML leaves destination intact");
+        assertImportRejected(dst, Arrays.copyOf(portable, portable.length - 22), "missing ZIP central directory footer");
+        SharedPreferences live = mockPrefs();
+        BackupPreferences.replace(live, Map.of("config_json", "new-in-process", "schema_version", 1));
+        check(live.getString("config_json", "").equals("new-in-process") && live.getInt("schema_version", 0) == 1, "Restored values visible on existing preference instance");
+        check(!Files.exists(dstBody.resolveSibling("deadbeef.mht")), "Unreferenced body not restored");
+        byte[] finalConfig = Files.readAllBytes(dstConfig);
+        BackupManager.RestoreControl cancel = new BackupManager.RestoreControl();
+        ByteArrayInputStream cancelDuringRead = new ByteArrayInputStream(portable) {
+            @Override public synchronized int read(byte[] buffer, int off, int len) {
+                int count = super.read(buffer, off, len);
+                if (pos > 40000) cancel.cancel();
+                return count;
+            }
+        };
+        try {
+            BackupManager.restore(null, dst, null, cancelDuringRead, null, cancel);
+            throw new AssertionError("Expected cancellation");
+        } catch (java.io.InterruptedIOException expected) {
+            check(Arrays.equals(finalConfig, Files.readAllBytes(dstConfig)), "Canceled restore preserves destination credentials");
+        }
+        BackupManager.RestoreControl apply = new BackupManager.RestoreControl();
+        apply.beginApply();
+        check(!apply.cancel(), "Commit phase completes as one unit");
+    }
+
+    private static byte[] profileFixture(String endpoint, String key, String header) throws Exception {
+        JSONObject profile = new JSONObject().put("id", "local-ai").put("apiFormat", "openai_compat").put("baseUrl", endpoint)
+                .put("apiKey", key).put("extraHeadersJson", new JSONObject().put("X-Custom", header).toString()).put("model", "model-1");
+        JSONObject config = new JSONObject().put("aiProfiles", new org.json.JSONArray().put(profile)).put("targetLang", "de");
+        return BackupPreferences.encode(Map.of("config_json", config.toString(), "schema_version", 1));
+    }
+
+    private static JSONObject readFirstProfile(Path path) throws Exception {
+        String json = (String)BackupPreferences.read(Files.readAllBytes(path)).get("config_json");
+        return new JSONObject(json).getJSONArray("aiProfiles").getJSONObject(0);
+    }
+
+    private static byte[] legacyZip(Map<String,byte[]> items) throws IOException {
+        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        try (ZipOutputStream zip = new ZipOutputStream(bytes)) {
+            zip.putNextEntry(new ZipEntry("manifest.json"));
+            zip.write("{\"formatVersion\":1,\"appVersion\":\"0.4.0\"}".getBytes(StandardCharsets.UTF_8));
+            zip.closeEntry();
+            for (Map.Entry<String,byte[]> item : items.entrySet()) {
+                zip.putNextEntry(new ZipEntry(item.getKey()));
+                zip.write(item.getValue());
+                zip.closeEntry();
+            }
+        }
+        return bytes.toByteArray();
     }
 
     private static byte[] makeOversizedZip() throws IOException {
@@ -533,12 +665,36 @@ public final class V040EnginesCheck {
         check(rejected, "BackupManager must reject " + label);
     }
 
+    private static void checkServiceWorkerRules() throws IOException {
+        FilterRules.Builder builder = new FilterRules.Builder();
+        builder.read(new java.io.StringReader(String.join("\n",
+                "||ads.example.org^$third-party", "||cdn.example.net^",
+                "@@||cdn.example.net^$domain=reader.example",
+                "||media.example.net^$image,domain=reader.example",
+                "@@||reader.example/checkout$document")));
+        FilterRules rules = builder.build();
+        Map<String, String> headers = Map.of("origin", "https://app.example", "referer", "https://reader.example/topic",
+                "sec-fetch-dest", "image");
+        String page = SiteFilter.workerSource(headers);
+        check("https://reader.example/topic".equals(page), "Worker keeps Referer path and prefers it over Origin");
+        check("https://app.example".equals(SiteFilter.workerSource(Map.of("Origin", "https://app.example"))), "Origin fallback");
+        check(SiteFilter.workerSource(Map.of("Origin", "null")) == null, "Opaque worker source is unknown");
+        check(SiteFilter.workerMatch(rules, page, "reader.example", "ads.example.org", "https://ads.example.org/a", "/a", headers), "Worker third-party rule");
+        check(!SiteFilter.workerMatch(rules, page, "reader.example", "cdn.example.net", "https://cdn.example.net/a", "/a", headers), "Worker site exception");
+        check(SiteFilter.workerMatch(rules, page, "reader.example", "media.example.net", "https://media.example.net/a", "/a", headers), "Worker typed resource");
+        check(!SiteFilter.workerMatch(rules, "https://reader.example/checkout", "reader.example", "ads.example.org", "https://ads.example.org/a", "/a", headers), "Worker document exception");
+        check(!SiteFilter.workerMatch(rules, "https://reader.example/", "reader.example", "ads.example.org", "https://ads.example.org/a", "/a", Map.of("Origin", "https://reader.example")), "Origin-only worker preserves potential checkout exception");
+        check(SiteFilter.workerMatch(rules, "https://other.example", "other.example", "ads.example.org", "https://ads.example.org/a", "/a", Map.of()), "Unrelated origin still blocks third-party requests");
+    }
+
     private static void checkStartPageConfig() {
         check(StartPageConfig.presets().size() == 5, "5 built-in start page presets");
         check("https://go.itab.link/".equals(StartPageConfig.presets().get(1).url), "iTab preset URL");
 
         SharedPreferences prefs = mockPrefs();
         StartPageConfig cfg = new StartPageConfig(prefs);
+        check(cfg.isSearchOnly(), "Native home and new tabs default to search only");
+        cfg.setSearchOnly(false);
         check(cfg.resolveHomeUrl() == null && cfg.resolveNewTabUrl() == null, "Default resolves to native (null)");
         check(!cfg.isShowHomeButton(), "Default showHomeButton is false");
 
@@ -598,6 +754,7 @@ public final class V040EnginesCheck {
 
         // Reload round-trip check
         StartPageConfig reopened = new StartPageConfig(prefs);
+        check(!reopened.isSearchOnly(), "Opting into the full native home survives reopening");
         check("https://go.itab.link/".equals(reopened.resolveHomeUrl()), "Reloaded homeUrl matches");
         check(reopened.hostAppJumpPolicy("zhihu.com") == -1, "Reloaded host policy matches");
         check(StartPageConfig.clampMinFontSize(8) == 12 && StartPageConfig.clampMinFontSize(0) == 0

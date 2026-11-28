@@ -151,6 +151,12 @@ final class FilterRules {
     }
 
     boolean exceptsPage(String host, String url, boolean cosmetic) {
+        return exceptsPage(host, url, cosmetic, false);
+    }
+
+    // Referrer policy may remove the client path. Honor a matching host's document
+    // exceptions conservatively when a worker request has only the origin to go on.
+    boolean exceptsPage(String host, String url, boolean cosmetic, boolean unknownPath) {
         if (host == null || url == null || pageExceptions.isEmpty()) return false;
         int pathStart = -1;
         int urlLen = url.length();
@@ -162,6 +168,7 @@ final class FilterRules {
                 if (bucket instanceof Rule) {
                     Rule rule = (Rule) bucket;
                     if (!rule.isCosmeticOnly() || cosmetic) {
+                        if (unknownPath && rule.scope.applies(host)) return true;
                         if (rule.pattern != null && pathStart < 0) pathStart = anchoredOffset(url);
                         if (rule.matchesPage(host, url, pathStart, urlLen)) return true;
                     }
@@ -170,6 +177,7 @@ final class FilterRules {
                     for (int i = 0; i < list.length; i++) {
                         Rule rule = list[i];
                         if (rule.isCosmeticOnly() && !cosmetic) continue;
+                        if (unknownPath && rule.scope.applies(host)) return true;
                         if (rule.pattern != null && pathStart < 0) pathStart = anchoredOffset(url);
                         if (rule.matchesPage(host, url, pathStart, urlLen)) return true;
                     }

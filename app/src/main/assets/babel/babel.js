@@ -19,6 +19,9 @@
         'LI', 'TD', 'TH', 'BLOCKQUOTE', 'FIGCAPTION', 'DT', 'DD', 'SUMMARY', 'CAPTION'
     ]);
     const CONTAINER_CANDIDATE_TAGS = new Set(['DIV', 'ARTICLE', 'SECTION', 'SPAN', 'MAIN']);
+    const BLOCK_SELECTOR = 'p,h1,h2,h3,h4,h5,h6,li,td,th,blockquote,figcaption,dt,dd,summary,caption,article,div,section,[data-testid="tweetText"],.comment-body';
+    const OWN_SELECTOR = '.' + TR_CLASS + ',[' + UI_ATTR + ']';
+    const EDIT_QUIET_MS = 240;
     const NAV_TAGS = new Set(['NAV', 'HEADER', 'FOOTER']);
     const NAV_ROLES = new Set(['navigation', 'menubar', 'toolbar', 'tablist', 'menu']);
     const SKIP_SELECTOR = [
@@ -55,7 +58,6 @@
 
     let io = null;
     let mo = null;
-    let moTimer = 0;
     let flushTimer = 0;
     let selTimer = 0;
     let seq = 0;
@@ -65,8 +67,9 @@
     const observedNodes = new Set();
     const translatedNodes = new Set();
     const pendingQueue = [];
-    let queuedSet = new WeakSet();
-    const pendingBatches = new Map();     // reqId -> { gen, entries: [{ id, el }] }
+    let currentEntries = new WeakMap();   // el -> latest queued, in-flight or rendered source
+    const refreshTimers = new Map();      // debounce independently so other blocks can settle
+    const pendingBatches = new Map();     // reqId -> { gen, entries: [{ id, el, text }] }
     const pendingSelections = new Map();  // reqId -> { text }
     const pendingInputs = new Map();      // reqId -> { el, origText }
     const spaceTracker = new WeakMap();   // el -> { times: number[], lastKeyTs: number, lastVal: string, timer: number }
@@ -483,50 +486,79 @@
         return needsTranslation(text, config.targetLang);
     }
 
-    function discoverAndObserve(root) {
-        if (!config.enabled || !io) return;
-        const scope = root && root.querySelectorAll ? root : document.body;
-        if (!scope) return;
+    function observeBlock(el) {
+        if (!observedNodes.has(el) && !refreshTimers.has(el) && isEligibleBlock(el)) {
+            observedNodes.add(el);
+            io.observe(el);
+        }
+    }
 
-        const candidates = [];
-        if (scope !== document.body && isEligibleBlock(scope)) {
-            candidates.push(scope);
+    function discoverAndObserve(scope) {
+        if (!config.enabled || !io || !scope || !scope.isConnected) return;
+        if (scope.matches(BLOCK_SELECTOR)) observeBlock(scope);
+        if (scope.childElementCount) scope.querySelectorAll(BLOCK_SELECTOR).forEach(observeBlock);
+    }
+
+    function scheduleBlockRefresh(el) {
+        const current = currentEntries.get(el);
+        if (current) {
+            if (extractCleanText(el) === current.text && el.lastChild === current.font) return;
+            removeTranslationNode(el); // expose current source immediately, including in replace mode
         }
-        const selector = 'p,h1,h2,h3,h4,h5,h6,li,td,th,blockquote,figcaption,dt,dd,summary,caption,article,div,[data-testid="tweetText"]';
-        let list;
-        try {
-            list = scope.querySelectorAll(selector);
-        } catch (_) {
-            return;
-        }
-        for (let i = 0; i < list.length; i++) {
-            const el = list[i];
-            if (observedNodes.has(el)) continue;
-            if (isEligibleBlock(el)) {
-                candidates.push(el);
+        if (observedNodes.delete(el)) io.unobserve(el);
+        clearTimeout(refreshTimers.get(el));
+        refreshTimers.set(el, setTimeout(() => {
+            refreshTimers.delete(el);
+            if (el.isConnected) observeBlock(el);
+        }, EDIT_QUIET_MS));
+    }
+
+    function onPageMutations(records) {
+        const changed = new Set();
+        const addedRoots = new Set();
+        for (const record of records) {
+            const target = record.target.nodeType === 1 ? record.target : record.target.parentElement;
+            if (!target || !target.isConnected || target.closest(OWN_SELECTOR)) continue;
+            if (record.type === 'childList') {
+                let sourceChanged = false;
+                for (const node of record.addedNodes) {
+                    if (node.nodeType === 1 && !node.matches(OWN_SELECTOR)) {
+                        addedRoots.add(node);
+                        sourceChanged = true;
+                    } else if (node.nodeType === 3) sourceChanged = true;
+                }
+                const entry = currentEntries.get(target);
+                for (const node of record.removedNodes) {
+                    if (node.nodeType === 3 || (node.nodeType === 1 && !node.matches(OWN_SELECTOR)) ||
+                            (entry && node === entry.font)) sourceChanged = true;
+                }
+                if (!sourceChanged) continue;
+            }
+            const nearest = target.closest(BLOCK_SELECTOR);
+            if (!nearest) continue;
+            changed.add(nearest);
+            // Inline wrappers can qualify as candidates themselves while their parent owns the translation.
+            for (let el = nearest.parentElement; el && el !== document.body; el = el.parentElement) {
+                if (observedNodes.has(el) || refreshTimers.has(el)) changed.add(el);
             }
         }
-        for (let i = 0; i < candidates.length; i++) {
-            const el = candidates[i];
-            if (!observedNodes.has(el)) {
-                observedNodes.add(el);
-                io.observe(el);
-            }
-        }
+        changed.forEach(scheduleBlockRefresh);
+        addedRoots.forEach(discoverAndObserve);
     }
 
     function enqueueElement(el) {
         if (!config.enabled || !el || !el.isConnected) return;
-        if (queuedSet.has(el)) return;
+        if (currentEntries.has(el) || refreshTimers.has(el)) return;
         if (el.dataset.aikoBabelState === 'done' || el.dataset.aikoBabelState === 'pending') return;
         if (isSkippedElement(el)) return;
         const text = extractCleanText(el);
         if (!needsTranslation(text, config.targetLang)) return;
 
-        queuedSet.add(el);
         el.dataset.aikoBabelState = 'pending';
-        insertOrUpdateTranslationNode(el, '…', true);
-        pendingQueue.push({ id: 'n_' + (++nodeCounter), el, text });
+        const font = insertOrUpdateTranslationNode(el, '…', true);
+        const entry = { id: 'n_' + (++nodeCounter), el, text, font };
+        currentEntries.set(el, entry);
+        pendingQueue.push(entry);
 
         if (!flushTimer) {
             flushTimer = setTimeout(flushPendingBatches, 90);
@@ -551,7 +583,7 @@
                     break;
                 }
                 pendingQueue.shift();
-                if (!next.el.isConnected) continue;
+                if (!next.el.isConnected || currentEntries.get(next.el) !== next) continue;
                 batch.push(next);
                 charSum += next.text.length;
             }
@@ -566,6 +598,12 @@
                 items: batch.map(item => ({ id: item.id, text: item.text }))
             });
         }
+    }
+
+    function acceptsReply(entry) {
+        // Check the live DOM as well: a bridge callback can beat MutationObserver delivery.
+        return entry.el.isConnected && currentEntries.get(entry.el) === entry &&
+            extractCleanText(entry.el) === entry.text;
     }
 
     // ---- Safe <font class="aiko-babel-tr"> Injection & Style Sync ----
@@ -615,8 +653,8 @@
                     tr.classList.toggle('aiko-babel-revealed');
                 }
             });
-            el.appendChild(tr);
         }
+        if (el.lastChild !== tr) el.appendChild(tr);
         tr.setAttribute('data-style', config.style);
         tr.classList.toggle('aiko-babel-loading', !!isLoading);
         tr.textContent = translatedText;
@@ -626,7 +664,8 @@
 
     function removeTranslationNode(el) {
         if (!el) return;
-        queuedSet.delete(el);
+        currentEntries.delete(el);
+        translatedNodes.delete(el);
         applyReplaceMetrics(el, false);
         for (let i = el.children.length - 1; i >= 0; i--) {
             const child = el.children[i];
@@ -683,29 +722,8 @@
         }
 
         if (typeof MutationObserver === 'function' && document.body) {
-            mo = new MutationObserver((mutations) => {
-                if (!config.enabled) return;
-                let hasAdded = false;
-                for (let i = 0; i < mutations.length; i++) {
-                    const m = mutations[i];
-                    for (let j = 0; j < m.addedNodes.length; j++) {
-                        const n = m.addedNodes[j];
-                        if (n.nodeType === 1 && !n.classList.contains(TR_CLASS) && !n.hasAttribute(UI_ATTR)) {
-                            hasAdded = true;
-                            break;
-                        }
-                    }
-                    if (hasAdded) break;
-                }
-                if (hasAdded) {
-                    if (moTimer) clearTimeout(moTimer);
-                    moTimer = setTimeout(() => {
-                        moTimer = 0;
-                        discoverAndObserve(document.body);
-                    }, 240);
-                }
-            });
-            mo.observe(document.body, { childList: true, subtree: true });
+            mo = new MutationObserver(onPageMutations);
+            mo.observe(document.body, { childList: true, characterData: true, subtree: true });
         }
 
         discoverAndObserve(document.body);
@@ -717,7 +735,8 @@
         config.enabled = false;
         activeGeneration += 1;
         if (flushTimer) { clearTimeout(flushTimer); flushTimer = 0; }
-        if (moTimer) { clearTimeout(moTimer); moTimer = 0; }
+        refreshTimers.forEach(clearTimeout);
+        refreshTimers.clear();
         if (io) { try { io.disconnect(); } catch (_) { } io = null; }
         if (mo) { try { mo.disconnect(); } catch (_) { } mo = null; }
 
@@ -739,7 +758,7 @@
         }
         observedNodes.clear();
         translatedNodes.clear();
-        queuedSet = new WeakSet();
+        currentEntries = new WeakMap();
         syncFab();
         postToNative({ type: 'state', active: false });
     }
@@ -1239,29 +1258,33 @@
             pendingBatches.delete(reqId);
             if (!config.enabled || job.gen !== activeGeneration) return;
             const list = Array.isArray(translations) ? translations : [];
+            let applied = false;
             for (let i = 0; i < job.entries.length; i++) {
                 const entry = job.entries[i];
+                if (!acceptsReply(entry)) continue;
+                applied = true;
                 const trText = typeof list[i] === 'string' ? list[i].trim() : '';
-                if (!entry.el.isConnected) continue;
                 if (trText) {
                     entry.el.dataset.aikoBabelState = 'done';
-                    insertOrUpdateTranslationNode(entry.el, trText, false);
+                    entry.font = insertOrUpdateTranslationNode(entry.el, trText, false);
                     translatedNodes.add(entry.el);
                 } else {
                     removeTranslationNode(entry.el);
                 }
             }
-            if (fabEl && fabEl.isConnected) fabEl.textContent = '译 · 双语';
+            if (applied && fabEl && fabEl.isConnected) fabEl.textContent = '译 · 双语';
         },
 
         applyBatchError(reqId, message) {
             const job = pendingBatches.get(reqId);
             if (!job) return;
             pendingBatches.delete(reqId);
-            for (let i = 0; i < job.entries.length; i++) {
-                removeTranslationNode(job.entries[i].el);
+            if (!config.enabled || job.gen !== activeGeneration) return;
+            const failed = job.entries.filter(acceptsReply);
+            for (const entry of failed) {
+                removeTranslationNode(entry.el);
             }
-            if (fabEl && fabEl.isConnected) {
+            if (failed.length && fabEl && fabEl.isConnected) {
                 fabEl.textContent = '译 · 点按重试';
                 fabEl.title = message || '翻译失败';
             }

@@ -68,7 +68,7 @@ final class AikoV040Ui {
         void onNightComfortChanged();
         void onTypographyOrPrivacyChanged();
         void pickCustomFont();
-        void startBackupExport();
+        void startBackupExport(boolean encrypted);
         void startBackupImport();
         void reloadCurrentTab();
         boolean effectiveDarkWeb(String host);
@@ -104,6 +104,12 @@ final class AikoV040Ui {
 
         LinearLayout homeCard = cardBox(act, d);
         body.addView(homeCard, mb(d, 8));
+
+        homeCard.addView(switchRow(act, d, "原生页仅显示搜索框", "关闭后显示快捷访问和稍后读",
+                cfg.isSearchOnly(), enabled -> {
+                    cfg.setSearchOnly(enabled);
+                    host.onStartPageOrBarChanged();
+                }));
 
         String activeHomeUrl = cfg.resolveHomeUrl();
         String currentHomeDesc = activeHomeUrl == null ? "Aiko 原生极速页" : activeHomeUrl;
@@ -963,22 +969,31 @@ final class AikoV040Ui {
         infoCard.setBackground(AikoTheme.glowBanner(dp(d, 16)));
         panel.addView(infoCard, mb(d, 12));
 
-        TextView head = label(act, "一键打包全站配置与油猴/巴别塔资产", 14, AikoTheme.TEXT, true);
+        TextView head = label(act, "选择备份方式", 14, AikoTheme.TEXT, true);
         infoCard.addView(head, mb(d, 6));
 
         TextView desc = label(act,
-                "• 完整包含：书签/历史/快捷拨号、主题色、性能模式、广告订阅与自定义规则、站点盾牌、油猴脚本、巴别塔 AI 配置、主页定制、自定义 !Bang 与导入字体。\n"
-                        + "• 安全隐私：自动排除 WebView 缓存与登录 Cookie，导入前严格校验 manifest 与路径安全。",
+                "便携备份包含书签、历史、脚本、巴别塔配置和离线书架等数据。\n"
+                        + "默认排除巴别塔 API 密钥和自定义请求头。要迁移这些凭据，请选择加密备份并妥善保存密码。",
                 12, AikoTheme.TEXT_MUTED, false);
         desc.setLineSpacing(dp(d, 3), 1f);
         infoCard.addView(desc);
 
-        TextView exportBtn = accentBtn(act, d, "导出完整备份 (.aiko)");
+        TextView exportBtn = accentBtn(act, d, "导出便携备份（不含 API 密钥）");
         exportBtn.setOnClickListener(v -> {
             dialog.dismiss();
-            host.startBackupExport();
+            host.startBackupExport(false);
         });
         panel.addView(exportBtn, new LinearLayout.LayoutParams(-1, dp(d, 46)));
+
+        TextView secureBtn = secondaryBtn(act, d, "导出加密备份（含 API 密钥）");
+        secureBtn.setOnClickListener(v -> {
+            dialog.dismiss();
+            host.startBackupExport(true);
+        });
+        LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(-1, dp(d, 44));
+        slp.topMargin = dp(d, 8);
+        panel.addView(secureBtn, slp);
 
         TextView importBtn = secondaryBtn(act, d, "从 .aiko 备份文件恢复");
         importBtn.setOnClickListener(v -> {

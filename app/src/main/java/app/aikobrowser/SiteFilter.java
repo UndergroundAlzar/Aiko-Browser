@@ -1548,29 +1548,8 @@ public final class SiteFilter {
         if (decision == null || decision.rules != snapshot) page.decision = decision = new Decision(snapshot, page);
         if (decision.excepted) return false;
 
-        Map<String, String> headers = request.getRequestHeaders();
-        String destination = null, relation = null, mode = null;
-        if (headers != null && !headers.isEmpty()) {
-            destination = headers.get("Sec-Fetch-Dest");
-            relation = headers.get("Sec-Fetch-Site");
-            if (destination == null || relation == null) {
-                for (Map.Entry<String, String> item : headers.entrySet()) {
-                    String k = item.getKey();
-                    if (k == null || k.length() < 14) continue;
-                    char c0 = k.charAt(0);
-                    if (c0 != 'S' && c0 != 's') continue;
-                    if (destination == null && "Sec-Fetch-Dest".equalsIgnoreCase(k)) destination = item.getValue();
-                    else if (relation == null && "Sec-Fetch-Site".equalsIgnoreCase(k)) relation = item.getValue();
-                    else if (mode == null && "Sec-Fetch-Mode".equalsIgnoreCase(k)) mode = item.getValue();
-                }
-            }
-        }
-        int type = FilterRules.requestType(destination, destination == null ? uri.getEncodedPath() : null);
-        if (type == 0 && "empty".equals(destination)) {
-            if (mode == null && headers != null) mode = headers.get("Sec-Fetch-Mode");
-            if ("cors".equals(mode) || "same-origin".equals(mode)) type = 64;
-        }
-        FilterRules.Rule match = snapshot.blockingRule(page.host, decision.key, host, uri.toString(), type, relation);
+        FilterRules.Rule match = matchRequest(snapshot, page.host, decision.key, host, uri.toString(),
+                uri.getEncodedPath(), request.getRequestHeaders());
         if (match == null) return false;
         page.trace.add(host, snapshot, match);
         return true;
@@ -1605,26 +1584,55 @@ public final class SiteFilter {
         String host = normal(uri.getHost());
         if (host == null) return false;
         Map<String, String> headers = request.getRequestHeaders();
-        String refHost = null;
-        if (headers != null && !headers.isEmpty()) {
-            for (Map.Entry<String, String> e : headers.entrySet()) {
-                String k = e.getKey();
-                if (k != null && ("Referer".equalsIgnoreCase(k) || "Origin".equalsIgnoreCase(k))) {
-                    String h = extractHostFast(e.getValue());
-                    if (h != null) { refHost = normal(h); break; }
-                }
-            }
-        }
-        if (refHost != null && !enabled(refHost)) return false;
-        if (!enabled(host)) return false;
+        String sourceUrl = workerSource(headers);
+        if (sourceUrl == null) return false; // A background request need not have an identifiable client.
+        String sourceHost = extractHostFast(sourceUrl);
+        if (!enabled(sourceHost)) return false;
         FilterRules snapshot = rules;
-        if (snapshot == FilterRules.EMPTY) {
-            for (int i = 0; i < TRACKERS.length; i++) {
-                if (atDomain(host, TRACKERS[i])) return true;
-            }
-            return false;
+        if (snapshot == FilterRules.EMPTY) return bootstrapMatch(sourceHost, host) != null;
+        return workerMatch(snapshot, sourceUrl, sourceHost, host, uri.toString(), uri.getEncodedPath(), headers);
+    }
+
+    static String workerSource(Map<String, String> headers) {
+        // A Referer may contain the path needed by a document exception. Origin is a fallback.
+        String source = header(headers, "Referer");
+        if (extractHostFast(source) != null) return source;
+        source = header(headers, "Origin");
+        return extractHostFast(source) != null ? source : null;
+    }
+
+    static boolean workerMatch(FilterRules rules, String sourceUrl, String sourceHost, String host,
+                               String url, String path, Map<String, String> headers) {
+        if (sourceHost == null || sourceUrl == null) return false;
+        if (rules.hasPageExceptions()) {
+            int authority = sourceUrl.indexOf("://") + 3;
+            int slash = sourceUrl.indexOf('/', authority);
+            boolean originOnly = slash < 0 || slash == sourceUrl.length() - 1 && sourceUrl.indexOf('?', authority) < 0;
+            if (rules.exceptsPage(sourceHost, sourceUrl, false, originOnly)) return false;
         }
-        return snapshot.blocksUrlFast(host, uri.toString());
+        return matchRequest(rules, sourceHost, rules.siteKey(sourceHost), host, url, path, headers) != null;
+    }
+
+    private static FilterRules.Rule matchRequest(FilterRules rules, String sourceHost, String siteKey,
+                                                 String host, String url, String path, Map<String, String> headers) {
+        String dest = header(headers, "Sec-Fetch-Dest");
+        int type = FilterRules.requestType(dest, dest == null ? path : null);
+        if (type == 0 && "empty".equals(dest)) {
+            String mode = header(headers, "Sec-Fetch-Mode");
+            if ("cors".equals(mode) || "same-origin".equals(mode)) type = 64;
+        }
+        return rules.blockingRule(sourceHost, siteKey, host, url, type, header(headers, "Sec-Fetch-Site"));
+    }
+
+    private static String header(Map<String, String> headers, String name) {
+        if (headers == null || headers.isEmpty()) return null;
+        String value = headers.get(name);
+        if (value == null) {
+            for (Map.Entry<String, String> entry : headers.entrySet()) {
+                if (name.equalsIgnoreCase(entry.getKey())) return entry.getValue();
+            }
+        }
+        return value;
     }
 
     private static String extractHostFast(String url) {

@@ -126,6 +126,8 @@ public final class MainActivity extends Activity {
     private static final int BOOKMARKS_IMPORT = 14;
     private static final int BACKUP_EXPORT = 15;
     private static final int BACKUP_IMPORT = 16;
+    private static final int BACKUP_EXPORT_ENCRYPTED = 18;
+    private char[] pendingBackupPassword;
     private static final int PICK_CUSTOM_FONT = 17;
     private static final int STATE_SAVE_MAX_BYTES = 256 * 1024;
     private static final int MAX_CUSTOM_FONT_BYTES = 16 * 1024 * 1024;
@@ -205,6 +207,7 @@ public final class MainActivity extends Activity {
 
     // Reusable Home view & dynamic sections
     private ScrollView homeView;
+    private boolean homeBuiltSearchOnly;
     private FrameLayout homeEmblemFrame;
     private LinearLayout homeBoxRow, homeSpeedGrid, homeShelfSection, homeShelfList;
     private BrowserIcon homeGoButton, homeQrButton;
@@ -444,7 +447,6 @@ public final class MainActivity extends Activity {
             String origin = SearchEngines.searchOrigin(SearchEngines.currentId(this), SearchEngines.customTemplate(this));
             if (origin != null && !origin.isEmpty()) {
                 WebViewPerf.preconnect(origin, siteFilter);
-                WebViewPerf.preconnectHost(origin);
             }
         }
         scheduleNewTabPreload(400L);
@@ -488,6 +490,7 @@ public final class MainActivity extends Activity {
             @Override public void onStartPageOrBarChanged() {
                 applyInsetsLayout();
                 updateChrome();
+                if (onHome) showHomeView();
                 releasePreloadedNewTab();
                 scheduleNewTabPreload(450L);
             }
@@ -504,7 +507,7 @@ public final class MainActivity extends Activity {
                 }
             }
             @Override public void pickCustomFont() { startCustomFontPicker(); }
-            @Override public void startBackupExport() { MainActivity.this.startBackupExport(); }
+            @Override public void startBackupExport(boolean encrypted) { MainActivity.this.startBackupExport(encrypted); }
             @Override public void startBackupImport() { MainActivity.this.startBackupImport(); }
             @Override public void reloadCurrentTab() { reloadPreservingScroll(); }
             @Override public boolean effectiveDarkWeb(String host) { return MainActivity.this.effectiveDarkWeb(host); }
@@ -591,8 +594,8 @@ public final class MainActivity extends Activity {
                             ? URLUtil.guessFileName(url, null, null) : filename.trim();
                     int lanes = Math.min(16, activeProfile.downloadLanes);
                     try {
-                        DownloadService.start(MainActivity.this, url, fname, null, lanes);
-                        toast("油猴脚本已启动高速下载：" + fname);
+                        DownloadService.start(MainActivity.this, url, fname, null, lanes,
+                                () -> toast("已加入下载队列：" + fname));
                     } catch (Exception e) {
                         showNewDownload(url, fname, null);
                     }
@@ -1889,7 +1892,16 @@ public final class MainActivity extends Activity {
     }
 
     private void ensureHomeView() {
-        if (homeView != null) return;
+        boolean searchOnly = startPageConfig == null || startPageConfig.isSearchOnly();
+        if (homeView != null && homeBuiltSearchOnly == searchOnly) return;
+        if (homeView != null) {
+            page.removeView(homeView);
+            homeEmblemFrame = null;
+            homeStatusPill = homeEngineBadge = homeAddPin = null;
+            homeGoButton = homeQrButton = null;
+            homeSpeedGrid = homeShelfSection = homeShelfList = null;
+        }
+        homeBuiltSearchOnly = searchOnly;
         homeView = new ScrollView(this);
         homeView.setFillViewport(true);
         homeView.setVerticalScrollBarEnabled(false);
@@ -1897,40 +1909,11 @@ public final class MainActivity extends Activity {
 
         LinearLayout container = new LinearLayout(this);
         container.setOrientation(LinearLayout.VERTICAL);
-        container.setGravity(Gravity.CENTER_HORIZONTAL);
-        container.setPadding(dp(20), dp(48), dp(20), dp(28));
+        container.setGravity(searchOnly ? Gravity.CENTER : Gravity.CENTER_HORIZONTAL);
+        container.setPadding(dp(20), dp(searchOnly ? 24 : 48), dp(20), dp(searchOnly ? 24 : 28));
         homeView.addView(container, new ScrollView.LayoutParams(-1, -2));
 
-        // Airy Hero Header: Aiko emblem + brand + live performance mode pill
-        homeEmblemFrame = new FrameLayout(this);
-        homeEmblemFrame.setBackground(AikoTheme.card(AikoTheme.SURFACE, AikoTheme.STROKE_ACCENT, density, dp(22)));
-        homeEmblemFrame.setElevation(dp(8));
-        ImageView emblem = new ImageView(this);
-        emblem.setImageResource(R.drawable.aiko_pixel);
-        emblem.setScaleType(ImageView.ScaleType.FIT_CENTER);
-        homeEmblemFrame.addView(emblem, new FrameLayout.LayoutParams(dp(44), dp(44), Gravity.CENTER));
-        container.addView(homeEmblemFrame, new LinearLayout.LayoutParams(dp(68), dp(68)));
-
-        TextView brand = new TextView(this);
-        brand.setText("Aiko");
-        brand.setTextSize(28);
-        brand.setTextColor(AikoTheme.TEXT);
-        brand.setTypeface(AikoTheme.BOLD);
-        brand.setGravity(Gravity.CENTER_HORIZONTAL);
-        brand.setLetterSpacing(-0.015f);
-        LinearLayout.LayoutParams blp = new LinearLayout.LayoutParams(-2, -2);
-        blp.topMargin = dp(14);
-        container.addView(brand, blp);
-
-        homeStatusPill = AikoTheme.badge(this, density, "智能均衡 · 高刷",
-                AikoTheme.ACCENT_CYAN, AikoTheme.SURFACE, AikoTheme.CAPSULE_STROKE);
-        homeStatusPill.setForeground(AikoTheme.ripple(AikoTheme.RIPPLE_ACCENT, dp(14)));
-        AikoTheme.attachPressFeedback(homeStatusPill, 0.95f);
-        homeStatusPill.setOnClickListener(v -> showPerformanceCenter());
-        LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(-2, -2);
-        slp.topMargin = dp(8);
-        slp.bottomMargin = dp(26);
-        container.addView(homeStatusPill, slp);
+        if (!searchOnly) addHomeHeader(container);
 
         // Floating Pill Omnibox with clickable Search Engine badge
         homeBoxRow = new LinearLayout(this) {
@@ -1945,20 +1928,7 @@ public final class MainActivity extends Activity {
         homeBoxRow.setPadding(dp(8), dp(4), dp(6), dp(4));
         container.addView(homeBoxRow, new LinearLayout.LayoutParams(-1, dp(54)));
 
-        homeEngineBadge = new TextView(this);
-        homeEngineBadge.setTextSize(12);
-        homeEngineBadge.setTypeface(AikoTheme.MEDIUM);
-        homeEngineBadge.setTextColor(AikoTheme.ACCENT);
-        homeEngineBadge.setGravity(Gravity.CENTER);
-        homeEngineBadge.setPadding(dp(12), dp(6), dp(10), dp(6));
-        homeEngineBadge.setBackground(AikoTheme.card(AikoTheme.CARD, AikoTheme.STROKE, density, dp(18)));
-        homeEngineBadge.setForeground(AikoTheme.ripple(AikoTheme.RIPPLE_ACCENT, dp(18)));
-        homeEngineBadge.setContentDescription("切换搜索引擎");
-        AikoTheme.attachPressFeedback(homeEngineBadge, 0.94f);
-        homeEngineBadge.setOnClickListener(v -> showSearchEnginePicker());
-        LinearLayout.LayoutParams elp = new LinearLayout.LayoutParams(-2, dp(36));
-        elp.rightMargin = dp(10);
-        homeBoxRow.addView(homeEngineBadge, elp);
+        if (!searchOnly) addHomeEngineBadge();
 
         homeSearch = input("搜索或输入网址");
         homeSearch.setInputType(InputType.TYPE_NULL);
@@ -1977,6 +1947,10 @@ public final class MainActivity extends Activity {
             if (hasFocus) focusAddress();
         });
 
+        if (searchOnly) {
+            page.addView(homeView, new FrameLayout.LayoutParams(-1, -1));
+            return;
+        }
         homeQrButton = icon(QR, "扫码或识别二维码", () -> QrSheet.showScannerHintOrImageDecode(this, qrScanCallback));
         homeQrButton.tint(AikoTheme.TEXT_MUTED);
         AikoTheme.attachPressFeedback(homeQrButton, 0.92f);
@@ -2032,8 +2006,58 @@ public final class MainActivity extends Activity {
         page.addView(homeView, new FrameLayout.LayoutParams(-1, -1));
     }
 
+    private void addHomeHeader(LinearLayout container) {
+        // Airy Hero Header: Aiko emblem + brand + live performance mode pill
+        homeEmblemFrame = new FrameLayout(this);
+        homeEmblemFrame.setBackground(AikoTheme.card(AikoTheme.SURFACE, AikoTheme.STROKE_ACCENT, density, dp(22)));
+        homeEmblemFrame.setElevation(dp(8));
+        ImageView emblem = new ImageView(this);
+        emblem.setImageResource(R.drawable.aiko_pixel);
+        emblem.setScaleType(ImageView.ScaleType.FIT_CENTER);
+        homeEmblemFrame.addView(emblem, new FrameLayout.LayoutParams(dp(44), dp(44), Gravity.CENTER));
+        container.addView(homeEmblemFrame, new LinearLayout.LayoutParams(dp(68), dp(68)));
+
+        TextView brand = new TextView(this);
+        brand.setText("Aiko");
+        brand.setTextSize(28);
+        brand.setTextColor(AikoTheme.TEXT);
+        brand.setTypeface(AikoTheme.BOLD);
+        brand.setGravity(Gravity.CENTER_HORIZONTAL);
+        brand.setLetterSpacing(-0.015f);
+        LinearLayout.LayoutParams blp = new LinearLayout.LayoutParams(-2, -2);
+        blp.topMargin = dp(14);
+        container.addView(brand, blp);
+
+        homeStatusPill = AikoTheme.badge(this, density, "智能均衡 · 高刷",
+                AikoTheme.ACCENT_CYAN, AikoTheme.SURFACE, AikoTheme.CAPSULE_STROKE);
+        homeStatusPill.setForeground(AikoTheme.ripple(AikoTheme.RIPPLE_ACCENT, dp(14)));
+        AikoTheme.attachPressFeedback(homeStatusPill, 0.95f);
+        homeStatusPill.setOnClickListener(v -> showPerformanceCenter());
+        LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(-2, -2);
+        slp.topMargin = dp(8);
+        slp.bottomMargin = dp(26);
+        container.addView(homeStatusPill, slp);
+    }
+
+    private void addHomeEngineBadge() {
+        homeEngineBadge = new TextView(this);
+        homeEngineBadge.setTextSize(12);
+        homeEngineBadge.setTypeface(AikoTheme.MEDIUM);
+        homeEngineBadge.setTextColor(AikoTheme.ACCENT);
+        homeEngineBadge.setGravity(Gravity.CENTER);
+        homeEngineBadge.setPadding(dp(12), dp(6), dp(10), dp(6));
+        homeEngineBadge.setBackground(AikoTheme.card(AikoTheme.CARD, AikoTheme.STROKE, density, dp(18)));
+        homeEngineBadge.setForeground(AikoTheme.ripple(AikoTheme.RIPPLE_ACCENT, dp(18)));
+        homeEngineBadge.setContentDescription("切换搜索引擎");
+        AikoTheme.attachPressFeedback(homeEngineBadge, 0.94f);
+        homeEngineBadge.setOnClickListener(v -> showSearchEnginePicker());
+        LinearLayout.LayoutParams elp = new LinearLayout.LayoutParams(-2, dp(36));
+        elp.rightMargin = dp(10);
+        homeBoxRow.addView(homeEngineBadge, elp);
+    }
+
     private void refreshHomeContent() {
-        if (homeView == null) return;
+        if (homeView == null || homeBuiltSearchOnly) return;
         String engineName = SearchEngines.engineName(SearchEngines.currentId(this));
         if (homeEngineBadge != null) homeEngineBadge.setText(engineName + " ▾");
         if (homeStatusPill != null && displayMode != null) {
@@ -2122,7 +2146,6 @@ public final class MainActivity extends Activity {
         GestureChrome.attachPressScale(tile, 0.95f, () -> {
             if (activeProfile.preloadLevel > PerfProfiles.PRELOAD_OFF) {
                 WebViewPerf.preconnect(entry.url, siteFilter);
-                WebViewPerf.preconnectHost(entry.url);
             }
         });
         tile.setOnClickListener(v -> navigate(entry.url));
@@ -2440,7 +2463,7 @@ public final class MainActivity extends Activity {
             for (BrowserLibrary.Entry item : matches) {
                 if (showedCurrentCard && current != null && item.url.equals(current.url)) continue;
                 if (!preconnectedTop && !searchKey.isEmpty() && activeProfile.preloadLevel > PerfProfiles.PRELOAD_OFF) {
-                    WebViewPerf.preconnectHost(item.url);
+                    WebViewPerf.preconnect(item.url, siteFilter);
                     preconnectedTop = true;
                 }
                 boolean saved = library.isBookmarked(item.url);
@@ -2591,7 +2614,6 @@ public final class MainActivity extends Activity {
                 if (ev.getActionMasked() == MotionEvent.ACTION_DOWN
                         && activeProfile.preloadLevel > PerfProfiles.PRELOAD_OFF) {
                     WebViewPerf.preconnect(preconnectUrl, siteFilter);
-                    WebViewPerf.preconnectHost(preconnectUrl);
                 }
                 return false;
             });
@@ -7370,7 +7392,7 @@ public final class MainActivity extends Activity {
             PackageInfo pi = getPackageManager().getPackageInfo(getPackageName(), 0);
             if (pi != null && pi.versionName != null && !pi.versionName.isEmpty()) return pi.versionName;
         } catch (Exception ignored) { }
-        return "0.4.0";
+        return BackupManager.APP_VERSION;
     }
 
     private void showAboutSheet() {
@@ -7753,9 +7775,10 @@ public final class MainActivity extends Activity {
                 }
                 String filename = file.getText().toString().trim();
                 if (filename.isEmpty()) filename = URLUtil.guessFileName(chosen, null, null);
-                DownloadService.start(this, chosen, filename, ua, lanes);
+                DownloadService.start(this, chosen, filename, ua, lanes, () -> {
+                    if (!isFinishing() && !isDestroyed()) showDownloads();
+                });
                 d.dismiss();
-                showDownloads();
                 if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)
                         != PackageManager.PERMISSION_GRANTED && !mainPrefs.getBoolean("notif", false)) {
                     mainPrefs.edit().putBoolean("notif", true).apply();
@@ -7908,13 +7931,69 @@ public final class MainActivity extends Activity {
         if (sameOpenSite(tab, host)) reloadPreservingScroll();
     }
 
-    private void startBackupExport() {
+    private void startBackupExport(boolean encrypted) {
+        clearBackupPassword();
+        if (encrypted) {
+            askBackupPassword(true, password -> {
+                pendingBackupPassword = password;
+                pickBackupDestination(true);
+            });
+        } else pickBackupDestination(false);
+    }
+
+    private void clearBackupPassword() {
+        if (pendingBackupPassword != null) java.util.Arrays.fill(pendingBackupPassword, '\0');
+        pendingBackupPassword = null;
+    }
+
+    private void pickBackupDestination(boolean encrypted) {
         Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT)
                 .addCategory(Intent.CATEGORY_OPENABLE)
                 .setType("application/octet-stream")
                 .putExtra(Intent.EXTRA_TITLE, BackupManager.suggestedFilename());
-        try { startActivityForResult(intent, BACKUP_EXPORT); }
-        catch (RuntimeException e) { toast("找不到可用的文件管理器"); }
+        try { startActivityForResult(intent, encrypted ? BACKUP_EXPORT_ENCRYPTED : BACKUP_EXPORT); }
+        catch (RuntimeException e) { clearBackupPassword(); toast("找不到可用的文件管理器"); }
+    }
+
+    private EditText backupPasswordField(String hint) {
+        EditText field = new EditText(this);
+        field.setHint(hint);
+        field.setSingleLine(true);
+        field.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
+        field.setImeOptions(EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING | EditorInfo.IME_ACTION_DONE);
+        field.setImportantForAutofill(View.IMPORTANT_FOR_AUTOFILL_NO);
+        field.setSaveEnabled(false);
+        return field;
+    }
+
+    private void askBackupPassword(boolean exporting, java.util.function.Consumer<char[]> action) {
+        LinearLayout fields = new LinearLayout(this);
+        fields.setOrientation(LinearLayout.VERTICAL);
+        fields.setPadding(dp(18), 0, dp(18), 0);
+        EditText first = backupPasswordField(exporting ? "设置密码（至少 8 个字符）" : "输入备份密码");
+        EditText confirm = exporting ? backupPasswordField("再次输入密码") : null;
+        fields.addView(first);
+        if (confirm != null) fields.addView(confirm);
+        AlertDialog dialog = new AlertDialog.Builder(this)
+                .setTitle(exporting ? "加密整个备份" : "恢复加密备份")
+                .setMessage(exporting ? "请保管好密码。恢复巴别塔密钥和其他数据时需要它。" : "将覆盖备份中包含的设置和文件，包括巴别塔凭据。")
+                .setView(fields).setNegativeButton("取消", null)
+                .setPositiveButton(exporting ? "选择保存位置" : "解密并恢复", null).create();
+        dialog.getWindow().addFlags(WindowManager.LayoutParams.FLAG_SECURE);
+        dialog.setOnDismissListener(d -> {
+            first.getText().clear();
+            if (confirm != null) confirm.getText().clear();
+        });
+        dialog.show();
+        dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(v -> {
+            Editable input = first.getText();
+            if (input.length() < (exporting ? 8 : 1)) { first.setError(exporting ? "至少 8 个字符" : "请输入密码"); return; }
+            if (confirm != null && !TextUtils.equals(input, confirm.getText())) { confirm.setError("两次密码不同"); return; }
+            char[] password = new char[input.length()];
+            input.getChars(0, input.length(), password, 0);
+            dialog.dismiss();
+            action.accept(password);
+        });
     }
 
     private void startBackupImport() {
@@ -8000,32 +8079,70 @@ public final class MainActivity extends Activity {
         if (clipboardCapsule != null) clipboardCapsule.setVisibility(View.GONE);
     }
 
-    private void reloadAllConfigsAfterBackupRestore() {
-        AikoTheme.applyTheme(this);
-        applyLiveTheme();
-        if (startPageConfig != null) startPageConfig.reload();
-        if (menuConfig != null) menuConfig.reload();
-        if (bangCatalog != null) bangCatalog.reload();
-        BabelEngine oldBabel = babelEngine;
-        babelConfig = new BabelConfig(this);
-        babelEngine = new BabelEngine(babelConfig);
-        if (oldBabel != null) oldBabel.shutdown();
-        babelUi = new BabelUi(this, babelConfig, babelEngine, new BabelUi.HostCallbacks() {
-            @Override public void toast(String msg) { MainActivity.this.toast(msg); }
-            @Override public void speakText(String text, String lang) {
-                if (readAloud != null) readAloud.speak(text, lang);
-            }
-            @Override public void onStateChanged() { updateChrome(); }
+    private void writeBackup(Uri uri, char[] password) {
+        userScripts.flushValues();
+        library.flushHistory();
+        toast("正在导出备份…");
+        ioExecutor.execute(() -> {
+            try {
+                BackupManager.ExportReport result;
+                try (OutputStream out = getContentResolver().openOutputStream(uri, "wt")) {
+                    if (out == null) throw new java.io.IOException();
+                    result = BackupManager.exportToStream(this, out, password);
+                }
+                handler.post(() -> toast(result.summary));
+            } catch (Exception failure) {
+                handler.post(() -> toast("备份导出失败，请检查存储空间和文件权限"));
+            } finally { if (password != null) java.util.Arrays.fill(password, '\0'); }
         });
-        babelUi.setDisplayModeEngine(displayMode);
-        for (Tab t : tabs) {
-            if (t.view != null) babelUi.bindWebView(t.view);
-        }
-        applyAutoNightSchedule();
-        applyNightComfortOverlay();
-        applyInsetsLayout();
-        updateChrome();
-        if (onHome) refreshHomeContent();
+    }
+
+    private void confirmBackupImport(Uri uri) {
+        ioExecutor.execute(() -> {
+            try (InputStream in = getContentResolver().openInputStream(uri)) {
+                if (in == null) throw new java.io.IOException();
+                boolean encrypted = BackupEnvelope.encrypted(new java.io.BufferedInputStream(in));
+                handler.post(() -> {
+                    if (isDestroyed() || isFinishing()) return;
+                    if (encrypted) askBackupPassword(false, password -> restoreBackup(uri, password));
+                    else new AlertDialog.Builder(this).setTitle("恢复便携或旧版备份？")
+                            .setMessage("将覆盖备份中包含的设置和文件。只恢复可信来源的备份。明文备份内的巴别塔密钥和请求头将被忽略，同一配置和 API 地址可沿用本机凭据。")
+                            .setNegativeButton("取消", null).setPositiveButton("恢复", (d, w) -> restoreBackup(uri, null)).show();
+                });
+            } catch (Exception failure) { handler.post(() -> toast("无法读取备份文件")); }
+        });
+    }
+
+    private void restoreBackup(Uri uri, char[] password) {
+        userScripts.flushValues();
+        library.flushHistory();
+        BackupManager.RestoreControl control = new BackupManager.RestoreControl();
+        AlertDialog progress = new AlertDialog.Builder(this).setMessage("正在验证并恢复备份…")
+                .setNegativeButton("取消", null).setCancelable(false).show();
+        progress.getButton(AlertDialog.BUTTON_NEGATIVE).setOnClickListener(v -> {
+            boolean canceled = control.cancel();
+            progress.setMessage(canceled ? "正在取消…" : "正在写入，请稍候…");
+            v.setEnabled(false);
+        });
+        ioExecutor.execute(() -> {
+            try (InputStream in = getContentResolver().openInputStream(uri)) {
+                if (in == null) throw new java.io.IOException();
+                BackupManager.RestoreReport report = BackupManager.importFromStream(this, in, password, control);
+                handler.post(() -> {
+                    if (isDestroyed() || isFinishing()) return;
+                    progress.dismiss();
+                    toast(report.summary);
+                    recreate(); // Rebuild shelf, library, scripts and other in-memory snapshots together.
+                });
+            } catch (Exception failure) {
+                handler.post(() -> {
+                    if (isDestroyed() || isFinishing()) return;
+                    progress.dismiss();
+                    if (failure instanceof java.io.InterruptedIOException) toast("已取消恢复");
+                    else toast(password == null ? "恢复失败，请检查备份文件和存储空间" : "恢复失败，请检查密码、备份文件和存储空间");
+                });
+            } finally { if (password != null) java.util.Arrays.fill(password, '\0'); }
+        });
     }
 
     void toggleTransferPriority() {
@@ -8151,38 +8268,19 @@ public final class MainActivity extends Activity {
             picker = null;
             return;
         }
-        if (requestCode == BACKUP_EXPORT && resultCode == RESULT_OK && data != null && data.getData() != null) {
-            Uri uri = data.getData();
-            toast("正在导出完整备份 (.aiko)…");
-            ioExecutor.execute(() -> {
-                try (OutputStream out = getContentResolver().openOutputStream(uri)) {
-                    if (out == null) throw new java.io.IOException("无法写入目标文件");
-                    BackupManager.ExportReport rep = BackupManager.exportToStream(this, out);
-                    handler.post(() -> toast(rep.summary));
-                } catch (Exception e) {
-                    String err = e.getMessage();
-                    handler.post(() -> toast("备份导出失败：" + (err == null ? "请重试" : err)));
-                }
-            });
+        if (requestCode == BACKUP_EXPORT || requestCode == BACKUP_EXPORT_ENCRYPTED) {
+            if (resultCode != RESULT_OK || data == null || data.getData() == null) { clearBackupPassword(); return; }
+            char[] password = pendingBackupPassword;
+            pendingBackupPassword = null;
+            if (requestCode == BACKUP_EXPORT_ENCRYPTED && password == null) {
+                toast("备份会话已结束，请重新设置密码");
+                return;
+            }
+            writeBackup(data.getData(), password);
             return;
         }
-        if (requestCode == BACKUP_IMPORT && resultCode == RESULT_OK && data != null && data.getData() != null) {
-            Uri uri = data.getData();
-            toast("正在验证并恢复备份 (.aiko)…");
-            ioExecutor.execute(() -> {
-                try (InputStream in = getContentResolver().openInputStream(uri)) {
-                    if (in == null) throw new java.io.IOException("无法读取备份文件");
-                    BackupManager.RestoreReport rep = BackupManager.importFromStream(this, in);
-                    handler.post(() -> {
-                        if (isDestroyed()) return;
-                        reloadAllConfigsAfterBackupRestore();
-                        toast(rep.summary + "（部分偏好重启后彻底同步）");
-                    });
-                } catch (Exception e) {
-                    String err = e.getMessage();
-                    handler.post(() -> toast("备份恢复失败：" + (err == null ? "无效的 .aiko 文件" : err)));
-                }
-            });
+        if (requestCode == BACKUP_IMPORT) {
+            if (resultCode == RESULT_OK && data != null && data.getData() != null) confirmBackupImport(data.getData());
             return;
         }
         if (requestCode == PICK_CUSTOM_FONT && resultCode == RESULT_OK && data != null && data.getData() != null) {
@@ -8294,6 +8392,7 @@ public final class MainActivity extends Activity {
 
     @Override protected void onStart() {
         super.onStart();
+        DownloadService.restore(this);
         visible = true;
         if (displayMode != null) displayMode.start();
         applyAutoNightSchedule();
@@ -8334,6 +8433,7 @@ public final class MainActivity extends Activity {
     }
 
     @Override protected void onDestroy() {
+        clearBackupPassword();
         if (root != null) root.removeCallbacks(reapplyInsetsTask);
         detachHud();
         hideClipboardCapsule();

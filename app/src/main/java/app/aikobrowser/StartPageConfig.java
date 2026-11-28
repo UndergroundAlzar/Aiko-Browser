@@ -82,6 +82,7 @@ public final class StartPageConfig {
     };
 
     private static final String KEY_HOME_MODE = "home_mode";
+    private static final String KEY_SEARCH_ONLY = "native_search_only";
     private static final String KEY_HOME_URL = "home_url";
     private static final String KEY_NEWTAB_FOLLOWS_HOME = "newtab_follows_home";
     private static final String KEY_NEWTAB_MODE = "newtab_mode";
@@ -123,6 +124,7 @@ public final class StartPageConfig {
     private final Map<String, Integer> hostAppJumpMap = new HashMap<>();
 
     private PageMode homeMode = PageMode.NATIVE;
+    private boolean searchOnly = true;
     private String homeUrl = "";
     private boolean newTabFollowsHome = true;
     private PageMode newTabMode = PageMode.NATIVE;
@@ -179,6 +181,7 @@ public final class StartPageConfig {
         if (prefs == null) return;
         synchronized (lock) {
             homeMode = parsePageMode(prefs.getString(KEY_HOME_MODE, PageMode.NATIVE.name()));
+            searchOnly = prefs.getBoolean(KEY_SEARCH_ONLY, true);
             String hUrl = normalizeStartUrl(prefs.getString(KEY_HOME_URL, ""));
             homeUrl = hUrl == null ? "" : hUrl;
             newTabFollowsHome = prefs.getBoolean(KEY_NEWTAB_FOLLOWS_HOME, true);
@@ -227,6 +230,13 @@ public final class StartPageConfig {
     public PageMode getHomeMode() { synchronized (lock) { return homeMode; } }
     public String getHomeUrl() { synchronized (lock) { return homeUrl; } }
     public boolean isNewTabFollowsHome() { synchronized (lock) { return newTabFollowsHome; } }
+
+    public boolean isSearchOnly() { synchronized (lock) { return searchOnly; } }
+
+    public void setSearchOnly(boolean enabled) {
+        synchronized (lock) { searchOnly = enabled; }
+        putBoolean(KEY_SEARCH_ONLY, enabled);
+    }
     public PageMode getNewTabMode() { synchronized (lock) { return newTabMode; } }
     public String getNewTabUrl() { synchronized (lock) { return newTabUrl; } }
     public boolean isPreloadNewTab() { synchronized (lock) { return preloadNewTab; } }

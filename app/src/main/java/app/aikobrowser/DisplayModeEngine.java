@@ -62,7 +62,9 @@ public final class DisplayModeEngine {
     private int uiTid;
     // Holds AdpfHelper on API 31+ only; typed as Object so API 29-30 never loads PerformanceHintManager.
     private Object adpfController;
-    private final Runnable adpfSettleTask = this::settleAdpfBurst;
+    private Window.OnFrameMetricsAvailableListener adpfFrames;
+    private long adpfUntilMs;
+    private final Runnable adpfEnd = this::closeAdpfSession;
 
     // Live frame-pacing telemetry state (allocated ONLY when HUD is enabled).
     private HandlerThread hudThread;
@@ -200,7 +202,6 @@ public final class DisplayModeEngine {
             } catch (RuntimeException ignored) { }
         }
         apply();
-        if (adpfEnabled) ensureAdpfSession();
         if (hudListener != null) startFrameMetrics();
     }
 
@@ -224,16 +225,12 @@ public final class DisplayModeEngine {
         policy = clampPolicy(p.refreshPolicy);
         adpfEnabled = p.adpfBoost;
         apply();
-        if (adpfEnabled) {
-            if (listenerRegistered) ensureAdpfSession();
-        } else {
-            closeAdpfSession();
-        }
+        if (!adpfEnabled) closeAdpfSession();
     }
 
     /**
-     * Event-driven burst-only ADPF interaction boost (touch-down / fling start / page nav start).
-     * Never called per-frame; rate-limited against HAL preferred update rate and decays automatically.
+     * Track UI-thread work during a short interaction window. Android receives a measured
+     * frame sample at its preferred update interval; an idle window sends no samples.
      */
     public void boostInteraction(long durationMs) {
         if (!adpfEnabled || fullscreenVideo || !listenerRegistered || Build.VERSION.SDK_INT < 31) return;
@@ -241,14 +238,30 @@ public final class DisplayModeEngine {
             main.post(() -> boostInteraction(durationMs));
             return;
         }
-        if (uiTid <= 0) uiTid = Process.myTid();
-        long targetNs = targetWorkDurationNs();
-        long clampedMs = Math.max(40L, Math.min(durationMs, 1500L));
-        AdpfHelper helper = adpfHelper();
-        if (helper.boost(appContext, uiTid, targetNs, clampedMs)) {
-            main.removeCallbacks(adpfSettleTask);
-            main.postDelayed(adpfSettleTask, clampedMs);
+        long until = SystemClock.uptimeMillis() + Math.max(40L, Math.min(durationMs, 1500L));
+        if (adpfFrames == null) {
+            Window window = activity.getWindow();
+            if (window == null) return;
+            if (uiTid <= 0) uiTid = Process.myTid();
+            AdpfHelper helper = adpfHelper();
+            helper.openOrUpdate(appContext, uiTid, targetWorkDurationNs());
+            if (!helper.isActive()) return;
+            final long startNs = System.nanoTime();
+            adpfFrames = (w, metrics, dropped) -> {
+                if (metrics.getMetric(FrameMetrics.VSYNC_TIMESTAMP) >= startNs
+                        && SystemClock.uptimeMillis() < adpfUntilMs) helper.reportFrame(metrics);
+            };
+            try {
+                window.addOnFrameMetricsAvailableListener(adpfFrames, main);
+            } catch (RuntimeException e) {
+                closeAdpfSession();
+                return;
+            }
         }
+        if (until <= adpfUntilMs) return;
+        adpfUntilMs = until;
+        main.removeCallbacks(adpfEnd);
+        main.postAtTime(adpfEnd, until);
     }
 
     /** Returns true when an API 31+ ADPF hint session is currently open. */
@@ -292,6 +305,7 @@ public final class DisplayModeEngine {
     public void setFullscreenVideo(boolean fullscreen) {
         if (fullscreenVideo != fullscreen) {
             fullscreenVideo = fullscreen;
+            if (fullscreen) closeAdpfSession();
             apply();
         }
     }
@@ -691,35 +705,27 @@ public final class DisplayModeEngine {
         return (AdpfHelper) adpfController;
     }
 
-    private void ensureAdpfSession() {
-        if (!adpfEnabled || Build.VERSION.SDK_INT < 31) return;
-        if (Looper.myLooper() != Looper.getMainLooper()) {
-            main.post(this::ensureAdpfSession);
-            return;
-        }
-        if (uiTid <= 0) uiTid = Process.myTid();
-        adpfHelper().openOrUpdate(appContext, uiTid, targetWorkDurationNs());
-    }
-
-    private void settleAdpfBurst() {
-        if (Build.VERSION.SDK_INT < 31 || adpfController == null) return;
-        ((AdpfHelper) adpfController).settle(targetWorkDurationNs());
-    }
-
     private void closeAdpfSession() {
-        main.removeCallbacks(adpfSettleTask);
+        adpfUntilMs = 0;
+        main.removeCallbacks(adpfEnd);
+        if (adpfFrames != null) {
+            Window window = activity.getWindow();
+            if (window != null) {
+                try { window.removeOnFrameMetricsAvailableListener(adpfFrames); }
+                catch (RuntimeException ignored) { }
+            }
+            adpfFrames = null;
+        }
         if (Build.VERSION.SDK_INT < 31 || adpfController == null) return;
         ((AdpfHelper) adpfController).close();
     }
 
     /** Isolated API 31+ ADPF wrapper so API 29-30 never loads PerformanceHintManager classes. */
     private static final class AdpfHelper {
-        private static final long MIN_BURST_INTERVAL_NS = 80_000_000L;
-
         private PerformanceHintManager.Session session;
         private long lastTargetNs;
-        private long minUpdateRateNs = MIN_BURST_INTERVAL_NS;
-        private long lastBoostElapsedNs;
+        private long minUpdateRateNs;
+        private long lastReportNs;
         private boolean unsupported;
 
         void openOrUpdate(Context appContext, int uiTid, long targetNs) {
@@ -736,7 +742,7 @@ public final class DisplayModeEngine {
                     return;
                 }
                 long preferred = phm.getPreferredUpdateRateNanos();
-                minUpdateRateNs = Math.max(MIN_BURST_INTERVAL_NS, preferred > 0L ? preferred : 16_000_000L);
+                minUpdateRateNs = preferred > 0L ? preferred : 16_000_000L;
                 PerformanceHintManager.Session created = phm.createHintSession(new int[]{uiTid}, targetNs);
                 if (created == null) {
                     unsupported = true;
@@ -759,27 +765,20 @@ public final class DisplayModeEngine {
             } catch (RuntimeException ignored) { }
         }
 
-        boolean boost(Context appContext, int uiTid, long targetNs, long durationMs) {
+        void reportFrame(FrameMetrics frame) {
             long now = SystemClock.elapsedRealtimeNanos();
-            if (lastBoostElapsedNs != 0L && now - lastBoostElapsedNs < minUpdateRateNs) return false;
-            openOrUpdate(appContext, uiTid, targetNs);
-            if (session == null) return false;
-            lastBoostElapsedNs = now;
-            long factor = durationMs >= 350L ? 140L : 125L;
-            long reportNs = Math.max(targetNs + 500_000L, (targetNs * factor) / 100L);
+            if (session == null || now - lastReportNs < minUpdateRateNs) return;
+            // This session owns only the UI thread. Exclude RenderThread, GPU and VSync waits.
+            long input = frame.getMetric(FrameMetrics.INPUT_HANDLING_DURATION);
+            long animation = frame.getMetric(FrameMetrics.ANIMATION_DURATION);
+            long layout = frame.getMetric(FrameMetrics.LAYOUT_MEASURE_DURATION);
+            long draw = frame.getMetric(FrameMetrics.DRAW_DURATION);
+            if (input < 0 || animation < 0 || layout < 0 || draw < 0) return;
+            long uiWork = input + animation + layout + draw;
+            if (uiWork <= 0) return;
+            lastReportNs = now;
             try {
-                session.reportActualWorkDuration(reportNs);
-                return true;
-            } catch (RuntimeException ignored) {
-                return false;
-            }
-        }
-
-        void settle(long targetNs) {
-            if (session == null || targetNs <= 0L) return;
-            long relaxedNs = Math.max(1_000_000L, (targetNs * 65L) / 100L);
-            try {
-                session.reportActualWorkDuration(relaxedNs);
+                session.reportActualWorkDuration(uiWork);
             } catch (RuntimeException ignored) { }
         }
 
@@ -791,7 +790,7 @@ public final class DisplayModeEngine {
             PerformanceHintManager.Session s = session;
             session = null;
             lastTargetNs = 0L;
-            lastBoostElapsedNs = 0L;
+            lastReportNs = 0L;
             if (s != null) {
                 try { s.close(); } catch (RuntimeException ignored) { }
             }

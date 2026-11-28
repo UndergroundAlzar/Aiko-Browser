@@ -43,6 +43,10 @@ final class DownloadPanel {
     private TextView file, status, metric, rate, remaining, threadBadge, peakRate, section, details,
             priority, sniffButton, pause, cancel, finish;
     private View metricsRow, telemetryRow, segmentCard;
+    private TextView queueLink;
+    private android.app.AlertDialog queueDialog;
+    private ArrayAdapter<String> queueAdapter;
+    private List<DownloadQueue.Entry> shownPending, shownHistory;
     private ProgressBar overall;
     private SparklineView sparkline;
     private MapView map;
@@ -154,6 +158,13 @@ final class DownloadPanel {
         file.setEllipsize(TextUtils.TruncateAt.MIDDLE);
         infoCard.addView(file, new LinearLayout.LayoutParams(-1, -2));
 
+        queueLink = label("下载列表", 13, AikoTheme.ACCENT);
+        queueLink.setSingleLine(true);
+        queueLink.setEllipsize(TextUtils.TruncateAt.END);
+        queueLink.setGravity(Gravity.CENTER_VERTICAL);
+        queueLink.setOnClickListener(v -> showQueue());
+        infoCard.addView(queueLink, new LinearLayout.LayoutParams(-1, dp(42)));
+
         status = label("", 12, AikoTheme.TEXT_MUTED);
         status.setSingleLine(true);
         status.setEllipsize(TextUtils.TruncateAt.END);
@@ -250,7 +261,7 @@ final class DownloadPanel {
         lanes.setDivider(null);
         lanes.setVerticalScrollBarEnabled(false);
         LinearLayout.LayoutParams lanesLp = new LinearLayout.LayoutParams(-1,
-                dp(Math.min(200, Math.max(60, activity.getResources().getConfiguration().screenHeightDp - 460))));
+                dp(Math.min(200, Math.max(60, activity.getResources().getConfiguration().screenHeightDp - 502))));
         lanesLp.topMargin = dp(6);
         segBox.addView(lanes, lanesLp);
         lanes.setVisibility(View.GONE);
@@ -275,11 +286,6 @@ final class DownloadPanel {
         LinearLayout controls = new LinearLayout(activity);
         card.addView(controls, new LinearLayout.LayoutParams(-1, dp(46)));
         button(controls, "新建", false, () -> {
-            DownloadService.Job job = DownloadService.current;
-            if (job != null && (job.busy || (!job.finished && !job.cancelled))) {
-                activity.toast("请先完成或取消当前任务");
-                return;
-            }
             dialog.dismiss();
             activity.showNewDownload("", "", null);
         });
@@ -287,7 +293,7 @@ final class DownloadPanel {
             DownloadService.Job job = DownloadService.current;
             if (job == null || job.finished || job.cancelled) return;
             try {
-                if (job.busy) DownloadService.pause(job);
+                if (job.busy) DownloadService.pause(activity, job);
                 else DownloadService.launch(activity, job);
             } catch (RuntimeException e) {
                 activity.toast("无法启动后台下载");
@@ -298,7 +304,7 @@ final class DownloadPanel {
             DownloadService.Job job = DownloadService.current;
             if (job == null || job.finished || job.cancelled || job.saving) return;
             new android.app.AlertDialog.Builder(activity).setTitle("取消此下载？")
-                    .setMessage("已下载的分段将被删除。")
+                    .setMessage("将删除此任务的分段，然后继续下一个下载。")
                     .setNegativeButton("保留", null)
                     .setPositiveButton("取消任务", (d, which) -> {
                         DownloadService.cancel(activity.getApplicationContext(), job);
@@ -321,9 +327,50 @@ final class DownloadPanel {
         dialog.setOnDismissListener(d -> handler.removeCallbacks(tick));
         activity.showSheet(dialog, card);
         render();
-        if (DownloadService.current == null) {
-            DownloadService.loadCurrentAsync(activity, this::render);
+    }
+
+    private void showQueue() {
+        queueAdapter = new ArrayAdapter<>(activity, android.R.layout.simple_list_item_1);
+        queueDialog = new android.app.AlertDialog.Builder(activity).setTitle("下载列表")
+                .setAdapter(queueAdapter, (d, i) -> {
+                    if (i < shownPending.size()) {
+                        if (i == 0) return; // The active card already has the controls for this row.
+                        DownloadQueue.Entry entry = shownPending.get(i);
+                        new android.app.AlertDialog.Builder(activity).setTitle(entry.record.name)
+                                .setMessage("从等待队列中移除此下载？").setNegativeButton("保留", null)
+                                .setPositiveButton("移除", (a, b) -> DownloadService.dropWaiting(activity, entry.id))
+                                .show();
+                    } else {
+                        DownloadRecord r = shownHistory.get(i - shownPending.size()).record;
+                        Intent intent = new Intent(Intent.ACTION_VIEW).setData(android.net.Uri.parse(r.output))
+                                .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                        try { activity.startActivity(intent); } catch (RuntimeException e) {
+                            activity.toast("请在系统下载目录打开此文件");
+                        }
+                    }
+                }).setNegativeButton("关闭", null).create();
+        shownPending = null;
+        queueDialog.show();
+        render();
+    }
+
+    private void renderQueue() {
+        List<DownloadQueue.Entry> pending = DownloadService.pending;
+        List<DownloadQueue.Entry> history = DownloadService.history;
+        String next = pending.size() > 1 ? " · 等待 " + (pending.size() - 1) + " · " + pending.get(1).record.name : "";
+        setText(queueLink, "下载列表 ›" + next);
+        setVisibility(queueLink, pending.isEmpty() && history.isEmpty() ? View.GONE : View.VISIBLE);
+        if (queueDialog == null || !queueDialog.isShowing() || (pending == shownPending && history == shownHistory)) return;
+        shownPending = pending;
+        shownHistory = history;
+        queueAdapter.setNotifyOnChange(false);
+        queueAdapter.clear();
+        for (int i = 0; i < pending.size(); i++) {
+            DownloadRecord r = pending.get(i).record;
+            queueAdapter.add((i == 0 ? "当前 · " : "等待 " + i + " · ") + r.name + " · " + r.lanes + " 路");
         }
+        for (DownloadQueue.Entry done : history) queueAdapter.add("已完成 · " + done.record.name);
+        queueAdapter.notifyDataSetChanged();
     }
 
     private void toggleLanes() {
@@ -342,6 +389,7 @@ final class DownloadPanel {
     private void render() {
         handler.removeCallbacks(tick);
         if (dialog == null || !dialog.isShowing()) return;
+        renderQueue();
         DownloadService.Job job = DownloadService.current;
         RangeDownload d = job == null ? null : job.transfer;
         List<RangeDownload.Segment> segments = d == null ? Collections.emptyList() : d.segments;
@@ -454,7 +502,7 @@ final class DownloadPanel {
         boolean canCancel = job != null && !job.finished && !job.cancelled && !job.saving;
         setInteractive(cancel, canCancel);
         setText(finish, job != null && job.finished ? "打开文件" : "关闭");
-        if (job != null && job.busy) handler.postDelayed(tick, 250);
+        handler.postDelayed(tick, job != null && job.busy ? 250 : 750);
     }
 
     /** Zero-allocation live speed sparkline with gradient area fill and glowing tip dot. */

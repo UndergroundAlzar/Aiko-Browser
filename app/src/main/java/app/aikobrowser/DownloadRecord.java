@@ -5,7 +5,7 @@ import java.net.URL;
 import java.nio.file.Files;
 import java.nio.file.StandardCopyOption;
 
-/** The private, durable record for the one current download. No authentication headers are saved. */
+/** The private, durable record for a file download. No authentication headers are saved. */
 final class DownloadRecord {
     private static final int FORMAT = 1;
     static final int TRANSFERRING = 0, PUBLISHING = 1, COMPLETE = 2;
@@ -37,13 +37,7 @@ final class DownloadRecord {
         try (FileOutputStream file = new FileOutputStream(draft);
              DataOutputStream data = new DataOutputStream(new BufferedOutputStream(file))) {
             data.writeInt(FORMAT);
-            data.writeUTF(url.toExternalForm());
-            data.writeUTF(name);
-            data.writeUTF(userAgent);
-            data.writeInt(lanes);
-            data.writeInt(phase);
-            data.writeUTF(output);
-            data.writeLong(size);
+            writeTo(data);
             data.flush();
             file.getFD().sync();
         }
@@ -51,22 +45,34 @@ final class DownloadRecord {
                 StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
     }
 
-    static DownloadRecord read(File folder) {
+    void writeTo(DataOutput data) throws IOException {
+        data.writeUTF(url.toExternalForm());
+        data.writeUTF(name);
+        data.writeUTF(userAgent);
+        data.writeInt(lanes);
+        data.writeInt(phase);
+        data.writeUTF(output);
+        data.writeLong(size);
+    }
+
+    static DownloadRecord readFrom(DataInput data) throws IOException {
+        URL url = new URL(data.readUTF());
+        RangeDownload.requireHttp(url);
+        String name = data.readUTF(), userAgent = data.readUTF();
+        int lanes = data.readInt(), phase = data.readInt();
+        String output = data.readUTF();
+        long size = data.readLong();
+        if (lanes < 1 || lanes > RangeDownload.MAX_LANES || phase < TRANSFERRING || phase > COMPLETE
+                || (phase != TRANSFERRING && (size < 0 || !output.startsWith("content://media/")))) throw new IOException("下载任务数据无效");
+        return new DownloadRecord(url, name, userAgent, lanes, phase, output, size);
+    }
+
+    static DownloadRecord read(File folder) throws IOException {
         File target = target(folder);
         if (!target.isFile()) return null;
         try (DataInputStream data = new DataInputStream(new BufferedInputStream(new FileInputStream(target)))) {
-            if (data.readInt() != FORMAT) return null;
-            URL url = new URL(data.readUTF());
-            RangeDownload.requireHttp(url);
-            String name = data.readUTF(), userAgent = data.readUTF();
-            int lanes = data.readInt(), phase = data.readInt();
-            String output = data.readUTF();
-            long size = data.readLong();
-            if (lanes < 1 || lanes > RangeDownload.MAX_LANES || phase < TRANSFERRING || phase > COMPLETE
-                    || (phase != TRANSFERRING && (size < 0 || !output.startsWith("content://media/")))) return null;
-            return new DownloadRecord(url, name, userAgent, lanes, phase, output, size);
-        } catch (IOException ignored) {
-            return null;
+            if (data.readInt() != FORMAT) throw new IOException("下载任务格式无效");
+            return readFrom(data);
         }
     }
 

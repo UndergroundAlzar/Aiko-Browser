@@ -2,17 +2,17 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { createServer } from 'node:http';
-import { readFile, mkdtemp, rm } from 'node:fs/promises';
+import { readFile, mkdtemp, realpath, rm } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { dirname, resolve } from 'node:path';
+import { basename, dirname, resolve } from 'node:path';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const repoRoot = resolve(__dirname, '..');
 const workDir = resolve(repoRoot, '..');
 const babelJsPath = resolve(repoRoot, 'app/src/main/assets/babel/babel.js');
-const chromePath = resolve(workDir, 'work/chrome-test/chrome-headless-shell-win64/chrome-headless-shell.exe');
+const chromePath = process.env.AIKO_CHROMIUM || resolve(workDir, 'work/chrome-test/chrome-headless-shell-win64/chrome-headless-shell.exe');
 
 assert.ok(existsSync(babelJsPath), 'babel.js must exist');
 assert.ok(existsSync(chromePath), 'chrome-headless-shell.exe must exist at ' + chromePath);
@@ -77,7 +77,10 @@ const server = createServer((req, res) => {
 await once(server, 'listening');
 const port = server.address().port;
 
-const userDataDir = await mkdtemp(resolve(workDir, 'work/aiko-babel-chromium-'));
+const tempRoot = await realpath((await import('node:os')).tmpdir());
+const userDataDir = await realpath(await mkdtemp(resolve(tempRoot, 'aiko-babel-chromium-')));
+assert.equal(dirname(userDataDir), tempRoot);
+assert.ok(basename(userDataDir).startsWith('aiko-babel-chromium-'));
 const child = spawn(chromePath, [
     '--disable-gpu',
     '--disable-background-networking',
@@ -164,6 +167,7 @@ try {
                 const msg = JSON.parse(raw);
                 window.__bridgeLog.push(msg);
                 if (msg.type === 'translate_batch') {
+                    if (window.__holdBatches) return;
                     const prefix = msg.targetLang === 'ja' ? '【JA】' : '【译】';
                     const out = msg.items.map(it => prefix + it.text);
                     setTimeout(() => window.__aikoBabel.applyBatchResult(msg.reqId, out), 15);
@@ -288,6 +292,113 @@ try {
     assert.equal(stylesResult.replaceTextNodeStillExists, 'Immersive bilingual translation preserves page layout cleanly.');
     assert.equal(stylesResult.softRestoredAttr, false, 'leaving replace mode clears replace attribute');
 
+    // A quiet block must finish while its neighbor keeps changing. Offscreen edits stay lazy.
+    const stream = await evalJson(`(async () => {
+        const a = document.getElementById('li-item');
+        const b = document.getElementById('td-cell');
+        const c = document.getElementById('tweet');
+        const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+        const translation = el => el.querySelector('font.aiko-babel-tr')?.textContent;
+        const since = window.__bridgeLog.length;
+        let bodyScans = 0;
+        let documentScans = 0;
+        const query = document.body.querySelectorAll;
+        const documentQuery = document.querySelectorAll;
+        window.__aikoBabel.setStyle('replace');
+        document.body.querySelectorAll = function (...args) { bodyScans++; return query.apply(this, args); };
+        document.querySelectorAll = function (...args) { documentScans++; return documentQuery.apply(this, args); };
+        try {
+            document.getElementById('lazy-below').firstChild.appendData(' Updated offscreen.');
+            b.textContent = 'Quiet replacement source'; // removes the font as well as the original Text
+            const quietNode = b.firstChild;
+            const inline = document.createElement('em');
+            inline.append(' with an inline suffix');
+            c.append(inline); // the source can grow after our font
+            const cSource = c.firstChild.data + inline.textContent;
+            const aNode = a.firstChild;
+            aNode.data = 'Streaming reply';
+            for (let i = 0; i < 14; i++) {
+                aNode.appendData(' token');
+                await delay(50);
+            }
+            const quietDuringStream = translation(b);
+            const aSource = aNode.data;
+            await delay(500);
+            const sent = window.__bridgeLog.slice(since).filter(m => m.type === 'translate_batch')
+                .flatMap(m => m.items.map(it => it.text));
+            return { quietDuringStream, aSource, translated: translation(a), cSource, appended: translation(c),
+                sent, bodyScans, documentScans, sourcePreserved: quietNode === b.firstChild && aNode === a.firstChild && c.contains(inline),
+                fontLast: c.lastChild === c.querySelector('font.aiko-babel-tr'),
+                replace: [a, b, c].every(el => el.dataset.aikoBabelReplace === '1' &&
+                    el.querySelectorAll('font.aiko-babel-tr[data-style="replace"]').length === 1) };
+        } finally {
+            delete document.body.querySelectorAll;
+            delete document.querySelectorAll;
+            window.__aikoBabel.setStyle('soft');
+        }
+    })()`);
+    assert.equal(stream.quietDuringStream, '【译】Quiet replacement source', 'textContent replacement refreshes independently');
+    assert.equal(stream.translated, '【译】' + stream.aSource, 'characterData edits alone refresh a translated block');
+    assert.equal(stream.appended, '【译】' + stream.cSource, 'inline additions refresh only their source block');
+    assert.deepEqual(stream.sent.sort(), ['Quiet replacement source', stream.aSource, stream.cSource].sort(), 'one request per settled source');
+    assert.equal(stream.bodyScans + stream.documentScans, 0, 'stream never rescans document or body');
+    assert.ok(stream.sourcePreserved && stream.fontLast && stream.replace, 'replace style keeps source nodes and one trailing translation');
+
+    // Hold native requests and reply out of order, including a callback in the same task as the edit.
+    const races = await evalJson(`(async () => {
+        const api = window.__aikoBabel;
+        const p = document.getElementById('bq-text');
+        const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+        const font = () => p.querySelector('font.aiko-babel-tr');
+        const requestFor = async text => {
+            const deadline = performance.now() + 2500;
+            do {
+                const batch = window.__bridgeLog.find(m => m.type === 'translate_batch' &&
+                    m.items.some(item => item.text === text));
+                if (batch) return batch;
+                await delay(15);
+            } while (performance.now() < deadline);
+            throw new Error('Missing request for ' + text);
+        };
+        const reply = (batch, value) => api.applyBatchResult(batch.reqId, batch.items.map(() => value));
+        window.__holdBatches = true;
+        try {
+            p.textContent = 'Pending before edit';
+            const immediate = await requestFor('Pending before edit');
+            p.firstChild.appendData(' in the same task');
+            reply(immediate, 'stale synchronous result');
+            const beforeObserver = font()?.textContent;
+            const lateSuccess = await requestFor('Pending before edit in the same task');
+
+            p.replaceChildren('Pending after replacement');
+            const lateError = await requestFor('Pending after replacement');
+            p.firstChild.data = 'Settled final source';
+            const current = await requestFor('Settled final source');
+            api.setStyle('quote');
+            reply(current, 'accepted final translation');
+            reply(lateSuccess, 'late stale translation');
+            api.applyBatchError(lateError.reqId, 'late stale error');
+            const finalText = font()?.textContent;
+            const finalStyle = font()?.dataset.style;
+            const fab = document.querySelector('.aiko-babel-fab').textContent;
+
+            api.setStyle('replace');
+            p.firstChild.data = '这段已经是中文';
+            await delay(420);
+            return { beforeObserver, finalText, finalStyle, fab,
+                sourceOnly: !font() && !p.hasAttribute('data-aiko-babel-replace') &&
+                    !p.hasAttribute('data-aiko-babel-state') && getComputedStyle(p).fontSize !== '0px' };
+        } finally {
+            window.__holdBatches = false;
+            api.setStyle('soft');
+        }
+    })()`);
+    assert.notEqual(races.beforeObserver, 'stale synchronous result', 'stale reply rejected before observer delivery');
+    assert.equal(races.finalText, 'accepted final translation', 'late success and error leave latest translation intact');
+    assert.equal(races.finalStyle, 'quote', 'refresh uses current display style');
+    assert.equal(races.fab, '译 · 双语', 'stale failure cannot change FAB status');
+    assert.ok(races.sourceOnly, 'editing into target language restores source visibility in replace mode');
+
     // 3. Scroll down -> lazy IntersectionObserver translates far-below paragraph, AND MutationObserver translates dynamic post
     const lazyAndDynamic = await evalJson(`(async () => {
         document.getElementById('lazy-below').scrollIntoView();
@@ -302,6 +413,7 @@ try {
         };
     })()`);
     assert.ok(lazyAndDynamic.lazyTr.startsWith('【译】This far-below'), 'lazy element translated after scroll');
+    assert.ok(lazyAndDynamic.lazyTr.endsWith('Updated offscreen.'), 'lazy translation uses latest source');
     assert.ok(lazyAndDynamic.dynTr.startsWith('【译】Dynamically loaded'), 'dynamic MutationObserver node translated');
 
     // 4. Stop cleanly restores DOM with zero leftover translation nodes
@@ -439,11 +551,11 @@ try {
     assert.equal(inputResult.pwdVal, '秘密密码   ', 'password input strictly skipped');
     assert.equal(inputResult.stillLoading, false, 'loading shimmer removed after completion');
 
-    console.log('PASS babel_dom_check.mjs (Chromium strict CSP, IntersectionObserver lazy discovery, skip guards, 5 DisplayStyles, stop cleanup, selection popup & triple-space input back-translation)');
+    console.log('PASS babel_dom_check.mjs (Chromium strict CSP, lazy discovery, skip guards, 5 DisplayStyles, per-block streaming, stale replies, stop cleanup, selection popup & triple-space input back-translation)');
 } finally {
     clearTimeout(watchdog);
     try { socket?.close(); } catch (_) {}
     try { child.kill(); } catch (_) {}
     server.close();
-    try { await rm(userDataDir, { recursive: true, force: true }); } catch (_) {}
+    try { await rm(userDataDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 150 }); } catch (_) {}
 }

@@ -12,10 +12,9 @@ import java.io.*;
 import java.net.URL;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
-import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import java.util.Collections;
+import java.util.List;
+import java.util.concurrent.*;
 
 public final class DownloadService extends Service {
     private static final String CHANNEL = "aiko_transfers";
@@ -23,9 +22,6 @@ public final class DownloadService extends Service {
     private static final String PAUSE = "app.aikobrowser.download.PAUSE";
     private static final int NOTIFICATION_ID = 7;
     private static final long PUBLISH_CHUNK_BYTES = 2L * 1024 * 1024;
-    // LOAD_LOCK guards only in-memory `current` transitions (never held across disk/IPC I/O).
-    private static final Object LOAD_LOCK = new Object();
-    private static final Object DISK_LOAD_LOCK = new Object();
     private static final Handler MAIN = new Handler(Looper.getMainLooper());
     private static final ExecutorService IO = Executors.newSingleThreadExecutor(task -> {
         Thread thread = new Thread(() -> {
@@ -50,36 +46,41 @@ public final class DownloadService extends Service {
     }
 
     static final class Job {
-        final String name, userAgent;
+        final String id, name, userAgent;
         final int lanes;
         final URL url;
         final File part;
         volatile RangeDownload transfer;
         volatile String state = "等待启动";
-        volatile boolean busy, saving, finished, cancelled, pauseRequested, needsRecordWrite;
+        volatile boolean busy, saving, finished, cancelled, pauseRequested;
+        boolean executing; // metadata executor only
         volatile Uri output;
         volatile DownloadRecord record;
 
-        Job(DownloadRecord record, File part) {
+        Job(DownloadQueue.Entry entry, File folder) {
+            id = entry.id;
+            DownloadRecord record = entry.record;
             this.record = record;
             this.url = record.url;
             this.name = record.name;
             this.userAgent = record.userAgent;
             this.lanes = record.lanes;
-            this.part = part;
+            this.part = entry.part(folder);
         }
     }
 
-    private final ExecutorService worker = Executors.newSingleThreadExecutor(task -> new Thread(() -> {
+    private static final ExecutorService WORKER = Executors.newSingleThreadExecutor(task -> new Thread(() -> {
         try { android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND); }
         catch (SecurityException ignored) { }
         task.run();
     }, "aiko-download-worker"));
-    private final Handler handler = new Handler(Looper.getMainLooper());
+    private volatile boolean alive = true;
+    private volatile int lastStartId;
     private HandlerThread notifThread;
     private Handler notifHandler;
     private NotificationManager notificationManager;
     private PendingIntent openIntent, pauseIntent;
+    private String pauseId;
     private final Runnable update = new Runnable() {
         @Override public void run() {
             Job job = current;
@@ -91,150 +92,158 @@ public final class DownloadService extends Service {
         }
     };
 
-    static Job start(Context context, String address, String name, String ua, int lanes)
-            throws Exception {
-        URL url = new URL(address);
-        RangeDownload.requireHttp(url);
-        Context app = context.getApplicationContext();
-        File folder = new File(app.getFilesDir(), "transfers");
-        int effectiveLanes = Math.min(RangeDownload.clampLanes(lanes), maxLanesLimit);
-        DownloadRecord record = new DownloadRecord(url, safeName(name), ua, effectiveLanes);
-        Job job = new Job(record, partFile(folder, url));
-        job.needsRecordWrite = true;
-        job.state = "准备下载";
-        job.busy = true;
-        Job previous;
-        synchronized (LOAD_LOCK) {
-            previous = current;
-            if (previous != null && (previous.busy || (!previous.finished && !previous.cancelled))) {
-                throw new IOException("请先完成或取消当前任务");
+    // Queue and dispatch decisions are confined to IO. The network worker never holds up submissions.
+    private static DownloadQueue queue;
+    static volatile List<DownloadQueue.Entry> pending = Collections.emptyList(), history = Collections.emptyList();
+
+    private static void load(Context app) throws IOException {
+        if (queue != null) return;
+        DownloadQueue restored = new DownloadQueue(new File(app.getFilesDir(), "transfers"));
+        DownloadQueue.Entry head = restored.head();
+        if (head != null && head.record.phase == DownloadRecord.PUBLISHING) {
+            // Recovery also handles old builds killed between MediaStore.update and the local commit.
+            try {
+                if (publicationState(app.getContentResolver(), Uri.parse(head.record.output)) == 0) {
+                    restored.complete(head.id);
+                    discardPart(head, restored.folder);
+                }
+            } catch (IOException e) {
+                // Keep the URI attached. A manual retry queries the same row before writing anything.
+                restored.setRunning(false);
             }
-            current = job;
         }
-        try {
-            context.startForegroundService(new Intent(context, DownloadService.class).setAction(RUN));
-        } catch (RuntimeException e) {
-            job.busy = false;
-            job.state = "无法启动后台下载";
-            synchronized (LOAD_LOCK) {
-                if (current == job) current = previous;
-            }
-            throw e;
-        }
-        return job;
+        queue = restored;
+        refresh();
     }
 
-    static void loadCurrentAsync(Context context, Runnable onReady) {
-        if (current != null) {
-            if (Looper.myLooper() == Looper.getMainLooper()) onReady.run();
-            else MAIN.post(onReady);
-            return;
+    private static void refresh() {
+        pending = queue.pending();
+        history = queue.history();
+        DownloadQueue.Entry entry = queue.head();
+        if (entry == null && !history.isEmpty()) entry = history.get(0);
+        if (entry == null) { current = null; return; }
+        Job job = current;
+        if (job == null || !job.id.equals(entry.id)) {
+            job = new Job(entry, queue.folder);
+            if (entry.record.phase != DownloadRecord.COMPLETE) {
+                job.transfer = new RangeDownload(job.url, job.part, job.lanes, job.userAgent, null);
+                job.transfer.showSavedProgress();
+                job.state = job.transfer.resumable ? "已暂停 · 可续传" : "等待继续";
+            }
         }
+        job.record = entry.record;
+        if (entry.record.phase == DownloadRecord.COMPLETE) {
+            job.output = Uri.parse(entry.record.output);
+            job.finished = true;
+            job.state = "已完成 · 下载目录";
+        }
+        current = job;
+    }
+
+    private interface Command { void run() throws IOException; }
+
+    private static void command(Context context, Command action) {
         Context app = context.getApplicationContext();
         IO.execute(() -> {
-            loadCurrent(app);
-            MAIN.post(onReady);
+            try { load(app); action.run(); }
+            catch (IOException | RuntimeException e) {
+                String msg = errorMessage("下载队列操作失败", e);
+                MAIN.post(() -> android.widget.Toast.makeText(app, msg, android.widget.Toast.LENGTH_LONG).show());
+            }
         });
     }
 
-    static Job loadCurrent(Context context) {
-        Job existing = current;
-        if (existing != null) return existing;
-        synchronized (DISK_LOAD_LOCK) {
-            existing = current;
-            if (existing != null) return existing;
-            File folder = new File(context.getFilesDir(), "transfers");
-            DownloadRecord record = DownloadRecord.read(folder);
-            if (record == null) return current;
-            Job job = new Job(record, partFile(folder, record.url));
-            job.transfer = new RangeDownload(job.url, job.part, job.lanes, job.userAgent, null);
-            job.transfer.showSavedProgress();
-            if (record.phase != DownloadRecord.TRANSFERRING) {
-                Uri output = Uri.parse(record.output);
-                if (record.phase == DownloadRecord.COMPLETE || isPublished(context.getContentResolver(), output)) {
-                    job.output = output;
-                    job.finished = true;
-                    job.state = "已完成 · 下载目录";
-                }
-            }
-            if (!job.finished) {
-                job.state = job.transfer.resumable ? "已恢复任务 · 可续传"
-                        : record.phase == DownloadRecord.PUBLISHING ? "写入中断 · 点继续保存" : "已恢复任务 · 等待继续";
-            }
-            synchronized (LOAD_LOCK) {
-                if (current != null) return current;
-                current = job;
-                return job;
-            }
-        }
+    static void start(Context context, String address, String name, String ua, int lanes, Runnable onQueued)
+            throws IOException {
+        URL url = new URL(address);
+        RangeDownload.requireHttp(url);
+        DownloadRecord record = new DownloadRecord(url, safeName(name), ua, RangeDownload.clampLanes(lanes));
+        Context app = context.getApplicationContext();
+        command(app, () -> {
+            queue.enqueue(record);
+            refresh();
+            MAIN.post(onQueued);
+            requestRun(app);
+        });
     }
 
-    private static File partFile(File folder, URL url) {
-        byte[] hash;
-        try {
-            hash = MessageDigest.getInstance("SHA-256").digest(url.toExternalForm().getBytes(StandardCharsets.UTF_8));
-        } catch (java.security.NoSuchAlgorithmException error) {
-            throw new AssertionError(error);
-        }
-        StringBuilder key = new StringBuilder(64);
-        for (byte b : hash) {
-            key.append(Character.forDigit((b & 255) >>> 4, 16));
-            key.append(Character.forDigit(b & 15, 16));
-        }
-        return new File(folder, key + ".part");
+    static void restore(Context context) {
+        Context app = context.getApplicationContext();
+        command(app, () -> requestRun(app));
     }
 
     static void launch(Context context, Job job) {
-        synchronized (LOAD_LOCK) {
-            if (job.busy || job.finished || job.cancelled) return;
-            job.pauseRequested = false;
-            job.state = "准备下载";
-            job.busy = true;
-            current = job;
-        }
+        Context app = context.getApplicationContext();
+        command(app, () -> {
+            if (job != current || job.busy || job.finished) return;
+            queue.setRunning(true);
+            requestRun(app);
+        });
+    }
+
+    private static void requestRun(Context app) throws IOException {
+        Job job = current;
+        if (!queue.running() || queue.head() == null || job.busy) return;
+        job.busy = true;
+        job.state = "准备下载";
         try {
-            context.startForegroundService(new Intent(context, DownloadService.class).setAction(RUN));
+            app.startForegroundService(new Intent(app, DownloadService.class).setAction(RUN));
         } catch (RuntimeException e) {
             job.busy = false;
-            job.state = "无法启动后台下载";
-            throw e;
+            job.state = "无法启动后台下载 · 点继续重试";
+            queue.setRunning(false);
+            throw new IOException(job.state, e);
         }
     }
 
-    static void pause(Job job) {
-        if (job == null || !job.busy || job.saving) return;
+    static void pause(Context context, Job job) {
+        command(context, () -> {
+            if (job != current || job == null || !job.busy || job.saving || job.finished) return;
+            queue.setRunning(false);
+            stopTransfer(job);
+        });
+    }
+
+    private static void stopTransfer(Job job) {
         job.pauseRequested = true;
         job.state = "正在暂停";
         RangeDownload transfer = job.transfer;
         if (transfer != null) {
-            RangeDownload.Control control = transfer.control;
-            control.stopped = true;
-            // Some HTTP implementations can block in disconnect; keep it off the UI thread.
-            new Thread(() -> {
-                try { android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND); }
-                catch (SecurityException ignored) { }
-                control.interruptConnections();
-            }, "aiko-download-stop").start();
+            transfer.control.stopped = true;
+            new Thread(transfer.control::interruptConnections, "aiko-download-stop").start();
         }
         PACER.wake();
     }
 
+    static void dropWaiting(Context context, String id) {
+        command(context, () -> {
+            if (!queue.dropWaiting(id)) throw new IOException("任务已移出等待队列");
+            refresh();
+        });
+    }
+
     static void cancel(Context context, Job job) {
-        if (job == null || job.finished || job.saving) return;
-        job.cancelled = true;
-        if (job.busy) {
-            pause(job);
-        } else {
-            job.state = "已取消";
-            job.busy = true;
-            Context app = context.getApplicationContext();
-            new Thread(() -> {
-                try { android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND); }
-                catch (SecurityException ignored) { }
+        Context app = context.getApplicationContext();
+        command(app, () -> {
+            if (job != current || job.finished || job.saving || job.cancelled) return;
+            queue.setRunning(false);
+            job.cancelled = true;
+            if (job.executing) stopTransfer(job);
+            else {
                 try { discardJob(app, job); }
-                catch (IOException error) { job.state = "清理失败"; job.cancelled = false; }
-                finally { job.busy = false; }
-            }, "aiko-download-discard").start();
+                finally { job.cancelled = false; job.busy = false; }
+                refresh();
+                requestRun(app);
+            }
+        });
+    }
+
+    // Transfer thread barriers for the two points at which publication must be serialized with UI actions.
+    private static <T> T metadata(Callable<T> action) throws Exception {
+        try { return IO.submit(action).get(); }
+        catch (ExecutionException e) {
+            if (e.getCause() instanceof Exception) throw (Exception) e.getCause();
+            throw e;
         }
     }
 
@@ -247,161 +256,183 @@ public final class DownloadService extends Service {
                 new Intent(this, MainActivity.class).putExtra("downloads", true)
                         .addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
                 PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
-        pauseIntent = PendingIntent.getService(this, 2,
-                new Intent(this, DownloadService.class).setAction(PAUSE), PendingIntent.FLAG_IMMUTABLE);
         notifThread = new HandlerThread("aiko-download-notif", android.os.Process.THREAD_PRIORITY_BACKGROUND);
         notifThread.start();
         notifHandler = new Handler(notifThread.getLooper());
     }
 
     @Override public int onStartCommand(Intent intent, int flags, int startId) {
-        Job job = current;
-        if (intent != null && PAUSE.equals(intent.getAction()) && job != null) {
-            pause(job);
-            return START_NOT_STICKY;
-        }
-        if (intent == null || !RUN.equals(intent.getAction()) || job == null || !job.busy) {
-            stopSelf(startId);
-            return START_NOT_STICKY;
-        }
-        startForeground(NOTIFICATION_ID, notification(job));
-        Handler nh = notifHandler;
-        if (nh != null) {
-            nh.removeCallbacks(update);
-            nh.postDelayed(update, 1000);
-        }
-        worker.execute(() -> {
-            perform(job);
-            handler.post(() -> {
-                Handler bg = notifHandler;
-                if (bg != null) bg.removeCallbacks(update);
-                stopForeground(STOP_FOREGROUND_REMOVE);
-                stopSelfResult(startId);
-                job.busy = false;
+        lastStartId = startId;
+        startForeground(NOTIFICATION_ID, notification(current));
+        notifHandler.removeCallbacks(update);
+        notifHandler.postDelayed(update, 1000);
+        if (intent != null && PAUSE.equals(intent.getAction())) {
+            String requested = intent.getIdentifier();
+            IO.execute(() -> {
+                try {
+                    load(this);
+                    Job job = current;
+                    if (job != null && job.id.equals(requested) && !job.finished && !job.saving) {
+                        queue.setRunning(false);
+                        if (job.executing) stopTransfer(job);
+                    }
+                    if (job == null || !job.executing) dispatch();
+                } catch (IOException e) { stopIdle(); }
             });
+            return START_STICKY;
+        }
+        IO.execute(() -> {
+            try { load(this); dispatch(); }
+            catch (Exception e) { stopIdle(); }
         });
-        return START_NOT_STICKY;
+        return START_STICKY;
     }
 
-    private void perform(Job job) {
-        try { android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND); }
-        catch (SecurityException ignored) { }
+    private void dispatch() {
+        Job job = current;
+        if (job != null && job.executing) return;
+        if (!alive || !queue.running() || queue.head() == null) {
+            if (job != null && !job.executing) {
+                job.busy = false;
+                if (job.pauseRequested) job.state = "已暂停";
+            }
+            stopIdle();
+            return;
+        }
+        job.executing = true;
+        job.busy = true;
+        job.pauseRequested = false;
+        job.state = "准备下载";
+        WORKER.execute(() -> {
+            Exception failure = null;
+            try { perform(job); } catch (Exception e) { failure = e; }
+            Exception result = failure;
+            IO.execute(() -> finish(job, result));
+        });
+    }
+
+    private void finish(Job job, Exception error) {
         try {
-            if (job.pauseRequested || job.cancelled) {
-                job.state = "已暂停";
-                return;
-            }
-            if (job.needsRecordWrite) {
-                File folder = job.part.getParentFile();
-                if (folder != null && !folder.isDirectory() && !folder.mkdirs()) {
-                    throw new IOException("无法创建下载目录");
-                }
-                if (folder != null) {
-                    DownloadRecord previous = DownloadRecord.read(folder);
-                    if (previous != null) {
-                        File oldPart = partFile(folder, previous.url);
-                        if (!oldPart.equals(job.part)) {
-                            try {
-                                new RangeDownload(previous.url, oldPart, previous.lanes,
-                                        previous.userAgent, null).discard();
-                            } catch (IOException ignored) { }
-                        }
-                    }
-                    job.record.write(folder);
-                }
-                job.needsRecordWrite = false;
-            }
-            String cookies = null;
-            try { cookies = CookieManager.getInstance().getCookie(job.url.toExternalForm()); }
-            catch (RuntimeException ignored) { }
-            RangeDownload transfer = new RangeDownload(job.url, job.part, job.lanes, maxLanesLimit,
-                    job.userAgent, cookies, PACER, () -> {
-                        try { android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND); }
-                        catch (SecurityException ignored) { }
-                    });
-            job.transfer = transfer;
-            if (job.pauseRequested || job.cancelled) {
-                transfer.control.stopped = true;
-                job.state = "已暂停";
-                return;
-            }
-            job.state = "下载中";
-            boolean staged = job.record.phase == DownloadRecord.PUBLISHING
-                    && job.part.isFile() && job.part.length() == job.record.size;
-            if (!staged && job.record.phase == DownloadRecord.PUBLISHING) {
-                throw new IOException("待保存文件不完整，请取消后重新下载");
-            }
-            if (staged || transfer.transfer()) {
-                job.saving = true;
-                if (transfer.control.stopped || job.pauseRequested || job.cancelled) {
-                    job.state = "已暂停";
-                    return;
-                }
-                job.state = "正在保存到下载目录";
-                job.output = publish(job);
-                job.finished = true;
-                job.state = "已完成 · 下载目录";
-                try { transfer.discard(); } catch (IOException ignored) { }
+            if (job.cancelled) {
+                discardJob(this, job);
+            } else if (job.output != null) {
+                // Keep the persisted publishing URI until the cursor advances atomically with history.
+                job.transfer.discard();
+                queue.complete(job.id);
             } else {
-                job.state = "已暂停";
+                queue.setRunning(false);
+                job.state = job.pauseRequested || error == null ? "已暂停" : errorMessage("下载失败", error);
             }
         } catch (Exception e) {
-            String message = e.getMessage();
-            job.state = "下载失败" + (message == null || message.contains("://") ? "" : " · " + message);
-        } finally {
-            job.saving = false;
-            if (job.cancelled) {
-                try {
-                    discardJob(this, job);
-                    job.state = "已取消";
-                } catch (IOException error) {
-                    job.state = "清理失败";
-                    job.cancelled = false;
-                }
-            }
+            job.state = errorMessage("下载队列更新失败", e);
+            try { queue.setRunning(false); } catch (IOException ignored) { }
+            // Even a full disk must not spin or retransfer a published file.
+            resetWorker(job);
+            stopIdle();
+            return;
+        }
+        resetWorker(job);
+        refresh();
+        if (alive) dispatch();
+        else {
+            try { requestRun(getApplicationContext()); } catch (IOException ignored) { }
         }
     }
 
-    private Uri publish(Job job) throws IOException {
-        ContentResolver resolver = getContentResolver();
-        File folder = job.part.getParentFile();
-        Uri uri = job.record.phase == DownloadRecord.PUBLISHING ? Uri.parse(job.record.output) : null;
-        if (uri != null && isPublished(resolver, uri)) {
-            completeRecord(job, folder, uri);
-            return uri;
+    private static void resetWorker(Job job) {
+        job.executing = false;
+        job.busy = false;
+        job.saving = false;
+        job.cancelled = false;
+        job.pauseRequested = false;
+    }
+
+    private void stopIdle() {
+        int id = lastStartId;
+        MAIN.post(() -> {
+            if (id == lastStartId && (current == null || !current.busy) && stopSelfResult(id)) {
+                stopForeground(STOP_FOREGROUND_REMOVE);
+                if (notifHandler != null) notifHandler.removeCallbacks(update);
+            }
+        });
+    }
+
+    private static String errorMessage(String prefix, Exception error) {
+        String msg = error.getMessage();
+        return prefix + (msg == null || msg.contains("://") ? "" : " · " + msg);
+    }
+
+    private void perform(Job job) throws Exception {
+        if (job.record.phase == DownloadRecord.PUBLISHING) {
+            if (beginSaving(job)) job.output = publish(job);
+            return;
         }
-        if (uri == null || publicationState(resolver, uri) != 1) {
+        String cookies = null;
+        try { cookies = CookieManager.getInstance().getCookie(job.url.toExternalForm()); }
+        catch (RuntimeException ignored) { }
+        RangeDownload transfer = new RangeDownload(job.url, job.part, job.lanes, maxLanesLimit,
+                job.userAgent, cookies, PACER, () -> {
+                    try { android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND); }
+                    catch (SecurityException ignored) { }
+                });
+        job.transfer = transfer;
+        if (job.pauseRequested) return;
+        job.state = "下载中";
+        if (transfer.transfer() && beginSaving(job)) job.output = publish(job);
+    }
+
+    private static boolean beginSaving(Job job) throws Exception {
+        return metadata(() -> {
+            if (job.pauseRequested || job.cancelled) return false;
+            job.saving = true;
+            job.state = "正在保存到下载目录";
+            return true;
+        });
+    }
+
+    private Uri publish(Job job) throws Exception {
+        ContentResolver resolver = getContentResolver();
+        Uri uri = null;
+        if (job.record.phase == DownloadRecord.PUBLISHING) {
+            uri = Uri.parse(job.record.output);
+            int state = publicationState(resolver, uri);
+            if (state == 0) return uri;
+            if (!job.part.isFile() || job.part.length() != job.record.size) {
+                throw new IOException("待保存文件不完整，请取消后重新下载");
+            }
+            if (state == -1) uri = null; // Confirmed absent. Query failures must never create another row.
+        }
+        if (uri == null) {
             ContentValues values = new ContentValues();
             values.put(MediaStore.MediaColumns.DISPLAY_NAME, job.name);
             values.put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/Aiko Browser");
             values.put(MediaStore.MediaColumns.IS_PENDING, 1);
-            uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values);
-            if (uri == null) throw new IOException("无法写入下载目录");
-            DownloadRecord pending = job.record.publication(DownloadRecord.PUBLISHING, uri.toString(), job.part.length());
+            Uri inserted = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values);
+            if (inserted == null) throw new IOException("无法写入下载目录");
             try {
-                pending.write(folder);
-                job.record = pending;
-            } catch (IOException error) {
-                resolver.delete(uri, null, null);
+                metadata(() -> {
+                    queue.publishing(job.id, inserted.toString(), job.part.length());
+                    job.record = queue.head().record;
+                    return null;
+                });
+            } catch (Exception error) {
+                resolver.delete(inserted, null, null);
                 throw error;
             }
+            uri = inserted;
         }
-        try {
-            ParcelFileDescriptor descriptor = resolver.openFileDescriptor(uri, "rwt");
-            if (descriptor == null) throw new IOException("无法打开下载文件");
-            try (FileOutputStream out = new ParcelFileDescriptor.AutoCloseOutputStream(descriptor);
-                 FileInputStream in = new FileInputStream(job.part)) {
-                copyPublished(in.getChannel(), out.getChannel());
-                out.getFD().sync();
-            }
-            ContentValues values = new ContentValues();
-            values.put(MediaStore.MediaColumns.IS_PENDING, 0);
-            if (resolver.update(uri, values, null, null) != 1) throw new IOException("无法发布下载文件");
-            completeRecord(job, folder, uri);
-            return uri;
-        } catch (RuntimeException error) {
-            throw new IOException("无法保存下载文件", error);
+        ParcelFileDescriptor descriptor = resolver.openFileDescriptor(uri, "rwt");
+        if (descriptor == null) throw new IOException("无法打开下载文件");
+        try (FileOutputStream out = new ParcelFileDescriptor.AutoCloseOutputStream(descriptor);
+             FileInputStream in = new FileInputStream(job.part)) {
+            copyPublished(in.getChannel(), out.getChannel());
+            if (out.getChannel().size() != job.record.size) throw new IOException("下载文件写入不完整");
+            out.getFD().sync();
         }
+        ContentValues values = new ContentValues();
+        values.put(MediaStore.MediaColumns.IS_PENDING, 0);
+        if (resolver.update(uri, values, null, null) != 1) throw new IOException("无法发布下载文件");
+        return uri;
     }
 
     private static void copyPublished(FileChannel src, FileChannel dst) throws IOException {
@@ -446,31 +477,18 @@ public final class DownloadService extends Service {
         }
     }
 
-    private static void completeRecord(Job job, File folder, Uri uri) {
-        DownloadRecord complete = job.record.publication(DownloadRecord.COMPLETE, uri.toString(), job.part.length());
-        try {
-            complete.write(folder);
-            job.record = complete;
-        } catch (IOException ignored) {
-            // A published item with a PUBLISHING record is detected on the next launch.
-        }
-    }
-
-    private static boolean isPublished(ContentResolver resolver, Uri uri) {
-        return publicationState(resolver, uri) == 0;
-    }
-
     @SuppressWarnings("deprecation")
-    private static int publicationState(ContentResolver resolver, Uri uri) {
+    private static int publicationState(ContentResolver resolver, Uri uri) throws IOException {
         String[] columns = {MediaStore.MediaColumns.IS_PENDING};
         Bundle pending = new Bundle();
         pending.putInt(MediaStore.QUERY_ARG_MATCH_PENDING, MediaStore.MATCH_INCLUDE);
         try (Cursor cursor = Build.VERSION.SDK_INT >= 30
                 ? resolver.query(uri, columns, pending, null)
                 : resolver.query(MediaStore.setIncludePending(uri), columns, null, null, null)) {
-            return cursor != null && cursor.moveToFirst() ? cursor.getInt(0) : -1;
-        } catch (RuntimeException ignored) {
-            return -1;
+            if (cursor == null) throw new IOException("无法确认下载文件状态");
+            return cursor.moveToFirst() ? cursor.getInt(0) : -1;
+        } catch (RuntimeException e) {
+            throw new IOException("无法确认下载文件状态", e);
         }
     }
 
@@ -479,31 +497,59 @@ public final class DownloadService extends Service {
             Uri output = Uri.parse(job.record.output);
             ContentResolver resolver = context.getContentResolver();
             try {
-                if (publicationState(resolver, output) == 1) resolver.delete(output, null, null);
+                int state = publicationState(resolver, output);
+                if (state == 0) {
+                    // This explicit cancellation requests advancement, even when the queue was paused.
+                    queue.setRunning(true);
+                    queue.complete(job.id);
+                    discardPart(new DownloadQueue.Entry(job.id, job.record), queue.folder);
+                    return;
+                }
+                if (state == 1 && resolver.delete(output, null, null) != 1) throw new IOException("无法清理待发布文件");
             } catch (RuntimeException error) {
                 throw new IOException("无法清理下载文件", error);
             }
         }
         if (job.transfer != null) job.transfer.discard();
-        DownloadRecord.clear(job.part.getParentFile());
+        queue.cancelHead(job.id);
     }
 
-    private Notification notification(Job job) {
-        RangeDownload download = job.transfer;
+    private static void discardPart(DownloadQueue.Entry entry, File folder) {
+        DownloadRecord r = entry.record;
+        try { new RangeDownload(r.url, entry.part(folder), r.lanes, r.userAgent, null).discard(); }
+        catch (IOException ignored) { }
+    }
+
+    private synchronized Notification notification(Job job) {
+        RangeDownload download = job == null ? null : job.transfer;
         long total = download == null ? 0 : download.total;
         int percent = total > 0 ? (int) Math.min(100, 100.0 * download.downloaded() / total) : 0;
-        return new Notification.Builder(this, CHANNEL).setSmallIcon(android.R.drawable.stat_sys_download)
-                .setContentTitle(job.name).setContentText(job.state)
+        Notification.Builder builder = new Notification.Builder(this, CHANNEL).setSmallIcon(android.R.drawable.stat_sys_download)
+                .setContentTitle(job == null ? "下载队列" : job.name).setContentText(job == null ? "恢复下载" : job.state)
                 .setContentIntent(openIntent).setProgress(100, percent, total <= 0).setOnlyAlertOnce(true)
-                .setOngoing(true).addAction(new Notification.Action.Builder(null, "暂停", pauseIntent).build()).build();
+                .setOngoing(true);
+        if (job != null && !job.saving && !job.finished) {
+            if (!job.id.equals(pauseId)) {
+                pauseId = job.id;
+                pauseIntent = PendingIntent.getService(this, 2, new Intent(this, DownloadService.class)
+                        .setAction(PAUSE).setIdentifier(job.id), PendingIntent.FLAG_IMMUTABLE);
+            }
+            builder.addAction(new Notification.Action.Builder(null, "暂停", pauseIntent).build());
+        }
+        return builder.build();
     }
 
     @Override public IBinder onBind(Intent intent) { return null; }
 
     @Override public void onTimeout(int startId, int fgsType) {
-        pause(current);
+        alive = false;
+        command(this, () -> {
+            queue.setRunning(false);
+            Job job = current;
+            if (job != null && job.executing && !job.saving) stopTransfer(job);
+        });
         stopForeground(STOP_FOREGROUND_REMOVE);
-        stopSelf(startId);
+        stopSelf();
     }
 
     @Override public void onDestroy() {
@@ -514,7 +560,7 @@ public final class DownloadService extends Service {
             notifThread = null;
             notifHandler = null;
         }
-        worker.shutdown();
+        alive = false;
         super.onDestroy();
     }
 

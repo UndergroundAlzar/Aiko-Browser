@@ -2,7 +2,7 @@
 param(
     [string] $RepoRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path,
     [string] $ToolchainRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..\..\work\android-toolchain')).Path,
-    [string] $ClassesDir = (Join-Path $env:TEMP ('aiko-bench-classes-' + [Guid]::NewGuid().ToString('N'))),
+    [string] $ClassesDir,
     [switch] $SkipDownloadTest,
     [switch] $IncludeChromiumSmoke,
     [switch] $KeepClasses
@@ -15,6 +15,8 @@ $java = Join-Path $jdk 'bin/java.exe'
 $src = Join-Path $RepoRoot 'app/src/main/java/app/aikobrowser'
 $testing = $PSScriptRoot
 
+$ownsClasses = -not $ClassesDir
+if ($ownsClasses) { $ClassesDir = Join-Path $env:TEMP ('aiko-bench-classes-' + [Guid]::NewGuid().ToString('N')) }
 New-Item -ItemType Directory -Path $ClassesDir -Force | Out-Null
 
 function Run-Timed {
@@ -30,11 +32,11 @@ function Run-Timed {
 
 try {
     $javaSources = [System.Collections.Generic.List[string]]@(
-        "$src/RangeDownload.java", "$src/TransferPacer.java", "$src/DownloadRecord.java",
+        "$src/RangeDownload.java", "$src/TransferPacer.java", "$src/DownloadRecord.java", "$src/DownloadQueue.java",
         "$src/FilterRules.java", "$src/CustomFilterList.java", "$src/ScrollPositions.java",
         "$src/FilterTrace.java", "$src/SiteProfile.java",
         "$src/UserScript.java", "$src/UserScriptInput.java",
-        "$testing/RangeDownloadCheck.java", "$testing/FilterRulesCheck.java",
+        "$testing/RangeDownloadCheck.java", "$testing/DownloadQueueCheck.java", "$testing/FilterRulesCheck.java",
         "$testing/ScrollPositionsCheck.java", "$testing/UserCustomizationCheck.java",
         "$testing/SiteDiagnosticsCheck.java", "$testing/FilterRulesBench.java"
     )
@@ -60,6 +62,9 @@ try {
         }
     }
 
+    Run-Timed "DownloadQueueCheck" {
+        & $java -cp $ClassesDir app.aikobrowser.DownloadQueueCheck
+    }
     if (-not $SkipDownloadTest) {
         Run-Timed "RangeDownloadCheck" {
             & $java --add-modules jdk.httpserver -cp $ClassesDir app.aikobrowser.RangeDownloadCheck
@@ -136,13 +141,13 @@ try {
     $v040Check = Join-Path $testing 'V040EnginesCheck.java'
     $startCfgSrc = Join-Path $src 'StartPageConfig.java'
     $bangSrc = Join-Path $src 'BangCatalog.java'
-    $backupSrc = Join-Path $src 'BackupManager.java'
+    $backupSrc = @((Join-Path $src 'BackupManager.java'), (Join-Path $src 'BackupEnvelope.java'), (Join-Path $src 'BackupPreferences.java'))
     $qrSrc = Join-Path $src 'QrEngine.java'
     $siteExtrasSrc = Join-Path $src 'SiteExtras.java'
     $siteFilterSrc = Join-Path $src 'SiteFilter.java'
     $wvPerfSrc = Join-Path $src 'WebViewPerf.java'
     if ((Test-Path -LiteralPath $v040Check) -and (Test-Path -LiteralPath $startCfgSrc) `
-            -and (Test-Path -LiteralPath $bangSrc) -and (Test-Path -LiteralPath $backupSrc) `
+            -and (Test-Path -LiteralPath $bangSrc) -and (Test-Path -LiteralPath $backupSrc[0]) `
             -and (Test-Path -LiteralPath $qrSrc) -and (Test-Path -LiteralPath $androidJar) `
             -and (Test-Path -LiteralPath $jsonJar)) {
         $v040Classes = Join-Path $ClassesDir 'v040'
@@ -194,7 +199,7 @@ try {
     }
 
     $babelDomCheck = Join-Path $testing 'babel_dom_check.mjs'
-    $chromeHeadless = Join-Path $parentDir 'work/chrome-test/chrome-headless-shell-win64/chrome-headless-shell.exe'
+    $chromeHeadless = if ($env:AIKO_CHROMIUM) { $env:AIKO_CHROMIUM } else { Join-Path $parentDir 'work/chrome-test/chrome-headless-shell-win64/chrome-headless-shell.exe' }
     if ((Test-Path -LiteralPath $babelDomCheck) -and (Test-Path -LiteralPath $chromeHeadless)) {
         Run-Timed "babel_dom_check.mjs" {
             & node $babelDomCheck
@@ -202,24 +207,14 @@ try {
     }
 
     if ($IncludeChromiumSmoke) {
-        $parent = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..\..')).Path
-        $smoke = Join-Path $parent 'work/userscript_chromium_smoke.mjs'
-        if (Test-Path -LiteralPath $smoke) {
-            $before = @(Get-ChildItem -Directory (Join-Path $parent 'work') -Filter 'aiko-chromium-*' -ErrorAction SilentlyContinue | ForEach-Object Name)
-            Push-Location $parent
-            try {
-                Run-Timed "userscript_chromium_smoke.mjs" { & node $smoke }
-            } finally {
-                Pop-Location
-                $after = @(Get-ChildItem -Directory (Join-Path $parent 'work') -Filter 'aiko-chromium-*' -ErrorAction SilentlyContinue)
-                foreach ($d in $after) {
-                    if ($d.Name -notin $before) { Remove-Item -Recurse -Force $d.FullName -ErrorAction SilentlyContinue }
-                }
-            }
-        }
+        Run-Timed "userscript_chromium_smoke.mjs" { & node (Join-Path $PSScriptRoot 'userscript_chromium_smoke.mjs') }
     }
 } finally {
-    if (-not $KeepClasses -and (Test-Path -LiteralPath $ClassesDir)) {
-        Remove-Item -Recurse -Force $ClassesDir -ErrorAction SilentlyContinue
+    if ($ownsClasses -and -not $KeepClasses -and (Test-Path -LiteralPath $ClassesDir)) {
+        $target = (Resolve-Path -LiteralPath $ClassesDir).Path
+        $tempRoot = (Resolve-Path -LiteralPath $env:TEMP).Path.TrimEnd('\')
+        if ([IO.Path]::GetDirectoryName($target) -eq $tempRoot -and [IO.Path]::GetFileName($target) -match '^aiko-bench-classes-[0-9a-f]{32}$') {
+            Remove-Item -LiteralPath $target -Recurse -Force
+        }
     }
 }

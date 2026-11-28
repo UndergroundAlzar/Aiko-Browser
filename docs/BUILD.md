@@ -1,101 +1,54 @@
-# 构建、校验与基准测试指南（v0.4.0）
+# Aiko Browser 0.5.1 构建与验证
 
-> 返回主页：[简体中文 README](../README.md) · [English README](README.en.md) · [深度配置指南](CUSTOMIZATION.md)
+[中文首页](../README.md) · [English overview](README.en.md) · [使用指南](CUSTOMIZATION.md)
 
----
+## 校验发行 APK
 
-## 一、校验官方发布的 APK
-
-**Aiko Browser v0.4.0**（包名 `app.aikobrowser`，`versionCode = 14`，最低 Android 10 / API 29，目标 API 36，作者 **Alzar**）共 **2,656,083 字节**（`2.53 MiB`），包含全部 7 套 2026 实时中英文广告过滤规则、巴别塔翻译脚本与完整油猴运行时。签名沿用自 `v0.1.7` 起的同一证书，可直接覆盖安装任意历史官方版本并保留 100% 本地用户数据。
-
-| 校验项 | SHA-256 指纹 |
-| :--- | :--- |
-| **`Aiko-Browser-0.4.0.apk`** | `d23cb60d3e7f694e27390a6597e6804bfca113a86f3e86020b74cdb8b6c765b8` |
-| **官方签名证书** | `ae71c82831309c76ebf55c407d91afbba16776e97389bd73c5e8400fe9397fe4` |
-
-在 PowerShell 中执行以下命令即可核对文件完整性与 APK v3 签名：
+应用包名为 `app.aikobrowser`，版本为 0.5.1（versionCode 16），最低 Android 10 / API 29，目标 API 36。把同一发行版的 APK 与校验清单下载到同一目录。[v0.5.1 APK](https://github.com/UndergroundAlzar/Aiko-Browser/releases/download/v0.5.1/Aiko-Browser-0.5.1.apk) · [SHA256SUMS.txt](https://github.com/UndergroundAlzar/Aiko-Browser/releases/download/v0.5.1/SHA256SUMS.txt)
 
 ```powershell
-Get-FileHash ./Aiko-Browser-0.4.0.apk -Algorithm SHA256
-& "$env:ANDROID_HOME/build-tools/36.0.0/apksigner.bat" verify --verbose --print-certs ./Aiko-Browser-0.4.0.apk
+$apk = 'Aiko-Browser-0.5.1.apk'
+Get-FileHash -Algorithm SHA256 -LiteralPath $apk
+Get-Content -LiteralPath ./SHA256SUMS.txt | Select-String -SimpleMatch $apk
+& "$env:ANDROID_HOME/build-tools/36.0.0/apksigner.bat" verify --verbose --print-certs $apk
 ```
 
----
+文件摘要须与校验清单中该 APK 的摘要完全一致。最后一条命令验证签名并打印签名证书指纹，可与已信任的发行包核对。
 
-## 二、从源码构建（Windows / 零 Gradle）
+## Windows 源码构建
 
-### 环境要求
-- PowerShell 7 (`pwsh`)
-- JDK 21（`JAVA_HOME`）
-- Android SDK Platform 36 & Build Tools 36.0.0（`ANDROID_HOME`）
-
-### 一键编译并签名
+准备 PowerShell 7、JDK 21、Android SDK Platform 36 和 Build Tools 36.0.0。将 `JAVA_HOME` 指向 JDK、`ANDROID_HOME` 指向 SDK，在仓库根目录运行下列命令。首次构建需要网络访问 Google Maven 和 Maven Central，以下载脚本锁定并校验摘要的依赖。
 
 ```powershell
 pwsh -NoProfile -File ./build.ps1
 ```
 
-默认产物输出至 `build/Aiko-Browser-0.4.0.apk`。支持参数：`-JavaHome`、`-AndroidJar`、`-BuildTools`、`-SigningKey`、`-SigningAlias`、`-OutputFile`（也可通过环境变量 `AIKO_KEYSTORE_PASSWORD` 提供密码）。
+默认产物为 `build/Aiko-Browser-0.5.1.apk`。脚本使用 aapt2、javac、R8、zipalign 和 apksigner，并检查 APK 内资源路径、过滤规则与 Babel 等必需资源。[构建脚本](../build.ps1)
 
-### 构建管线内置安全门禁
-1. **依赖摘要锁死**：自动在 `build/deps` 缓存并按 SHA-256 校验 `androidx.webkit:1.18.0`、`androidx.core:1.1.0` 等依赖（见 [AndroidX 许可](../app/src/main/assets/notices/NOTICE.txt) 与 [规则许可](../app/src/main/assets/filters/NOTICE.txt)）。
-2. **R8 优化与 API 外联**：以 `--release --min-api 29` 运行 R8（结合 `aapt2 --proguard`、`androidx-keep.pro` 与 WebKit AAR 规则），保留 Manifest 组件（含 `MediaPlaybackService`）与 `@JavascriptInterface` 桥接边界，自动外联 API 30+/31+ 系统调用。
-3. **Windows `aapt2` 路径规范化与签名后断言**：自动修正 Windows `aapt2` 产生的反斜杠资源路径（`\` → `/`），并在签名后强制校验 **0 反斜杠**、`resources.arsc` 未压缩（`STORED`），以及 `assets/babel/babel.js`、`assets/userscripts/runtime.js` 与全部 7 套 `.txt.gz` 规则完整存在。
+默认本地签名密钥在 `build/local-preview.p12`。请保留自己的签名密钥，以便覆盖升级本地构建。已有密钥可通过 `-SigningKey`、`-SigningAlias` 及环境变量 `AIKO_KEYSTORE_PASSWORD` 指定。也可用 `-JavaHome`、`-AndroidJar`、`-BuildTools` 或 `-OutputFile` 指定工具及输出位置。
 
-> **签名提示**：自行构建时脚本会生成本地密钥（`build/local-preview.p12`），保留该密钥即可持续覆盖安装自己的构建；不同签名之间无法直接覆盖安装官方 GitHub 发行版。
+## 主机回归与 Chromium 检查
 
----
+先完成一次构建，让 `build/deps` 包含 AndroidX 依赖。准备带全局 `fetch` 和 `WebSocket` 的 Node.js（例如 22.4+）及 Windows 版 Chromium headless shell。测试脚本查找以下路径，均相对仓库根目录。[测试入口](../testing/run_benchmarks.ps1)
 
-## 三、运行全套自动化测试与微基准（13 项）
-
-仓库内置了一键全量回归脚本 `testing/run_benchmarks.ps1`，覆盖 JVM 单元测试、微基准、Node.js 运行时验证与真实无头 Chromium 严格 CSP 端到端测试：
+| 用途 | 默认位置 |
+| --- | --- |
+| JDK 21 | `../work/android-toolchain/jdk*/bin/javac.exe`，子目录名须以 `jdk` 开头 |
+| Android 平台 JAR | `../work/android-toolchain/platform-36_r02/android-36/android.jar` |
+| JVM 上的 org.json 实现 | 将 `org.json:json:20240303` 的 JAR 放到 `../work/aiko-test-json.jar`。可从 [Maven Central](https://repo.maven.apache.org/maven2/org/json/json/20240303/json-20240303.jar) 获取。 |
+| Chromium | `../work/chrome-test/chrome-headless-shell-win64/chrome-headless-shell.exe`，或令 `AIKO_CHROMIUM` 指向该可执行文件的绝对路径 |
 
 ```powershell
-# 运行全部 13 项测试与基准（推荐）
 pwsh -NoProfile -File ./testing/run_benchmarks.ps1 -IncludeChromiumSmoke
-
-# 跳过耗时 ~28s 的本地 HTTP 128 路下载压力测试，快速验证其余套件
-pwsh -NoProfile -File ./testing/run_benchmarks.ps1 -SkipDownloadTest -IncludeChromiumSmoke
 ```
 
-### 测试套件一览
+`-ToolchainRoot` 可覆盖上表中 `android-toolchain` 的位置。JSON 与 Chromium 另按各自的路径查找。部分套件缺少依赖时会被跳过，阅读运行输出，确认需要的套件均出现并返回 `exit=0`。
 
-| # | 测试套件 | 覆盖范围 |
-| :-: | :--- | :--- |
-| 1 | `RangeDownloadCheck` | 128 路并发、断点续传、强杀恢复、ETag 校验、503 重试、浏览优先让路 |
-| 2 | `FilterRulesCheck` | 3 列表基线、7 列表 151,979 条有效规则、作用域例外与 CSS 安全清洗 |
-| 3 | `ScrollPositionsCheck` | 同 URL 不同历史条目滚动位置恢复与前进分支丢弃 |
-| 4 | `UserCustomizationCheck` | 自定义 ABP 规则、Tampermonkey `@grant`/`@connect`/`@require`/`@resource`、`PageToolkit`、`WebDevTools` |
-| 5 | `SiteDiagnosticsCheck` | 站点位掩码编码、拦截记录来源归因与内存边界 |
-| 6 | `FilterRulesBench` | 3 列表 & 7 列表编译/缓存/匹配/堆内存与 `HttpUrlUtil` 微基准 |
-| 7 | `FlagshipUnitChecks` | 11 组核心单测：`PerfProfiles`、`UrlCleaner`、`AikoTheme.Palette` 360° WCAG、`DisplayModeEngine`、`GestureChrome`、`BrowserLibrary` 等 |
-| 8 | `BabelEngineCheck` | 巴别塔多引擎配置钳位、OpenAI/Gemini 模型列表解析、Google→Bing 国内无感降级、并发门控、LRU 缓存与 28 并发压测 |
-| 9 | `V040EnginesCheck` | 纯 Java ISO 18004 二维码编码/解码往返与 OLED 对比度、`BangCatalog`、`BackupManager` 路径穿越防护与往返、`StartPageConfig`、`SiteFilter` 异步撤销、`WebViewPerf`、`VideoBooster` |
-| 10 | `userscript_runtime_check.mjs` | 油猴执行时机、存储桥接、`GM_xmlhttpRequest`、`GM_addValueChangeListener`、`GM_registerMenuCommand` |
-| 11 | `userscript_iframe_bench.mjs` | 10-iframe 突发注入守卫微基准 |
-| 12 | `babel_dom_check.mjs` | 真实无头 Chromium 严格 CSP 下的 `IntersectionObserver`、代码块跳过、5 种双语样式、开关重译、划词与三连空格反译 |
-| 13 | `userscript_chromium_smoke.mjs` | 真实无头 Chromium 隔离世界 CSP 注入与真实 `.user.js` 端到端冒烟 |
+| 核心检查 | 验证内容 |
+| --- | --- |
+| `DownloadQueueCheck`、`RangeDownloadCheck` | 队列顺序、旧任务迁移、完成记录，以及本地 HTTP 服务的分片下载与续传。使用 `-SkipDownloadTest` 会跳过后者。 |
+| `V040EnginesCheck` | 起始页设置持久化、Service Worker 来源与规则例外、v1 / 加密备份往返、快照迁移及错误处理。 |
+| `babel_dom_check.mjs` | 无头 Chromium 上的逐段刷新、乱序回包、可见区懒翻译、五种排版及关闭后的 DOM 清理。 |
+| `userscript_chromium_smoke.mjs` | 严格 CSP 页面中的脚本执行，随 `-IncludeChromiumSmoke` 启用。 |
 
----
-
-## 四、实测基准参考
-
-### 1. 真机实测（OnePlus PMS110 · SM8850 · Android 17 · 185Hz · WebView Canary 160）
-
-| 项目 | 实测结果 |
-| :--- | :--- |
-| 冷启动耗时（`am start -W`） | **`159–166 ms`** |
-| 185Hz 连续快速滑动（`dumpsys gfxinfo`） | `943` 帧 · 丢 VSync **`0`** · 抖动 `4` 帧 (**`0.42%`**) · CPU `p95=5ms / p99=6ms` · GPU `p99=3ms` |
-| 运行内存（`dumpsys meminfo`） | `Java Heap 23.2 MB` · `Native Heap 25.8 MB` · `TOTAL PSS 193.6 MB` |
-| 实机有效过滤规则 | 内置 7 套 **`152,033` 条** → 订阅 `anti-AD` 后 **`172,031` 条**（编译缓存 `9.58 MB`） |
-
-### 2. 主机端同口径微基准（`v0.1.9` → `v0.4.0`，JDK 21 / Node.js）
-
-| 指标 | v0.1.9（3 列表） | v0.4.0（全 7 列表 · 151,979 条） |
-| :--- | ---: | ---: |
-| `FilterRules` 二进制缓存体积 / 热载 | —（每次 `322.75 ms`） | **`8.34 MB`** / **`22.42 ms`** |
-| `FilterRules` 常驻堆内存（GC 后） | `40.67 MB` | **`24.97 MB`**（**-38.6%**） |
-| `blockingRule()` 匹配耗时（p50 / 均值） | `16.540 µs/req` | **`0.400 µs`** / **`0.669 µs`** |
-| `css()` 隐藏规则查表（p50） | `0.700 µs` | **`0.200 µs`** |
-| `HttpUrlUtil` 混合校验 | `3,119.1 ns` | **`43.4 ns`**（**71.9×**） |
-| 油猴 10-iframe 突发守卫（p50） | `38.4 µs` | **`7.0 µs`**（**5.5×**） |
+单独复查网页行为可运行 `node ./testing/babel_dom_check.mjs`。JVM 和桌面 Chromium 覆盖主机端逻辑，手机刷新率、启动耗时、ADPF 采样和 Android 系统 WebView 的具体表现需在对应设备上测量。
